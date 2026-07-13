@@ -1,0 +1,23 @@
+{% extends "research/base.html" %}
+{% block title %}{{ object.fund_name }} {{ object.quarter }} · {{ site_name }}{% endblock %}
+{% block content %}
+{% with item=object %}
+<article class="content-wrap">
+  <header class="mx-auto max-w-5xl border-b hairline pb-7">
+    <div class="flex flex-wrap gap-2"><span class="eyebrow">Fund letter</span><span class="badge badge-accent">{{ item.quarter }}</span><span class="badge">{{ item.strategy }}</span>{% if item.stance %}<span class="badge {% if item.stance == 'bullish' or item.stance == '看多' %}badge-positive{% elif item.stance == 'bearish' or item.stance == '看空' %}badge-negative{% endif %}">{{ item.stance }}</span>{% endif %}</div>
+    <h1 class="page-title mt-4">{{ item.fund_name }}</h1>
+    <p class="page-deck">{{ item.fund_name_en }}{% if item.manager %} · {{ item.manager }}{% endif %}</p>
+    <div class="mt-5 flex flex-wrap items-center gap-3"><time class="mono text-[11px] muted">{% if item.published_at %}发布于 {{ item.published_at|date:"Y-m-d" }}{% else %}原始发布日期未核验{% endif %}</time><a class="button button-primary" href="{{ item.original_url }}" target="_blank" rel="noopener noreferrer">基金官网原文 ↗</a><button class="button button-ghost" type="button" data-copy-link>复制链接</button></div>
+  </header>
+  <div class="mx-auto mt-6 grid max-w-5xl gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+    <div class="grid gap-4">
+      <section class="panel"><header class="panel-header"><div><h2 class="section-title">{% if item.key_points %}中文摘要{% else %}元数据说明{% endif %}</h2><p class="section-deck">{% if item.key_points %}原创研究摘要，不是原文镜像{% else %}仅保存官方链接，不声称已完成内容研读{% endif %}</p></div></header><div class="panel-body prose-atlas">{{ item.summary|linebreaks }}</div></section>
+      <section class="panel"><header class="panel-header"><h2 class="section-title">核心观点</h2></header><ol class="panel-body grid gap-3">{% for point in item.key_points %}<li class="flex gap-3 rounded-lg bg-[var(--surface-2)] p-3 text-[12px] leading-5"><span class="mono positive">0{{ forloop.counter }}</span><span>{{ point.text|default:point }}</span></li>{% empty %}<li class="muted">暂无结构化要点。</li>{% endfor %}</ol></section>
+      {% if item.asset_views %}<section class="panel"><header class="panel-header"><h2 class="section-title">资产观点</h2></header><div class="data-table-wrap"><table class="data-table"><thead><tr><th>资产</th><th>立场</th><th>理由</th></tr></thead><tbody>{% for view in item.asset_views %}<tr><td><strong>{{ view.asset }}</strong></td><td><span class="badge">{{ view.view }}</span></td><td>{{ view.reason }}</td></tr>{% endfor %}</tbody></table></div></section>{% endif %}
+    </div>
+    <aside class="grid content-start gap-4"><section class="panel"><header class="panel-header"><h2 class="section-title">信函资料</h2></header><dl class="panel-body grid gap-3 text-[11px]"><div class="flex justify-between gap-3"><dt class="muted">基金</dt><dd class="text-right">{{ item.fund_name }}</dd></div><div class="flex justify-between gap-3"><dt class="muted">管理人</dt><dd>{{ item.manager|default:"—" }}</dd></div><div class="flex justify-between gap-3"><dt class="muted">策略</dt><dd>{{ item.strategy }}</dd></div><div class="flex justify-between gap-3"><dt class="muted">AUM</dt><dd class="mono">{% if item.aum_usd_m %}${{ item.aum_usd_m|floatformat:0 }}m{% else %}—{% endif %}</dd></div><div class="flex justify-between gap-3"><dt class="muted">来源</dt><dd>{{ item.source_label }}</dd></div><div class="flex justify-between gap-3"><dt class="muted">许可</dt><dd>{{ item.license_status }}</dd></div></dl></section><div class="callout text-[11px] leading-5">本页不托管信函正文或 PDF。请通过基金官网原文核对完整语境。</div></aside>
+  </div>
+  {% if related %}<section class="mx-auto mt-5 max-w-5xl"><h2 class="section-title mb-3">同基金历史</h2><div class="grid gap-3 md:grid-cols-3">{% for related_item in related %}<a class="panel block p-4 hover:border-[var(--accent)]" href="{{ related_item.get_absolute_url }}"><span class="badge">{{ related_item.quarter }}</span><p class="mt-2 text-[11px] line-clamp-2">{{ related_item.summary }}</p></a>{% endfor %}</div></section>{% endif %}
+</article>
+{% endwith %}
+{% endblock %}

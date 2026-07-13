@@ -1,0 +1,28 @@
+{% extends "research/base.html" %}
+{% block title %}基金信函 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Investor letters" page_title="基金信函" page_description="用一致结构整理基金官网公开信函：中文摘要、核心观点、资产判断与原文入口。" %}
+  <form class="filter-bar mb-4" method="get">
+    <label class="field field-grow"><span class="field-label">基金 / 管理人</span><input class="control" type="search" name="q" value="{{ request.GET.q }}" placeholder="搜索基金、管理人或摘要"></label>
+    <label class="field"><span class="field-label">季度</span><select class="control" name="quarter"><option value="">全部季度</option>{% for option in filter_options.quarter %}<option value="{{ option }}" {% if request.GET.quarter == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <label class="field"><span class="field-label">策略</span><select class="control" name="strategy"><option value="">全部策略</option>{% for option in filter_options.strategy %}<option value="{{ option }}" {% if request.GET.strategy == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <label class="field"><span class="field-label">立场</span><select class="control" name="stance"><option value="">全部立场</option>{% for option in filter_options.stance %}<option value="{{ option }}" {% if request.GET.stance == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <button class="button button-primary" type="submit">筛选信函</button>
+    {% if request.GET %}<a class="button" href="{{ request.path }}">重置</a>{% endif %}
+  </form>
+  <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+    {% for letter in page_obj %}
+      <article class="panel group flex flex-col p-4 transition hover:-translate-y-0.5 hover:border-[var(--accent)]">
+        <div class="flex items-center justify-between gap-3"><span class="badge badge-accent">{{ letter.quarter }}</span><time class="mono text-[9px] muted">{% if letter.published_at %}{{ letter.published_at|date:"Y-m-d" }}{% else %}发布日期未核验{% endif %}</time></div>
+        <h2 class="mt-4 text-lg font-semibold tracking-[-.025em]"><a class="group-hover:text-[var(--accent)]" href="{{ letter.get_absolute_url }}">{{ letter.fund_name }}</a></h2>
+        {% if letter.fund_name_en %}<p class="mt-1 text-[10px] muted">{{ letter.fund_name_en }}</p>{% endif %}
+        <p class="mt-3 line-clamp-4 flex-1 text-[11px] leading-5 muted">{{ letter.summary }}</p>
+        <div class="mt-4 flex flex-wrap gap-1.5"><span class="badge">{{ letter.strategy }}</span>{% if letter.stance %}<span class="badge {% if letter.stance == 'bullish' or letter.stance == '看多' %}badge-positive{% elif letter.stance == 'bearish' or letter.stance == '看空' %}badge-negative{% endif %}">{{ letter.stance }}</span>{% endif %}{% if letter.aum_usd_m %}<span class="badge">AUM ${{ letter.aum_usd_m|floatformat:0 }}m</span>{% endif %}</div>
+        <a class="mt-4 inline-flex items-center gap-2 text-[11px] font-semibold" href="{{ letter.get_absolute_url }}">{% if letter.key_points %}阅读结构化摘要{% else %}查看元数据{% endif %} →</a>
+      </article>
+    {% empty %}<div class="panel md:col-span-2 xl:col-span-3">{% include "research/includes/empty_state.html" with empty_title="没有匹配的基金信函" empty_href=request.path %}</div>{% endfor %}
+  </div>
+  {% include "research/includes/pagination.html" %}
+</div>
+{% endblock %}

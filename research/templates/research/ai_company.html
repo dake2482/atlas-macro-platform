@@ -1,0 +1,73 @@
+{% extends "research/base.html" %}
+{% block title %}{{ object.name }} · 公司档案 · {{ site_name }}{% endblock %}
+{% block content %}
+{% with item=object %}
+<div class="content-wrap">
+  <header class="mb-6 flex flex-col gap-5 border-b hairline pb-6 lg:flex-row lg:items-end lg:justify-between">
+    <div>
+      <div class="flex flex-wrap gap-2">
+        <span class="eyebrow">Company profile</span>
+        <span class="badge">{{ item.exchange }}:{{ item.ticker }}</span>
+        <a class="badge badge-accent" href="{{ item.primary_node.get_absolute_url }}">{{ item.primary_node.name }}</a>
+        {% if reviewed_sec %}<span class="badge badge-positive">Reviewed SEC profile</span>{% else %}<span class="badge">Generic sourced profile</span>{% endif %}
+      </div>
+      <h1 class="page-title mt-4">{{ item.name }}</h1>
+      <p class="page-deck">{{ item.name_en }}{% if item.country %} · {{ item.country }}{% endif %}</p>
+    </div>
+    <div class="grid grid-cols-2 gap-4 text-right">
+      {% if reviewed_sec %}
+        <div><p class="metric-label">价格 / 市值</p><p class="mono mt-1">不可用</p><p class="text-[10px] muted">Reviewed SEC 页面不使用缓存行情估值</p></div>
+        <div><p class="metric-label">评级 / 共识</p><p class="mono mt-1">不可用</p><p class="text-[10px] muted">没有获授权的一致预期</p></div>
+      {% else %}
+        <div><p class="metric-label">价格 / 市值</p><p class="mono mt-1">{% if item.price != None %}${{ item.price|floatformat:2 }}{% else %}—{% endif %}</p><p class="text-[10px] muted">仅展示当前有效公共行情源</p></div>
+        <div><p class="metric-label">评级 / 共识</p><p class="mono mt-1">{% if item.rating %}{{ item.rating }}{% else %}—{% endif %}</p><p class="text-[10px] muted">通用公司字段</p></div>
+      {% endif %}
+    </div>
+  </header>
+
+  <div class="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
+    {% if reviewed_sec %}
+      <article class="metric-card"><p class="metric-label">市场 / 估值</p><p class="metric-value">不可用</p><p class="text-[10px] muted">Reviewed SEC 页面不展示旧行情或估值</p></article>
+      <article class="metric-card"><p class="metric-label">最新收入增速</p><p class="metric-value">{% if latest_fact.revenue_growth != None %}{{ latest_fact.revenue_growth|floatformat:1 }}%{% else %}—{% endif %}</p><p class="text-[10px] muted">当前 SEC 发布批次</p></article>
+      <article class="metric-card"><p class="metric-label">最新毛利率</p><p class="metric-value">{% if latest_fact.gross_margin != None %}{{ latest_fact.gross_margin|floatformat:1 }}%{% else %}—{% endif %}</p><p class="text-[10px] muted">当前 SEC 发布批次</p></article>
+      <article class="metric-card"><p class="metric-label">评级 / 共识</p><p class="metric-value">不可用</p><p class="text-[10px] muted">没有获授权的一致预期</p></article>
+    {% else %}
+      <article class="metric-card"><p class="metric-label">市场 / 估值</p><p class="metric-value">{% if item.market_cap_usd_m != None %}${{ item.market_cap_usd_m|floatformat:0 }}m{% else %}—{% endif %}</p><p class="text-[10px] muted">通用公司公开字段</p></article>
+      <article class="metric-card"><p class="metric-label">最新收入增速</p><p class="metric-value">{% if latest_fact.revenue_growth != None %}{{ latest_fact.revenue_growth|floatformat:1 }}%{% elif item.revenue_growth != None %}{{ item.revenue_growth|floatformat:1 }}%{% else %}—{% endif %}</p><p class="text-[10px] muted">通用 FinancialFact / 公司字段</p></article>
+      <article class="metric-card"><p class="metric-label">最新毛利率</p><p class="metric-value">{% if latest_fact.gross_margin != None %}{{ latest_fact.gross_margin|floatformat:1 }}%{% elif item.gross_margin != None %}{{ item.gross_margin|floatformat:1 }}%{% else %}—{% endif %}</p><p class="text-[10px] muted">通用 FinancialFact / 公司字段</p></article>
+      <article class="metric-card"><p class="metric-label">评级 / 共识</p><p class="metric-value">{% if item.rating %}{{ item.rating }}{% else %}—{% endif %}</p><p class="text-[10px] muted">通用公司字段</p></article>
+    {% endif %}
+  </div>
+
+  <div class="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(18rem,.6fr)]">
+    <div class="grid gap-4">
+      {% if reviewed_sec %}
+        {% if sec_projection_allowed %}
+          <section class="panel">
+            <header class="panel-header"><div><h2 class="section-title">最近三年财务</h2><p class="section-deck">当前 exact publication batch · {{ item.source.name }} · {{ item.publication_batch_id }}</p></div></header>
+            <div class="panel-body callout mb-3 text-[11px]">{{ item.source.name }}：公司层面报告的现金资本开支和年度基本面，不是 AI-only CapEx；不推断 GPU 数量、租赁或项目级 AI 拆分。{% if item.slug == "amazon" %}Amazon 的 productive-assets 标签较宽，不能与其他公司 PP&amp;E 口径完全比较。{% endif %}</div>
+            <div class="data-table-wrap"><table class="data-table"><thead><tr><th>财年 / 期末</th><th class="numeric">收入</th><th class="numeric">收入增长</th><th class="numeric">毛利 / 毛利率</th><th class="numeric">净利润</th><th class="numeric">经营现金流</th><th class="numeric">现金资本开支 / 比率</th><th>CapEx 定义 / 来源</th><th>发布血缘</th></tr></thead><tbody>
+              {% for fact in financials %}<tr><td class="mono">FY{{ fact.fiscal_year }}<br><span class="muted">{{ fact.period_end|date:"Y-m-d" }}</span><br><span class="muted">期间 {{ fact.period_start|date:"Y-m-d" }} — {{ fact.period_end|date:"Y-m-d" }}</span></td><td class="numeric">{% if fact.revenue_usd_m != None %}${{ fact.revenue_usd_m|floatformat:0 }}m{% else %}—{% endif %}</td><td class="numeric">{% if fact.revenue_growth != None %}{{ fact.revenue_growth|floatformat:1 }}%{% else %}—{% endif %}</td><td class="numeric">{% if fact.gross_profit_usd_m != None %}${{ fact.gross_profit_usd_m|floatformat:0 }}m{% endif %}<br>{% if fact.gross_margin != None %}{{ fact.gross_margin|floatformat:1 }}%{% endif %}</td><td class="numeric">{% if fact.net_income_usd_m != None %}${{ fact.net_income_usd_m|floatformat:0 }}m{% else %}—{% endif %}</td><td class="numeric">{% if fact.operating_cash_flow_usd_m != None %}${{ fact.operating_cash_flow_usd_m|floatformat:0 }}m{% else %}—{% endif %}</td><td class="numeric">{% if fact.capital_expenditures_usd_m != None %}${{ fact.capital_expenditures_usd_m|floatformat:0 }}m{% else %}—{% endif %}<br>{% if fact.capex_intensity != None %}{{ fact.capex_intensity|floatformat:1 }}%{% endif %}</td><td><span class="block">{{ fact.metadata.capex_definition_label|default:fact.capex_definition }}</span><span class="muted">{{ fact.source.name }}</span><br><a class="text-[10px]" href="{{ fact.capex_source_url }}" target="_blank" rel="noopener noreferrer">CapEx filing ↗</a><br><span class="muted">{{ fact.capex_source_fact.accession_number }} · {{ fact.capex_source_fact.form }} · filed {{ fact.capex_source_fact.filed_at|date:"Y-m-d" }}</span></td><td class="mono">batch {{ fact.publication_batch_id }}<br><span class="muted">value {{ fact.period_end|date:"Y-m-d" }}</span><br><span class="muted">fetched {{ fact.fetched_at|date:"Y-m-d H:i:s" }}</span><br><span class="badge">{{ fact.quality_status }}</span><br><span class="muted">license {{ fact.license_scope }}</span><br><span class="muted">fallback {{ fact.fallback_source|default:"—" }}</span></td></tr>{% empty %}<tr><td colspan="9" class="muted text-center">财务数据待回填。</td></tr>{% endfor %}
+            </tbody></table></div>
+          </section>
+          <section class="panel"><header class="panel-header"><h2 class="section-title">SEC 数据声明</h2></header><div class="panel-body text-[11px] leading-5">Source: U.S. Securities and Exchange Commission EDGAR. Atlas Macro is not affiliated with, sponsored by, or endorsed by the SEC; values retain the filing period, actual retrieval time, quality, licence scope and fallback state.</div></section>
+        {% else %}
+          <section class="callout" role="status"><h2 class="section-title">SEC 衍生展示暂不可用</h2><p class="mt-2 text-[11px] leading-5">当前 SEC 来源仍可能允许公司公开壳层，但没有有效的 public+derived display permission，因此隐藏财务投影、CapEx 和 SEC 派生说明。</p></section>
+        {% endif %}
+      {% else %}
+        <section class="panel"><header class="panel-header"><div><h2 class="section-title">公开财务事实</h2><p class="section-deck">{{ item.source.name }} · generic company data</p></div></header>
+          <div class="panel-body callout mb-3 text-[11px]">这是通用公司档案；页面只读取当前有效公共显示许可下的 FinancialFact，并保留其原始来源与通用口径。</div>
+          <div class="data-table-wrap"><table class="data-table"><thead><tr><th>财年</th><th class="numeric">收入</th><th class="numeric">收入增长</th><th class="numeric">毛利率</th><th class="numeric">净利润</th><th class="numeric">经营现金流</th><th>来源 / 血缘</th></tr></thead><tbody>
+            {% for fact in financials %}<tr><td class="mono">FY{{ fact.fiscal_year }}</td><td class="numeric">{% if fact.revenue_usd_m != None %}${{ fact.revenue_usd_m|floatformat:0 }}m{% else %}—{% endif %}</td><td class="numeric">{% if fact.revenue_growth != None %}{{ fact.revenue_growth|floatformat:1 }}%{% else %}—{% endif %}</td><td class="numeric">{% if fact.gross_margin != None %}{{ fact.gross_margin|floatformat:1 }}%{% else %}—{% endif %}</td><td class="numeric">{% if fact.net_income_usd_m != None %}${{ fact.net_income_usd_m|floatformat:0 }}m{% else %}—{% endif %}</td><td class="numeric">{% if fact.operating_cash_flow_usd_m != None %}${{ fact.operating_cash_flow_usd_m|floatformat:0 }}m{% else %}—{% endif %}</td><td>{{ fact.source.name }}<br><span class="muted">value {{ fact.period_end|date:"Y-m-d" }} · fetched {{ fact.fetched_at|date:"Y-m-d H:i:s" }}</span><br><span class="muted">quality {{ fact.quality_status }} · license {{ fact.license_scope|default:"—" }} · fallback {{ fact.fallback_source|default:"—" }}</span></td></tr>{% empty %}<tr><td colspan="7" class="muted text-center">暂无通过当前公共许可的财务事实。</td></tr>{% endfor %}</tbody></table></div>
+        </section>
+        {% if chart_data %}<section class="panel"><header class="panel-header"><div><h2 class="section-title">授权价格走势</h2><p class="section-deck">仅通用公司页面展示非 demo、当前公共许可行情</p></div></header><div class="panel-body"><div class="chart chart-tall" data-chart data-chart-kind="line" data-chart-source="company-price-chart" data-empty-label="暂无可视化数据" role="img" aria-label="授权价格走势"></div>{{ chart_data|json_script:"company-price-chart" }}</div></section>{% endif %}
+      {% endif %}
+    </div>
+    <aside class="grid content-start gap-4">
+      <section class="panel"><header class="panel-header"><h2 class="section-title">业务定位</h2></header><div class="panel-body prose-atlas !text-[12px]">{{ item.description|linebreaks }}{{ item.business|linebreaks }}</div></section>
+      <section class="panel"><header class="panel-header"><h2 class="section-title">数据血缘</h2></header><div class="panel-body text-[10px] leading-5 muted"><p>来源：{{ item.source.name }}</p><p>数值截至：{{ item.data_as_of|date:"Y-m-d" }}</p><p>抓取：{{ item.fetched_at|date:"Y-m-d H:i:s" }}</p><p>发布批次：{{ item.publication_batch_id }}</p><p>质量：{{ item.quality_status }}</p><p>许可范围：{{ item.license_scope }}</p><p>fallback：{{ item.fallback_source|default:"—" }}</p>{% if item.investor_relations_url %}<a class="button mt-3 !min-h-8" href="{{ item.investor_relations_url }}" target="_blank" rel="noopener noreferrer">Investor relations ↗</a>{% endif %}</div></section>
+    </aside>
+  </div>
+</div>
+{% endwith %}
+{% endblock %}

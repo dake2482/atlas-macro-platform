@@ -1,0 +1,20 @@
+{% extends "research/base.html" %}
+{% block title %}机构研究库 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Institutional views" page_title="机构观点合成" page_description="把公开可链接的机构观点映射到宏观主题与资产立场；这里只展示元数据和原创摘要。" %}
+  <form class="filter-bar mb-4" method="get">
+    <label class="field field-grow"><span class="field-label">关键词</span><input class="control" type="search" name="q" value="{{ request.GET.q }}" placeholder="报告标题或摘要"></label>
+    <label class="field"><span class="field-label">机构</span><select class="control" name="bank"><option value="">全部机构</option>{% for option in filter_options.banks %}<option value="{{ option }}" {% if request.GET.bank == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <label class="field"><span class="field-label">分类</span><select class="control" name="category"><option value="">全部分类</option>{% for option in filter_options.categories %}<option value="{{ option }}" {% if request.GET.category == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <label class="field"><span class="field-label">立场</span><select class="control" name="stance"><option value="">全部立场</option>{% for option in filter_options.stances %}<option value="{{ option }}" {% if request.GET.stance == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <button class="button button-primary" type="submit">筛选观点</button>
+    {% if request.GET %}<a class="button" href="{{ request.path }}">重置</a>{% endif %}
+  </form>
+  {% if stance_matrix %}<section class="panel mb-4"><header class="panel-header"><div><h2 class="section-title">机构多空矩阵</h2><p class="section-deck">按最新公开观点聚合，不代表机构整体仓位</p></div></header><div class="grid divide-y divide-[var(--line)] md:grid-cols-3 md:divide-x md:divide-y-0">{% for group in stance_matrix %}<div class="p-4"><div class="flex justify-between"><strong class="text-[12px]">{{ group.label|default:group.stance }}</strong><span class="mono">{{ group.count }}</span></div><div class="mt-3 flex flex-wrap gap-1.5">{% for bank in group.banks %}<span class="badge {% if group.stance == 'bullish' or group.stance == '看多' %}badge-positive{% elif group.stance == 'bearish' or group.stance == '看空' %}badge-negative{% endif %}">{{ bank }}</span>{% endfor %}</div></div>{% endfor %}</div></section>{% endif %}
+  <section class="panel"><header class="panel-header"><div><h2 class="section-title">研究条目</h2><p class="section-deck">按发布时间倒序</p></div><span class="badge">Link only</span></header><div class="data-table-wrap"><table class="data-table"><thead><tr><th>日期 / 机构</th><th>标题与摘要</th><th>主题</th><th>立场</th><th class="numeric">重要性</th><th>原文</th></tr></thead><tbody>
+    {% for item in page_obj %}<tr><td><time class="mono whitespace-nowrap">{{ item.published_at|date:"Y-m-d" }}</time><strong class="mt-1 block">{{ item.bank }}</strong></td><td class="max-w-2xl"><strong>{{ item.title }}</strong><p class="mt-1 line-clamp-2 text-[10px] leading-5 muted">{{ item.summary }}</p></td><td><span class="badge badge-accent">{{ item.category }}</span></td><td><span class="badge {% if item.stance == 'bullish' or item.stance == '看多' %}badge-positive{% elif item.stance == 'bearish' or item.stance == '看空' %}badge-negative{% endif %}">{{ item.stance|default:"未标注" }}</span></td><td class="numeric">{% if item.importance %}{{ item.importance }}/10{% else %}—{% endif %}</td><td><a class="button !min-h-8" href="{{ item.source_url }}" target="_blank" rel="noopener noreferrer">打开 ↗</a></td></tr>{% empty %}<tr><td colspan="6">{% include "research/includes/empty_state.html" with empty_title="没有匹配的机构观点" empty_href=request.path %}</td></tr>{% endfor %}
+  </tbody></table></div></section>
+  {% include "research/includes/pagination.html" %}
+</div>
+{% endblock %}

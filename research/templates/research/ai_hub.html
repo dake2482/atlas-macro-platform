@@ -1,0 +1,22 @@
+{% extends "research/base.html" %}
+{% block title %}AI 产业观察 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap page-grid">
+  {% include "research/includes/page_header.html" with eyebrow="AI industry intelligence" page_title="AI 产业观察" page_description="把算力、基础设施、模型与应用放进同一资本地图，用可追溯关系连接产业叙事与公司基本面。" as_of=as_of source=source %}
+  {% if required_notices %}<aside class="callout mb-4 text-[10px] leading-5" aria-label="数据授权声明">{% for notice in required_notices %}<p{% if not forloop.first %} class="mt-2"{% endif %}>{{ notice }}</p>{% endfor %}</aside>{% endif %}
+  <section class="grid gap-3 md:grid-cols-2 xl:grid-cols-5" aria-label="覆盖范围">
+    {% for stat in stats %}{% include "research/includes/metric_card.html" with metric=stat %}{% empty %}
+      <p class="panel col-span-full p-5 text-[11px] muted">尚无通过来源审核的 AI 产业覆盖数据。</p>
+    {% endfor %}
+  </section>
+  <div class="mt-4 grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
+    <a class="panel group panel-raised p-5 transition hover:-translate-y-1 hover:border-[var(--accent)]" href="/ai-industry/market-map/"><span class="eyebrow">01 / Capital map</span><h2 class="mt-4 text-2xl font-semibold tracking-[-.04em]">资本地图</h2><p class="mt-2 text-[12px] leading-6 muted">在九层产业链与五象限中筛选公司，比较增长、利润率、估值与叙事强度。</p><span class="mt-6 inline-flex text-[11px] font-semibold text-[var(--accent)]">进入地图 →</span></a>
+    <a class="panel group p-5 transition hover:-translate-y-1 hover:border-[var(--cyan)]" href="/ai-industry/graph/"><span class="eyebrow !text-[var(--cyan)]">02 / Knowledge graph</span><h2 class="mt-4 text-2xl font-semibold tracking-[-.04em]">关系图谱</h2><p class="mt-2 text-[12px] leading-6 muted">从供应、客户、技术依赖与资本开支连接节点；每条边保留证据与审核状态。</p><span class="mt-6 inline-flex text-[11px] font-semibold text-[var(--cyan)]">探索关系 →</span></a>
+    <a class="panel group p-5 transition hover:-translate-y-1 hover:border-[var(--warning)]" href="/ai-industry/chain/model-evolution/"><span class="eyebrow !text-[var(--warning)]">03 / Frontier models</span><h2 class="mt-4 text-2xl font-semibold tracking-[-.04em]">模型演变</h2><p class="mt-2 text-[12px] leading-6 muted">对齐发布时间、上下文、公开价格与独立基准，避免只按单项榜单判断能力。</p><span class="mt-6 inline-flex text-[11px] font-semibold text-[var(--warning)]">查看时间线 →</span></a>
+  </div>
+  <div class="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.45fr)_minmax(18rem,.55fr)]">
+    {% include "research/includes/chart_panel.html" with chart_id="ai-hub-map-chart" chart_title="AI 价值链资本分布" chart_description="按节点聚合的市值、增长与估值分布" chart_data=chart_data chart_kind="bar" chart_class="chart-tall" source=source as_of=as_of %}
+    <section class="panel"><header class="panel-header"><div><h2 class="section-title">近期催化剂</h2><p class="section-deck">财报、发布、供应链与监管事件</p></div></header><div class="panel-body timeline">{% for event in catalysts %}<article class="timeline-item"><span class="timeline-dot"></span><time class="mono text-[9px] muted">{{ event.date|default:event.at|date:"m-d" }}</time><h3 class="mt-1 text-[12px] font-semibold">{{ event.title|default:event.name }}</h3><p class="mt-1 text-[10px] leading-4 muted">{{ event.description|default:event.note }}</p></article>{% empty %}<p class="pl-6 text-[11px] muted">暂无已审核催化剂。</p>{% endfor %}</div></section>
+  </div>
+</div>
+{% endblock %}

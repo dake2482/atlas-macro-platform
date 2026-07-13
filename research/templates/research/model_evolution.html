@@ -1,0 +1,16 @@
+{% extends "research/base.html" %}
+{% block title %}大模型演变 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Frontier model timeline" page_title="大模型演变" page_description="能力、成本、上下文与发布时间同屏对齐；榜单分数保留测试版本和来源，不跨版本硬比较。" as_of=as_of source=source %}
+  {% if metrics %}<div class="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">{% for metric in metrics %}{% include "research/includes/metric_card.html" with metric=metric %}{% endfor %}</div>{% endif %}
+  <div class="grid gap-4 xl:grid-cols-2">
+    {% include "research/includes/chart_panel.html" with chart_id="model-capability-chart" chart_title="Terminal-Bench 2.1" chart_description="厂商发布页披露值；不同 harness 与 effort 可能影响结果，不视为独立综合排名" chart_data=capability_data chart_kind="scatter" source=source as_of=as_of %}
+    {% include "research/includes/chart_panel.html" with chart_id="model-cost-chart" chart_title="能力 / 成本效率" chart_description="公开 API 标价，未包含缓存、批处理或企业折扣" chart_data=cost_data chart_kind="scatter" source=source as_of=as_of %}
+  </div>
+  <section class="panel mt-4"><header class="panel-header"><div><h2 class="section-title">模型参考表</h2><p class="section-deck">按 Terminal-Bench 2.1 披露值排序；逐条保留来源与核验日期</p></div><span class="badge badge-accent">{{ models|length }} models</span></header><div class="data-table-wrap"><table class="data-table"><thead><tr><th>模型 / 厂商</th><th>发布日期</th><th>层级</th><th class="numeric">TB 2.1</th><th class="numeric">上下文</th><th class="numeric">输入 $/M</th><th class="numeric">输出 $/M</th><th>详情</th></tr></thead><tbody>
+    {% for model in models %}<tr><td><strong>{{ model.name }}</strong><p class="mt-1 text-[9px] muted">{{ model.provider }}</p></td><td class="mono">{{ model.release_date|date:"Y-m-d" }}</td><td><span class="badge badge-accent">{{ model.tier }}</span></td><td class="numeric positive">{% if model.capability_score %}{{ model.capability_score|floatformat:1 }}{% else %}—{% endif %}</td><td class="numeric">{% if model.context_tokens %}{{ model.context_tokens }}{% else %}—{% endif %}</td><td class="numeric">{{ model.input_price|floatformat:3|default:"—" }}</td><td class="numeric">{{ model.output_price|floatformat:3|default:"—" }}</td><td><a class="button !min-h-8" href="{{ model.get_absolute_url }}">查看</a></td></tr>{% empty %}<tr><td colspan="8" class="muted text-center">模型资料待回填。</td></tr>{% endfor %}
+  </tbody></table></div></section>
+  {% if agents %}<section class="panel mt-4"><header class="panel-header"><div><h2 class="section-title">Coding Agent 目录</h2><p class="section-deck">官方产品信息；没有统一独立评测时不填排名</p></div></header><div class="grid gap-3 p-4 sm:grid-cols-2 xl:grid-cols-3">{% for agent in agents %}<a class="rounded-lg border hairline p-4 hover:border-[var(--accent)]" href="{{ agent.get_absolute_url }}"><div class="flex justify-between gap-3"><span class="badge">{{ agent.product_type }}</span><span class="mono positive">{% if agent.capability_score %}{{ agent.capability_score }}{% else %}待统一评测{% endif %}</span></div><h3 class="mt-3 text-[14px] font-semibold">{{ agent.name }}</h3><p class="text-[10px] muted">{{ agent.provider }} · {{ agent.price_label }}</p><p class="mt-2 line-clamp-2 text-[10px] leading-5 muted">{{ agent.description }}</p></a>{% endfor %}</div></section>{% endif %}
+</div>
+{% endblock %}

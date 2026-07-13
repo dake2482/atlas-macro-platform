@@ -1,0 +1,30 @@
+<article class="metric-card">
+  <div class="flex items-start justify-between gap-3">
+    <p class="metric-label">{% if metric.label %}{{ metric.label }}{% elif metric.name %}{{ metric.name }}{% else %}指标{% endif %}</p>
+    {% if metric.quality_status or metric.status %}
+      <span class="badge {% if metric.quality_status == 'fresh' or metric.status == 'fresh' %}badge-positive{% elif metric.quality_status == 'error' or metric.status == 'error' %}badge-negative{% else %}badge-warning{% endif %}">{% if metric.get_quality_status_display %}{{ metric.get_quality_status_display }}{% elif metric.quality_status %}{{ metric.quality_status }}{% else %}{{ metric.status }}{% endif %}</span>
+    {% endif %}
+  </div>
+  <p class="metric-value">{% if metric.display_value %}{{ metric.display_value }}{% elif metric.value != None %}{{ metric.value }}{% else %}—{% endif %}{% if metric.unit and not metric.display_value %}<small class="ml-1 text-[11px] text-[var(--muted)]">{{ metric.unit }}</small>{% endif %}</p>
+  {% if metric.change != None %}
+    <p class="metric-delta {% if metric.change > 0 %}positive{% elif metric.change < 0 %}negative{% else %}muted{% endif %}">
+      {% if metric.change > 0 %}+{% endif %}{{ metric.change }}
+      {% if metric.change_unit %}<span>{{ metric.change_unit }}</span>{% endif %}
+      <span class="ml-1 text-[var(--faint)]">较前值</span>
+    </p>
+  {% else %}
+    <p class="metric-delta text-[var(--faint)]">暂无可比前值</p>
+  {% endif %}
+  {% if metric.as_of or metric.source %}
+    <div class="source-line absolute bottom-3 left-4 right-4">
+      {% if metric.source %}<span class="metric-source">{% if metric.source.name %}{{ metric.source.name }}{% else %}{{ metric.source }}{% endif %}</span>{% endif %}
+      <span class="metric-times text-right">
+        {% if metric.value_date %}<time class="block" datetime="{{ metric.value_date }}">数值 {{ metric.value_date|slice:":10" }}</time>{% elif metric.as_of %}<time class="block" datetime="{{ metric.as_of }}">数值 {{ metric.as_of|slice:":10" }}</time>{% endif %}
+        {% if metric.fetched_at %}<time class="block" datetime="{{ metric.fetched_at }}">抓取 {{ metric.fetched_at|slice:"5:16" }}</time>{% endif %}
+        {% if metric.batch_id %}<span class="block">批次 {{ metric.batch_id }}</span>{% elif metric.publication_batch_id %}<span class="block">批次 {{ metric.publication_batch_id }}</span>{% else %}<span class="block">批次 —</span>{% endif %}
+        <span class="block">许可 {{ metric.license_scope|default:"—" }}</span>
+        <span class="block">fallback {{ metric.fallback_source|default:"无" }}</span>
+      </span>
+    </div>
+  {% endif %}
+</article>

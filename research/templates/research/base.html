@@ -1,0 +1,138 @@
+{% load static %}
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  {% firstof page_title title "研究工作台" as meta_title %}
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#101411">
+  <meta name="description" content="Atlas Macro：可追溯的宏观、市场与 AI 产业研究工作台。">
+  <meta name="robots" content="{% block robots %}index,follow{% endblock %}">
+  <meta property="og:title" content="{{ meta_title }} · {{ site_name }}">
+  <meta property="og:description" content="可追溯的宏观、市场与 AI 产业研究工作台。">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="{{ site_url }}{{ request.path }}">
+  <meta property="og:site_name" content="{{ site_name }}">
+  <meta name="twitter:card" content="summary">
+  <title>{% block title %}{{ page_title|default:"研究工作台" }} · {{ site_name }}{% endblock %}</title>
+  <link rel="canonical" href="{{ site_url }}{{ request.path }}">
+  <link rel="manifest" href="{% static 'research/manifest.webmanifest' %}">
+  <link rel="icon" href="{% static 'research/icon.svg' %}" type="image/svg+xml">
+  <link rel="stylesheet" href="{% static 'research/css/app.css' %}">
+  <script>
+    try { document.documentElement.dataset.theme = localStorage.getItem('atlas-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); } catch (_) {}
+  </script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"{{ site_name|escapejs }}","url":"{{ site_url|escapejs }}","potentialAction":{"@type":"SearchAction","target":"{{ site_url|escapejs }}/search/?q={search_term_string}","query-input":"required name=search_term_string"}}</script>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <div class="app-grid">
+    <div class="mobile-backdrop lg:hidden" data-nav-backdrop hidden></div>
+    <aside class="sidebar" id="site-navigation" aria-label="主要导航">
+      <div class="flex h-[4.25rem] shrink-0 items-center justify-between border-b border-white/8 px-4">
+        <a href="/" class="flex items-center gap-3" aria-label="Atlas Macro 首页">
+          <span class="site-mark" aria-hidden="true">AM</span>
+          <span>
+            <strong class="block text-[13px] leading-none tracking-[-.02em] text-white">Atlas Macro</strong>
+            <span class="mt-1 block font-mono text-[8px] uppercase tracking-[.19em] text-[#7f8b82]">Research terminal</span>
+          </span>
+        </a>
+        <button class="icon-button button button-ghost lg:hidden !border-white/10 !text-white" type="button" data-nav-toggle aria-expanded="false" aria-controls="site-navigation" aria-label="关闭菜单">×</button>
+      </div>
+
+      <div class="px-3 py-3">
+        <form action="/search/" method="get" role="search">
+          <label class="sr-only" for="sidebar-search">搜索全站</label>
+          <div class="relative">
+            <span class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-xs text-[#6f7b73]" aria-hidden="true">⌕</span>
+            <input id="sidebar-search" class="h-9 w-full rounded-md border border-white/8 bg-white/[.035] pl-8 pr-12 text-[11px] text-white placeholder:text-[#657068] focus:border-[#a6d93e] focus:outline-none" name="q" value="{{ request.GET.q }}" placeholder="搜索指标、公司、报告" data-site-search>
+            <kbd class="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded border border-white/10 px-1.5 py-0.5 font-mono text-[8px] text-[#68746c]">⌘K</kbd>
+          </div>
+        </form>
+      </div>
+
+      <nav class="sidebar-scroll flex-1 pb-6">
+        {% for group in nav_groups %}
+          <details class="nav-section group" {% if not group.root or group.root in current_path %}open{% endif %}>
+            <summary class="nav-label cursor-pointer list-none">
+              <span>{{ group.label }}</span>
+              <span class="transition-transform group-open:rotate-90" aria-hidden="true">›</span>
+            </summary>
+            <div>
+              {% for label, href in group.items %}
+                <a class="nav-link" href="{{ href }}" {% if current_path == href %}aria-current="page"{% endif %}>{{ label }}</a>
+              {% endfor %}
+            </div>
+          </details>
+        {% endfor %}
+      </nav>
+
+      <div class="shrink-0 border-t border-white/8 p-3">
+        <div class="flex items-center justify-between rounded-lg bg-white/[.035] px-3 py-2.5">
+          <div>
+            <span class="block font-mono text-[9px] uppercase tracking-wider text-[#657168]">Market clock</span>
+            <time class="mt-1 block font-mono text-[10px] text-[#c6d0c8]" data-et-clock>--:-- ET</time>
+          </div>
+          <span class="relative flex h-2 w-2" title="系统在线">
+            <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#a8da42] opacity-40"></span>
+            <span class="relative inline-flex h-2 w-2 rounded-full bg-[#a8da42]"></span>
+          </span>
+        </div>
+      </div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <div class="flex min-w-0 items-center gap-3">
+          <button class="button icon-button button-ghost lg:hidden" type="button" data-nav-toggle aria-expanded="false" aria-controls="site-navigation" aria-label="打开菜单">
+            <span aria-hidden="true">☰</span>
+          </button>
+          <nav class="min-w-0 text-[11px] text-[var(--muted)]" aria-label="面包屑">
+            <ol class="flex min-w-0 items-center gap-1.5 whitespace-nowrap">
+              <li><a href="/" class="hover:text-[var(--ink)]">Atlas</a></li>
+              {% if breadcrumbs %}
+                {% for crumb in breadcrumbs %}
+                  {% firstof crumb.label crumb.0 as crumb_label %}
+                  {% firstof crumb.url crumb.1 as crumb_url %}
+                  <li class="text-[var(--faint)]" aria-hidden="true">/</li>
+                  <li class="truncate" {% if forloop.last %}aria-current="page"{% endif %}>
+                    {% if crumb_url and not forloop.last %}<a href="{{ crumb_url }}" class="hover:text-[var(--ink)]">{{ crumb_label }}</a>{% else %}{{ crumb_label }}{% endif %}
+                  </li>
+                {% endfor %}
+              {% elif page_title %}
+                <li class="text-[var(--faint)]" aria-hidden="true">/</li>
+                <li class="truncate" aria-current="page">{{ page_title }}</li>
+              {% endif %}
+            </ol>
+          </nav>
+        </div>
+        <div class="flex shrink-0 items-center gap-2">
+          <span class="badge hidden md:inline-flex"><span class="!hidden"></span>只读研究</span>
+          <button class="button icon-button button-ghost" type="button" data-theme-toggle aria-label="切换颜色主题" title="切换颜色主题"><span data-theme-icon aria-hidden="true">◐</span><span class="sr-only" data-theme-label>切换主题</span></button>
+        </div>
+      </header>
+
+      {% if messages %}
+        <div class="content-wrap !pb-0" role="status" aria-live="polite">
+          {% for message in messages %}
+            <div class="callout mb-2">{{ message }}</div>
+          {% endfor %}
+        </div>
+      {% endif %}
+
+      <main id="main-content" tabindex="-1">
+        {% block content %}{% endblock %}
+        {% if data_requirements %}<div class="content-wrap !pt-0">{% include "research/includes/data_requirements_panel.html" %}</div>{% endif %}
+      </main>
+
+      <footer class="border-t hairline px-4 py-6 text-center text-[10px] text-[var(--faint)] sm:px-8">
+        <p>Atlas Macro 仅供研究与教育，不构成投资建议。所有数值均应结合来源、口径与更新时间解读。</p>
+        <p class="mt-1 font-mono">Clean-room research interface · source-first · read-only</p>
+      </footer>
+    </div>
+  </div>
+  <script src="{% static 'research/js/app.js' %}" defer></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

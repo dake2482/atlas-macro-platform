@@ -1,0 +1,8 @@
+{% extends "research/base.html" %}
+{% block title %}当前离线 · {{ site_name }}{% endblock %}
+{% block robots %}noindex,nofollow{% endblock %}
+{% block content %}
+<div class="content-wrap flex min-h-[70vh] items-center justify-center">
+  <section class="panel panel-raised w-full max-w-2xl p-7 text-center sm:p-12"><span class="empty-glyph" aria-hidden="true">↯</span><p class="eyebrow">Offline mode</p><h1 class="mt-4 text-3xl font-semibold tracking-[-.04em]">暂时无法连接 Atlas Macro</h1><p class="mx-auto mt-3 max-w-lg text-[12px] leading-6 muted">页面外壳已离线可用，但研究数据需要网络连接并核对最新批次。恢复网络后重试，不会以缓存数据冒充实时数据。</p><button class="button button-primary mt-6" type="button" onclick="location.reload()">重新连接</button></section>
+</div>
+{% endblock %}

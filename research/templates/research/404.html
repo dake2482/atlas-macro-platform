@@ -1,0 +1,8 @@
+{% extends "research/base.html" %}
+{% block title %}页面未找到 · {{ site_name }}{% endblock %}
+{% block robots %}noindex,follow{% endblock %}
+{% block content %}
+<div class="content-wrap flex min-h-[70vh] items-center justify-center">
+  <section class="panel panel-raised w-full max-w-2xl p-7 text-center sm:p-12"><p class="eyebrow">HTTP 404 / Not found</p><p class="mono mt-5 text-7xl font-semibold text-[var(--faint)]">404</p><h1 class="mt-5 text-3xl font-semibold tracking-[-.04em]">这条研究路径不存在</h1><p class="mx-auto mt-3 max-w-lg text-[12px] leading-6 muted">路径可能已改变，或动态对象尚未进入公开数据库。试试全站搜索，或从市场仪表盘重新进入。</p><form class="mx-auto mt-6 flex max-w-md gap-2" action="/search/" method="get"><label class="sr-only" for="not-found-search">搜索</label><input class="control" id="not-found-search" name="q" placeholder="搜索指标、公司、报告"><button class="button button-primary" type="submit">搜索</button></form><a class="button button-ghost mt-3" href="/">返回首页</a></section>
+</div>
+{% endblock %}

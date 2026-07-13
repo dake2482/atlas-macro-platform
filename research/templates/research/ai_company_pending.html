@@ -1,0 +1,50 @@
+{% extends "research/base.html" %}
+{% block title %}{{ contract_slug }} · 公司数据待接入 · {{ site_name }}{% endblock %}
+{% block robots %}noindex,nofollow{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  <header class="mb-6 border-b hairline pb-6">
+    <div class="flex flex-wrap items-center gap-2">
+      <span class="eyebrow">Company contract route</span>
+      <span class="badge">URL 已兼容</span>
+      <span class="badge badge-negative">数据待接入</span>
+    </div>
+    <h1 class="page-title mt-4">公司数据待接入</h1>
+    <p class="page-deck mt-2">合同标识 <code class="mono">{{ contract_slug }}</code> 已通过公开 URL 审计，但本站尚无法展示具备来源、许可和时点的公司档案。</p>
+  </header>
+
+  <section class="callout mb-4" role="status">
+    <h2 class="section-title">为什么这个页面没有公司数值？</h2>
+    <p class="mt-2 text-[11px] leading-5">该路径只用于保持公开信息架构兼容。在完成实体身份核验、来源授权和数据质量检查前，我们不会创建占位公司，也不会填充价格、市值、财务、估值或评级。该路由不进入公司数量、排名、筛选和搜索结果。</p>
+  </section>
+
+  <section class="panel">
+    <header class="panel-header">
+      <div>
+        <h2 class="section-title">接入状态与采购建议</h2>
+        <p class="section-deck">先用官方一手数据；需要公开展示商业数据时，必须取得明确的缓存与再分发权。</p>
+      </div>
+    </header>
+    <div class="data-table-wrap">
+      <table class="data-table">
+        <thead>
+          <tr><th>数据域</th><th>当前状态</th><th>优先来源</th><th>启用条件 / 采购建议</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>实体与上市标识</td><td><span class="badge badge-negative">未核验</span></td><td>公司官网、交易所公告、监管机构登记</td><td>人工确认法定实体、主要证券、交易所和报告币种；官方来源通常无需采购。</td></tr>
+          <tr><td>监管申报与三年财务</td><td><span class="badge badge-negative">未接入</span></td><td>SEC EDGAR/XBRL、当地交易所、公司 IR</td><td>美国申报人优先使用 SEC；非美国报表若要跨市场标准化，建议采购允许公开再分发的全球基本面数据许可。</td></tr>
+          <tr><td>价格、市值与区间收益</td><td><span class="badge badge-negative">未授权</span></td><td>持牌交易所或授权行情供应商</td><td>采购范围必须覆盖延迟/收盘行情、历史缓存及网页再分发；不使用仅限个人查询的接口。</td></tr>
+          <tr><td>估值与可比公司</td><td><span class="badge badge-negative">不计算</span></td><td>经审核财务 + 同时点授权行情</td><td>上游两类数据同批次可用后再派生 P/E、P/S 等指标，并保留公式、口径与 as-of。</td></tr>
+          <tr><td>评级、一致预期与目标价</td><td><span class="badge badge-negative">不展示</span></td><td>自有审核研究或获授权的机构共识数据</td><td>如需展示卖方共识，必须采购含对外展示权的评级/预期许可；否则继续保持空白。</td></tr>
+          <tr><td>催化剂、风险与产业链关系</td><td><span class="badge badge-negative">待审核</span></td><td>公司公告、投资者材料、交易所文件、授权新闻</td><td>每条关系要有证据 URL、发布日期、审核状态和置信度；商业新闻只在获得摘要/再分发权后使用。</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="mt-4 flex flex-wrap gap-2">
+    <a class="button" href="/ai-industry/market-map/">返回 AI 资本地图</a>
+    <a class="button button-ghost" href="/data-sources/">查看数据源与许可</a>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,23 @@
+<section class="panel {{ panel_class }}" aria-labelledby="{{ chart_id }}-title">
+  <header class="panel-header">
+    <div>
+      <h2 class="section-title" id="{{ chart_id }}-title">{{ chart_title|default:"趋势" }}</h2>
+      {% if chart_description %}<p class="section-deck">{{ chart_description }}</p>{% endif %}
+    </div>
+    {% if chart_badge %}<span class="badge badge-accent">{{ chart_badge }}</span>{% elif quality_status %}<span class="badge {% if quality_status == 'fresh' %}badge-positive{% else %}badge-warning{% endif %}">{{ quality_status }}</span>{% endif %}
+  </header>
+  <div class="panel-body !pt-2">
+    <div class="chart {{ chart_class }}" data-chart data-chart-kind="{{ chart_kind|default:'line' }}" data-chart-source="{{ chart_id }}" data-empty-label="暂无可视化数据" role="img" aria-label="{{ chart_title|default:'数据图表' }}"></div>
+    {% if chart_data %}{{ chart_data|json_script:chart_id }}{% else %}<script id="{{ chart_id }}" type="application/json">null</script>{% endif %}
+  </div>
+  {% if sources or source or as_of or fetched_at or batch_ids or license_scopes %}
+    <footer class="source-line border-t hairline px-4 py-2">
+      {% if sources %}<span>来源：{% for item_source in sources %}{% if item_source.homepage %}<a href="{{ item_source.homepage }}" target="_blank" rel="noopener noreferrer">{{ item_source.name }}</a>{% else %}{{ item_source.name }}{% endif %}{% if not forloop.last %} / {% endif %}{% endfor %}</span>{% elif source %}<span>来源：{{ source.name|default:source }}</span>{% endif %}
+      {% if as_of %}<span>数值截至：{{ as_of|date:"Y-m-d"|default:as_of|slice:":10" }}</span>{% endif %}
+      {% if fetched_at %}<span>抓取：{{ fetched_at|date:"Y-m-d H:i"|default:fetched_at|slice:":16" }}</span>{% endif %}
+      <span>批次：{% if batch_ids %}{{ batch_ids|join:", " }}{% else %}—{% endif %}</span>
+      <span>许可：{% if license_scopes %}{{ license_scopes|join:" / " }}{% else %}—{% endif %}</span>
+      <span>fallback：{% if fallback_sources %}{{ fallback_sources|join:", " }}{% else %}无{% endif %}</span>
+    </footer>
+  {% endif %}
+</section>

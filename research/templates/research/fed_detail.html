@@ -1,0 +1,36 @@
+{% extends "research/base.html" %}
+{% block title %}{{ object.title }} · {{ site_name }}{% endblock %}
+{% block content %}
+{% with item=object %}
+<article class="content-wrap">
+  <header class="mx-auto max-w-5xl border-b hairline pb-7">
+    <div class="flex flex-wrap items-center gap-2"><span class="eyebrow">Federal Reserve</span><span class="badge">{{ item.get_document_type_display|default:item.document_type }}</span>{% if item.speaker %}<span class="badge">{{ item.speaker }}</span>{% endif %}</div>
+    <h1 class="page-title mt-4">{{ item.title }}</h1>
+    <div class="mt-5 flex flex-wrap items-center gap-3"><time class="mono text-[11px] muted">{{ item.published_at|date:"Y-m-d H:i T" }}</time><a class="button button-primary" href="{{ item.original_url }}" target="_blank" rel="noopener noreferrer">阅读官方原文 ↗</a><button class="button button-ghost" type="button" data-copy-link>复制链接</button></div>
+  </header>
+
+  <div class="mx-auto mt-6 grid max-w-5xl gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]">
+    <div class="grid gap-4">
+      <section class="panel"><header class="panel-header"><div><h2 class="section-title">官方 RSS 描述 / 摘要</h2><p class="section-deck">Federal Reserve RSS 元数据；不是 Atlas 分析，也不是正文副本</p></div><span class="badge">官方元数据</span></header><div class="panel-body prose-atlas">{% if item.official_description %}{{ item.official_description|linebreaks }}{% else %}<p class="muted">官方 RSS 未提供描述，请通过原文链接阅读完整文件。</p>{% endif %}</div></section>
+
+      <section class="panel"><header class="panel-header"><div><h2 class="section-title">{% if item.has_public_analysis %}Atlas 分析摘要{% else %}Atlas 分析状态{% endif %}</h2><p class="section-deck">自有分析与官方描述严格分离</p></div>{% if item.has_public_analysis and item.analysis_status == "ai_generated" %}<span class="badge badge-warning">AI generated · 未人工审核</span>{% elif item.has_public_analysis and item.analysis_status == "reviewed" %}<span class="badge badge-positive">已人工审核</span>{% else %}<span class="badge">未发布</span>{% endif %}</header>
+        <div class="panel-body prose-atlas">
+          {% if item.has_public_analysis %}
+            {{ item.summary|linebreaks }}
+            {% if item.key_points %}<h2>关键要点</h2><ul>{% for point in item.key_points %}<li>{{ point.text|default:point }}</li>{% endfor %}</ul>{% endif %}
+            <h2>分析 provenance</h2>
+            <dl class="grid gap-2 text-[11px]"><div><dt class="font-semibold">模型</dt><dd class="muted">{{ item.analysis_model }}</dd></div><div><dt class="font-semibold">提示词版本</dt><dd class="muted">{{ item.analysis_prompt_version }}</dd></div><div><dt class="font-semibold">生成时间</dt><dd class="mono muted">{{ item.analysis_generated_at|date:"Y-m-d H:i T" }}</dd></div>{% if item.analysis_status == "reviewed" %}<div><dt class="font-semibold">审核</dt><dd class="muted">{{ item.reviewed_by }} · {{ item.reviewed_at|date:"Y-m-d H:i T" }}</dd></div>{% endif %}</dl>
+            <h2>证据</h2><ul>{% for evidence in item.public_analysis_evidence %}<li>{% if evidence.label %}{{ evidence.label }}{% elif evidence.id %}{{ evidence.id }}{% else %}{{ evidence.source_id }}{% endif %}{% if evidence.url %} · <a href="{{ evidence.url }}" target="_blank" rel="noopener noreferrer">来源 ↗</a>{% endif %}</li>{% endfor %}</ul>
+          {% else %}
+            <p class="muted">尚无 provenance 完整且状态允许公开的 Atlas 分析。草稿、被拒绝记录和待复核的 legacy enrichment 均不会展示。</p>
+          {% endif %}
+        </div>
+      </section>
+    </div>
+
+    <aside class="grid content-start gap-4"><section class="panel"><header class="panel-header"><h2 class="section-title">鹰鸽温度</h2></header><div class="panel-body text-center">{% if item.has_public_score %}<p class="mono text-5xl {% if item.hawkish_score > 0 %}negative{% elif item.hawkish_score < 0 %}positive{% endif %}">{% if item.hawkish_score > 0 %}+{% endif %}{{ item.hawkish_score }}</p><p class="mt-2 text-[10px] uppercase tracking-wider muted">-5 鸽派 · +5 鹰派</p>{% else %}<p class="mono text-5xl muted">—</p><p class="mt-2 text-[10px] uppercase tracking-wider muted">待评分</p>{% endif %}</div></section><div class="callout text-[11px] leading-5">评分只在分析可公开且存在明确分值时展示；已审核综合分不纳入 AI 未审核记录。</div></aside>
+  </div>
+  {% if related_documents %}<section class="mx-auto mt-5 max-w-5xl"><h2 class="section-title mb-3">相关文档</h2><div class="grid gap-3 md:grid-cols-2">{% for related in related_documents %}<a class="panel block p-4 hover:border-[var(--accent)]" href="{% if related.get_absolute_url %}{{ related.get_absolute_url }}{% else %}/fed/document/{{ related.slug }}/{% endif %}"><time class="mono text-[9px] muted">{{ related.published_at|date:"Y-m-d" }}</time><h3 class="mt-2 text-[12px] font-semibold">{{ related.title }}</h3></a>{% endfor %}</div></section>{% endif %}
+</article>
+{% endwith %}
+{% endblock %}

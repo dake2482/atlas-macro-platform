@@ -1,0 +1,9 @@
+{% if page_obj and page_obj.paginator.num_pages > 1 %}
+  <nav class="pagination" aria-label="分页">
+    <p class="text-[11px] text-[var(--muted)]">第 <span class="mono text-[var(--ink)]">{{ page_obj.number }}</span> / {{ page_obj.paginator.num_pages }} 页 · 共 {{ page_obj.paginator.count }} 项</p>
+    <div class="flex items-center gap-2">
+      {% if page_obj.has_previous %}<a class="button" href="{% querystring page=page_obj.previous_page_number %}" rel="prev">← 上一页</a>{% endif %}
+      {% if page_obj.has_next %}<a class="button" href="{% querystring page=page_obj.next_page_number %}" rel="next">下一页 →</a>{% endif %}
+    </div>
+  </nav>
+{% endif %}

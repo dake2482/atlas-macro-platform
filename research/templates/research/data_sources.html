@@ -1,0 +1,17 @@
+{% extends "research/base.html" %}
+{% block title %}数据源与采购台账 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Source governance" page_title="数据源与采购台账" page_description="逐页跟踪真实数据接入、代理指标、许可审核和商业采购缺口。" %}
+  <section class="mb-4 grid grid-cols-2 gap-3 md:grid-cols-5">
+    {% for key, count in status_counts.items %}<article class="metric-card"><p class="metric-label">{{ key }}</p><p class="metric-value">{{ count }}</p></article>{% endfor %}
+  </section>
+  {% include "research/includes/data_requirements_panel.html" with data_requirements=requirements %}
+  <section class="panel mt-4">
+    <header class="panel-header"><div><h2 class="section-title">来源与许可决策</h2><p class="section-deck">数据可获得不等于可公开再分发。</p></div></header>
+    <div class="data-table-wrap"><table class="data-table"><thead><tr><th>来源</th><th>类型</th><th>许可状态</th><th>公网展示</th><th>派生展示</th><th>历史存储</th><th>AI 使用</th><th>归属 / 范围</th></tr></thead><tbody>
+      {% for source in sources %}{% with licence=source.public_licenses.0 %}<tr><td><strong>{{ source.name }}</strong><p class="text-[9px] muted">{{ source.key }}</p></td><td>{{ source.kind }}</td><td><span class="badge">{% if licence %}{{ licence.get_status_display }}{% else %}未审核{% endif %}</span></td><td>{% if licence.public_display_allowed %}<span class="positive">允许</span>{% else %}<span class="negative">未确认</span>{% endif %}</td><td>{% if licence.derived_display_allowed %}<span class="positive">允许</span>{% else %}<span class="negative">未确认</span>{% endif %}</td><td>{% if licence.historical_storage_allowed %}<span class="positive">允许</span>{% else %}<span class="negative">未确认</span>{% endif %}</td><td>{% if licence.ai_use_allowed %}<span class="positive">允许</span>{% else %}<span class="negative">未确认</span>{% endif %}</td><td class="max-w-xl text-[10px] muted">{{ source.attribution }}{% if source.license_scope %}<p>{{ source.license_scope }}</p>{% endif %}{% if licence.terms_url %}<a class="positive" href="{{ licence.terms_url }}" target="_blank" rel="noopener noreferrer">条款 ↗</a>{% endif %}</td></tr>{% endwith %}{% endfor %}
+    </tbody></table></div>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,50 @@
+[project]
+name = "atlas-macro"
+version = "0.1.0"
+description = "Clean-room macro research and AI supply-chain intelligence platform"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "brotli>=1.1,<2",
+  "Django>=5.2,<5.3",
+  "celery>=5.5,<6",
+  "dj-database-url>=3,<4",
+  "gunicorn>=23,<24",
+  "httpx>=0.28,<1",
+  "openpyxl>=3.1,<4",
+  "pypdf>=6,<7",
+  "psycopg[binary]>=3.2,<4",
+  "python-dateutil>=2.9,<3",
+  "redis>=6,<7",
+  "whitenoise>=6.9,<7",
+  "xlrd>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "coverage>=7.9,<8",
+  "pytest>=8.4,<9",
+  "pytest-django>=4.11,<5",
+  "ruff>=0.12,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["atlasmacro", "research"]
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "atlasmacro.settings"
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["research/migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

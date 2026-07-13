@@ -1,0 +1,39 @@
+{% extends "research/base.html" %}
+{% block title %}{{ page_title|default:"美联储文档" }} · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% if mode == "hawkish" %}
+    {% include "research/includes/page_header.html" with eyebrow="Fed language index" page_title=title page_description="仅展示 provenance 完整的 Atlas 分析；综合分只纳入已人工审核记录。" %}
+  {% else %}
+    {% include "research/includes/page_header.html" with eyebrow="Federal Reserve watch" page_title=title page_description="官方 RSS 描述与 Atlas 自有分析分栏展示；未审核或缺少来源记录的内容不会冒充正式研判。" %}
+  {% endif %}
+
+  {% if mode == "hub" or mode == "hawkish" %}
+    <section class="mb-4 grid gap-3 sm:grid-cols-2">
+      <article class="metric-card"><p class="metric-label">已审核鹰鸽均分</p><p class="metric-value">{% if average_score != None %}{{ average_score|floatformat:2 }}{% else %}—{% endif %}</p><p class="text-[10px] muted">只计算 provenance 完整、已人工审核且有评分的记录</p></article>
+      <article class="metric-card"><p class="metric-label">分析生产状态</p><p class="metric-value !text-xl">待形成定时闭环</p><p class="text-[10px] muted">官方文本已接入；自动证据绑定、提示词版本和审核仍在建设</p></article>
+    </section>
+  {% endif %}
+
+  <form class="filter-bar mb-4" method="get">
+    <label class="field field-grow"><span class="field-label">搜索</span><input class="control" name="q" value="{{ filters.q }}" placeholder="标题、官员、官方描述或 Atlas 分析"></label>
+    {% if show_type_filter %}<label class="field"><span class="field-label">类型</span><select class="control" name="type"><option value="">全部文档</option>{% for value, label in type_choices %}<option value="{{ value }}" {% if filters.type == value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>{% endif %}
+    <button class="button button-primary" type="submit">筛选</button>
+  </form>
+
+  <div class="grid gap-3">
+    {% for document in documents %}
+      <article class="panel transition hover:border-[var(--accent)]"><div class="grid gap-4 p-4 md:grid-cols-[8rem_minmax(0,1fr)_7rem] md:items-start">
+        <div><time class="mono text-[10px] muted">{{ document.published_at|date:"Y-m-d H:i" }}</time><p class="mt-2"><span class="badge">{{ document.get_document_type_display|default:document.document_type }}</span></p>{% if document.speaker %}<p class="mt-2 text-[11px] font-semibold">{{ document.speaker }}</p>{% endif %}</div>
+        <div>
+          <h2 class="text-[15px] font-semibold tracking-[-.02em]"><a class="hover:text-[var(--accent)]" href="{% if document.document_type == 'speech' %}/fed/speeches/{{ document.slug }}/{% elif document.document_type == 'news' %}/fed/news/{{ document.slug }}/{% else %}/fed/statements/{{ document.slug }}/{% endif %}">{{ document.title }}</a></h2>
+          <div class="mt-2 text-[11px] leading-5"><span class="font-semibold">官方 RSS 描述 / 摘要：</span>{% if document.official_description %}<span class="muted">{{ document.official_description|truncatechars:260 }}</span>{% else %}<span class="muted">RSS 未提供描述，请阅读官方原文。</span>{% endif %}</div>
+          {% if document.has_public_analysis %}<div class="mt-2 border-l-2 border-[var(--accent)] pl-3 text-[11px] leading-5"><span class="font-semibold">Atlas 分析：</span><span class="muted">{{ document.summary|truncatechars:260 }}</span>{% if document.analysis_status == "ai_generated" %}<span class="badge badge-warning ml-2">未人工审核</span>{% elif document.analysis_status == "reviewed" %}<span class="badge badge-positive ml-2">已人工审核</span>{% endif %}</div>{% else %}<p class="mt-2 text-[10px] muted">Atlas 分析未发布；草稿、拒绝或缺 provenance 的旧内容不会展示。</p>{% endif %}
+        </div>
+        <div class="md:text-right">{% if document.has_public_score %}<span class="mono text-lg {% if document.hawkish_score > 0 %}negative{% elif document.hawkish_score < 0 %}positive{% endif %}">{% if document.hawkish_score > 0 %}+{% endif %}{{ document.hawkish_score }}</span><span class="block text-[9px] uppercase tracking-wider muted">鹰鸽评分</span>{% else %}<span class="mono text-lg muted">—</span><span class="block text-[9px] uppercase tracking-wider muted">待评分</span>{% endif %}</div>
+      </div></article>
+    {% empty %}<div class="panel">{% include "research/includes/empty_state.html" with empty_title="没有匹配且可公开的联储文档" empty_href=request.path %}</div>{% endfor %}
+  </div>
+  {% include "research/includes/pagination.html" %}
+</div>
+{% endblock %}

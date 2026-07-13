@@ -1,0 +1,12 @@
+<header class="mb-6 flex flex-col gap-4 border-b hairline pb-6 lg:flex-row lg:items-end lg:justify-between">
+  <div>
+    <p class="eyebrow">{{ eyebrow|default:"Atlas research" }}</p>
+    <h1 class="page-title">{% if page_title %}{{ page_title }}{% elif title %}{{ title }}{% else %}Atlas Macro{% endif %}</h1>
+    {% if page_description %}<p class="page-deck">{{ page_description }}</p>{% elif description %}<p class="page-deck">{{ description }}</p>{% endif %}
+  </div>
+  <div class="flex shrink-0 flex-wrap items-center gap-2">
+    {% if as_of %}<span class="badge"><span class="!hidden"></span>截至 {{ as_of|date:"Y-m-d" }}</span>{% endif %}
+    {% if source %}{% include "research/includes/source_badge.html" with source=source %}{% endif %}
+    {% if show_copy %}<button type="button" class="button button-ghost no-print" data-copy-link>复制页面链接</button>{% endif %}
+  </div>
+</header>

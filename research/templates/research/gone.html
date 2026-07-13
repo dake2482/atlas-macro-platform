@@ -1,0 +1,8 @@
+{% extends "research/base.html" %}
+{% block title %}内容已下线 · {{ site_name }}{% endblock %}
+{% block robots %}noindex,nofollow{% endblock %}
+{% block content %}
+<div class="content-wrap flex min-h-[70vh] items-center justify-center">
+  <section class="panel panel-raised w-full max-w-2xl p-7 text-center sm:p-12"><p class="eyebrow">HTTP 410 / Gone</p><p class="mono mt-5 text-7xl font-semibold text-[var(--faint)]">410</p><h1 class="mt-5 text-3xl font-semibold tracking-[-.04em]">这个研究页面已永久下线</h1><p class="mx-auto mt-3 max-w-lg text-[12px] leading-6 muted">{{ reason|default:"旧版信用发行或事件页面不再维护。为避免展示不可验证、过期或许可不明确的数据，我们明确返回 410，而不是静默跳转。" }}</p><div class="mt-6 flex flex-wrap justify-center gap-2"><a class="button button-primary" href="/credit/">前往信用市场</a><a class="button" href="/">返回首页</a></div></section>
+</div>
+{% endblock %}

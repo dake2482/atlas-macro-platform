@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>bls.gov:feed:cpi</id>
+  <title>Consumer Price Index</title>
+  <entry>
+    <title>CPI for all items rises 0.2 percent in June</title>
+    <link type="text/html" rel="alternate" href="https://www.bls.gov/news.release/archives/cpi_07142026.htm"/>
+    <id>cpi-fixture-1</id>
+    <content>THIS BLS RELEASE BODY MUST NEVER BE STORED.</content>
+    <published>2026-07-14T08:30:00-04:00</published>
+    <updated>2026-07-14T08:30:00-04:00</updated>
+    <category>News Release</category>
+  </entry>
+</feed>

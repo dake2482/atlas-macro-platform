@@ -1,0 +1,1997 @@
+{
+  "schema_version": 1,
+  "scope": "Evidence-backed public AI URL contracts observed in cached timsun.net HTML snapshots",
+  "evidence_date": "2026-07-11",
+  "robots_policy": "No new network requests were made while producing this manifest; cached public-page evidence only.",
+  "counts": {
+    "total": 330,
+    "supply_chain_node": 45,
+    "company": 219,
+    "model": 12,
+    "coding_agent": 11,
+    "ai_glossary_term": 32,
+    "ai_collection": 11
+  },
+  "routes": [
+    {
+      "path": "/ai-industry/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/applications/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/attention/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/benchmark/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/chiplet/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/cowos/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/cpo/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/dram/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/eda/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/embedding/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/etch/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/foundry/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/gpu-rental/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/guardrails/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/hbm/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/idm/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/ip-core/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/kv-cache/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/lithography/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/model-api/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/moe/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/mosfet/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/optical-module/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/parameter/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/photoresist/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/pn-junction/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/pretraining/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/quantization/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/rag/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/rlhf/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/silicon-wafer/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/token/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/tool-calling/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/glossary/vlm/",
+      "family": "ai_glossary_term",
+      "evidence_url": "https://timsun.net/ai-industry/chain/glossary/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/claude-opus-4-7/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/claude-sonnet-4-6/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/deepseek-v4/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/gemini-3-flash/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/gemini-3-pro/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/gpt-5-3-codex/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/gpt-5-4-mini/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/gpt-5-5/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/grok-4-3/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/llama-4/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/mistral-large-3/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/model-evolution/model/qwen3-max/",
+      "family": "model",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/2-5d-3d-packaging/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/advanced-nodes/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/ai-asic/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/ai-servers/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/chiplet/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/cleaning/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/cloud-providers/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/cmp-materials/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/cowos/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/cpo/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/cpu/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/data-center-operators/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/deposition/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/dpu-nic/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/dram/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/electronic-specialty-gases/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/enterprise-ai/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/enterprise-ssd/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/etch/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/fpga/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/gpu/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/hbm/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/infiniband-ethernet/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/ion-implantation/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/liquid-cooling/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/lithography/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/mature-nodes/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/metrology-inspection/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/model-labs/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/nand/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/optical-modules/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/osat/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/photoresist/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/pmic/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/racks/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/serdes/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/silicon-wafers/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/soic/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/sovereign-ai/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/specialty-process/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/switching-asic/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/targets/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/test-equipment/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/ups-power/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/semiconductor-manufacturing/wet-chemicals/",
+      "family": "supply_chain_node",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/chain/teardown/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/abb/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/accelink/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/acm-research/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/advanced-energy/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/advantest/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/aehr-test-systems/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/agc/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/air-liquide/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/air-products/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/aixtron/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ajinomoto/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/alchip/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/alibaba/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/alphabet/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/amazon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/amd/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/amec/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/amkor/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/amphenol/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ams-osram/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/analog-devices/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/apple/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/applied-materials/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/applied-optoelectronics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/arista/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/arm/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ase-technology/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/asm-international/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/asml/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/asmpt/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/astera-labs/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/atlas-copco/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/auras/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/axcelis/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/axt/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/baidu/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/basf/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/besi/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/broadcom/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/cadence/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/camtek/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/canon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/caterpillar/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/celestica/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/cisco/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/cloudflare/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/coherent/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/cohu/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/coreweave/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/corning-hemlock/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/credo-technology/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/cummins/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/danaher/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/dell/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/delta-electronics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/digital-realty/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/digitalbridge/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/disco/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/dnp/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/donaldson/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/dupont/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/eaton/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ebara/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/entegris/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/eoptolink/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/equinix/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/fabrinet/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/fangda-carbon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/faraday-technology/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ferrotec/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/formfactor/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/foxconn-industrial-internet/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/fujifilm/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/fujimi/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/gcl-technology/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/gds/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/generac/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/global-unichip/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/globalfoundries/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/globalwafers/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/grinm-advanced-materials/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hamamatsu-photonics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hitachi/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hoya/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hpe/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hua-hong-semiconductor/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/huahai-qingke/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/huate-gas/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hubbell/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/hubei-dinglong/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ibiden/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ichor/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/infineon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/innolight/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/intel/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/inventec/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/ipg-photonics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/iqe/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/iron-mountain/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jabil/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jenoptik/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jiangfeng-electronics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jianghua-micro/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jiangsu-pacific-quartz/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jingsheng-mechanical-electrical/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jinhong-gas/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/jx-advanced-metals/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/kanto-denka/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/kinsus/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/kioxia/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/kla/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/kokusai-electric/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lam-research/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lasertec/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lattice-semiconductor/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/legrand/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lenovo/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/leon-micro/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lightpath-technologies/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/linde/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lpkf/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/lumentum/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/macom/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/marvell/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/materion/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/mediatek/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/merck-kgaa/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/mersen/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/meta/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/microchip/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/micron/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/microsoft/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/mitsubishi-materials/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/mks-instruments/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/modine/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/monolithic-power/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nan-ya-pcb/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nanya-technology/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nata-opto-electronic/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/national-silicon-industry-group/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/naura-technology/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nebius/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/netapp/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nextdc/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nikon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nippon-carbon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nlight/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nova/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nvent/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nvidia/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/nxp/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/oci-holdings/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/onsemi/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/onto-innovation/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/oracle/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/pdf-solutions/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/photronics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/piotech/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/power-integrations/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/pure-storage/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/qualcomm/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/quanta/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/rec-silicon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/renesas/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/resonac/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/rohm/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/samsung-electronics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sandisk/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/schneider-electric/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/screen-holdings/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/semtech/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sgl-carbon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/shanghai-sinyang/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/shin-etsu-chemical/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/siemens/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/siltronic/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sivers-semiconductors/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sk-hynix/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sk-siltron-sk-inc/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/smic/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/socionext/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/soitec/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/solvay/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/stella-chemifa/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/stmicroelectronics/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sumco/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sumitomo-chemical/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/sumitomo-electric/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/supermicro/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/synopsys/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tbea/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tcl-zhonghuan/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/te-connectivity/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tencent/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/teradyne/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/texas-instruments/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tokai-carbon/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tokuyama/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tokyo-electron/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tokyo-ohka-kogyo/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tokyo-seimitsu/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/toppan/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tower-semiconductor/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/toyo-tanso/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/tsmc/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/umc/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/unimicron/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/vanguard-international/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/vat-group/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/veeco/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/vertiv/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/viavi/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/vnet/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/wacker-chemie/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/wafer-works/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/western-digital/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/winbond/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/wiwynn/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/company/wolfspeed/",
+      "family": "company",
+      "evidence_url": "https://timsun.net/ai-industry/market-map/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/graph/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/market-map/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/news/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/",
+      "family": "ai_collection",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/aider/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/amp/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/claude-code/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/cline/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/cursor/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/devin/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/github-copilot/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/openai-codex/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/replit-agent/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/windsurf/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    },
+    {
+      "path": "/ai-industry/vibe-coding/zed/",
+      "family": "coding_agent",
+      "evidence_url": "https://timsun.net/ai-industry/chain/model-evolution/",
+      "evidence_date": "2026-07-11"
+    }
+  ]
+}

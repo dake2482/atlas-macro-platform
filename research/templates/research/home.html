@@ -1,0 +1,111 @@
+{% extends "research/base.html" %}
+{% block title %}今日判断 · {{ site_name }}{% endblock %}
+{% block content %}
+{% with active_thesis=thesis %}
+<div class="content-wrap page-grid">
+  {% include "research/includes/page_header.html" with eyebrow="Daily signal / 今日判断" page_title="把市场噪音压缩成可证伪的判断" page_description="从宏观主线、跨资产证据到行动触发器，每一项结论都保留来源、数据批次与复盘结果。" as_of=as_of source=source %}
+
+  <div class="grid gap-4 xl:grid-cols-[minmax(0,1.55fr)_minmax(18rem,.7fr)]">
+    <section class="panel panel-raised overflow-hidden">
+      <header class="flex items-start justify-between gap-4 border-b hairline bg-[var(--surface-2)] px-5 py-4">
+        <div>
+          <p class="eyebrow">Current macro regime</p>
+          <h2 class="mt-2 text-2xl font-semibold tracking-[-.035em]">{{ active_thesis.regime|default:"等待今日研究批次" }}</h2>
+        </div>
+        {% if active_thesis.confidence %}<span class="badge badge-accent">置信度 {{ active_thesis.confidence }}</span>{% endif %}
+      </header>
+      {% if active_thesis %}
+        <div class="panel-body !p-5">
+          <p class="max-w-3xl text-[15px] leading-8 text-[var(--ink)]">{{ active_thesis.summary }}</p>
+          <div class="mt-3 flex flex-wrap gap-2 text-[10px] text-[var(--muted)]"><span>daily-evidence v1 · 快照 <span class="mono">#{{ snapshot_metadata.id }}</span></span><span>批次 <span class="mono">{{ snapshot_metadata.batch_id }}</span></span><span>质量 {{ snapshot_metadata.quality_status }}</span>{% if snapshot_metadata.stale %}<span class="badge badge-warning">历史冻结</span>{% endif %}</div>
+          <div class="mt-6 grid gap-5 md:grid-cols-2">
+            <div>
+              <p class="eyebrow !text-[var(--muted)]">Evidence / 核心证据</p>
+              <ol class="mt-3 grid gap-3">
+                {% for item in evidence_items %}
+                  <li class="flex gap-3 rounded-lg border hairline bg-[var(--surface-2)] p-3 text-[12px] leading-5">
+                    <span class="mono positive">0{{ forloop.counter }}</span><span><strong>{{ item.label }}</strong> · {{ item.body }} <span class="mono">{{ item.value }}</span></span>
+                  </li>
+                {% empty %}<li class="muted">尚无已审核证据。</li>{% endfor %}
+              </ol>
+            </div>
+            <div>
+              <p class="eyebrow !text-[var(--muted)]">Triggers / 触发器</p>
+              <ul class="mt-3 grid gap-3">
+                {% for trigger in trigger_items %}
+                  <li class="rounded-lg border hairline p-3 text-[12px] leading-5"><span class="mr-2 positive" aria-hidden="true">↗</span><strong>{{ trigger.name }}</strong> · {{ trigger.condition }}</li>
+                {% empty %}<li class="muted">尚无触发器。</li>{% endfor %}
+              </ul>
+              {% if invalidation_record %}
+                <div class="mt-4 rounded-lg border border-[color-mix(in_srgb,var(--negative)_25%,transparent)] bg-[color-mix(in_srgb,var(--negative)_7%,transparent)] p-3">
+                  <p class="eyebrow !text-[var(--negative)]">Invalidation / 证伪条件</p>
+                  <p class="mt-2 text-[12px] leading-5">{{ invalidation_record.condition }}</p>
+                </div>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+      {% else %}
+        {% include "research/includes/empty_state.html" with empty_title="今日判断尚未发布" empty_message="研究批次完整并通过质量检查后，判断才会原子发布。" %}
+      {% endif %}
+      {% for notice in source_notices %}<div class="mx-5 mb-4 callout text-[10px] leading-5">{{ notice }}</div>{% endfor %}
+    </section>
+
+    <aside class="grid content-start gap-4">
+      <section class="panel">
+        <header class="panel-header"><div><h2 class="section-title">跨资产确认</h2><p class="section-deck">主线是否得到价格行为支持</p></div></header>
+        <div class="divide-y divide-[var(--line)]">
+          {% for item in evidence %}
+            <div class="flex items-center justify-between gap-4 px-4 py-3">
+              <div><p class="text-[12px] font-semibold">{{ item.label }}</p><p class="mt-0.5 text-[10px] text-[var(--muted)]">{{ item.detail }}</p></div>
+              <span class="mono text-[12px]">{{ item.value }}</span>
+            </div>
+          {% empty %}
+            <div class="p-4 text-[12px] text-[var(--muted)]">等待跨资产快照。</div>
+          {% endfor %}
+        </div>
+      </section>
+      <section class="panel">
+        <header class="panel-header"><div><h2 class="section-title">观察触发器</h2><p class="section-deck">研究观察，不连接交易账户</p></div><span class="badge">Read only</span></header>
+        <ul class="panel-body grid gap-3">
+          {% for action in trigger_items %}
+            <li class="flex gap-3 text-[12px]"><span class="positive">□</span><span>{{ action.name }} · {{ action.condition }}</span></li>
+          {% empty %}<li class="muted">暂无行动项。</li>{% endfor %}
+        </ul>
+      </section>
+    </aside>
+  </div>
+
+  {% if metrics or market_cards %}
+    <section class="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4 2xl:grid-cols-6" aria-label="关键市场指标">
+      {% for metric in metrics|default:market_cards %}{% include "research/includes/metric_card.html" with metric=metric %}{% endfor %}
+    </section>
+  {% endif %}
+
+  <div class="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(18rem,.65fr)]">
+    {% if chart_data %}
+      {% include "research/includes/chart_panel.html" with chart_id="home-market-chart" chart_title="市场主线与关键变量" chart_description="同批次数据对齐后的标准化走势" chart_data=chart_data chart_kind="line" chart_class="chart-tall" source=source as_of=as_of %}
+    {% else %}
+      <section class="panel">{% include "research/includes/empty_state.html" with empty_title="市场主线图等待完整批次" empty_message="只有同批次、可追溯且许可有效的数据才会进入图表。" %}</section>
+    {% endif %}
+    <section class="panel">
+      <header class="panel-header"><div><h2 class="section-title">最新官方动态</h2><p class="section-deck">已发布的官方新闻与公告，不冒充未来事件日历</p></div></header>
+      <div class="panel-body">
+        <div class="timeline">
+          {% for event in news_items|slice:":4" %}
+            <article class="timeline-item"><span class="timeline-dot"></span><time class="mono text-[10px] text-[var(--muted)]">{{ event.published_at|date:"m-d H:i" }}</time><h3 class="mt-1 text-[12px] font-semibold">{{ event.title }}</h3><p class="mt-1 text-[11px] text-[var(--muted)]">{{ event.source_name }}</p></article>
+          {% empty %}<p class="muted pl-6 text-[12px]">暂无已确认事件。</p>{% endfor %}
+        </div>
+      </div>
+    </section>
+  </div>
+  {% if news_items or research_items or letters %}
+    <div class="mt-4 grid gap-4 xl:grid-cols-3">
+      <section class="panel"><header class="panel-header"><h2 class="section-title">最新资讯</h2><a class="text-[10px] positive" href="/news/">全部 →</a></header><div class="divide-y divide-[var(--line)]">{% for item in news_items %}<a class="block p-4 hover:bg-[var(--accent-soft)]" href="{{ item.source_url }}" target="_blank" rel="noopener noreferrer"><span class="badge">{{ item.source_name }}</span><h3 class="mt-2 line-clamp-2 text-[11px] font-semibold">{{ item.title }}</h3></a>{% empty %}<p class="p-4 muted">暂无资讯。</p>{% endfor %}</div></section>
+      <section class="panel"><header class="panel-header"><h2 class="section-title">机构观点</h2><a class="text-[10px] positive" href="/research/reports/">全部 →</a></header><div class="divide-y divide-[var(--line)]">{% for item in research_items %}<a class="block p-4 hover:bg-[var(--accent-soft)]" href="{{ item.source_url }}" target="_blank" rel="noopener noreferrer"><span class="badge">{{ item.bank }}</span><h3 class="mt-2 line-clamp-2 text-[11px] font-semibold">{{ item.title }}</h3></a>{% empty %}<p class="p-4 muted">暂无观点。</p>{% endfor %}</div></section>
+      <section class="panel"><header class="panel-header"><h2 class="section-title">基金信函</h2><a class="text-[10px] positive" href="/research/fund-letters/">全部 →</a></header><div class="divide-y divide-[var(--line)]">{% for item in letters %}<a class="block p-4 hover:bg-[var(--accent-soft)]" href="{{ item.get_absolute_url }}"><span class="badge">{{ item.quarter }}</span><h3 class="mt-2 text-[11px] font-semibold">{{ item.fund_name }}</h3><p class="mt-1 line-clamp-2 text-[10px] muted">{{ item.summary }}</p></a>{% empty %}<p class="p-4 muted">暂无信函。</p>{% endfor %}</div></section>
+    </div>
+  {% endif %}
+</div>
+{% endwith %}
+{% endblock %}

@@ -1,0 +1,14 @@
+{% extends "research/base.html" %}
+{% block title %}{{ object.name }} · Coding Agent · {{ site_name }}{% endblock %}
+{% block content %}
+{% with item=object %}
+<article class="content-wrap">
+  <header class="mb-6 border-b hairline pb-6"><div class="flex flex-wrap gap-2"><span class="eyebrow">Coding agent profile</span><span class="badge">{{ item.product_type }}</span><span class="badge badge-accent">{{ item.provider }}</span></div><h1 class="page-title mt-4">{{ item.name }}</h1><p class="page-deck">{{ item.description }}</p><div class="mt-5 flex flex-wrap gap-3"><span class="badge">{{ item.price_label }}</span><time class="badge">{% if item.release_date %}发布 {{ item.release_date|date:"Y-m-d" }}{% else %}发布日期待核验{% endif %}</time>{% if item.homepage %}<a class="button button-primary" href="{{ item.homepage }}" target="_blank" rel="noopener noreferrer">产品主页 ↗</a>{% endif %}</div></header>
+  <div class="grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(18rem,.6fr)]">
+    {% include "research/includes/chart_panel.html" with chart_id="agent-benchmark-chart" chart_title="任务能力分解" chart_description="综合评分按同批次编码与终端任务标准化" chart_data=benchmark_data chart_kind="bar" chart_class="chart-tall" source=source as_of=as_of %}
+    <aside class="grid content-start gap-4"><section class="panel"><header class="panel-header"><h2 class="section-title">统一评测</h2></header><div class="panel-body text-center"><p class="mono text-3xl positive">{% if item.capability_score %}{{ item.capability_score|floatformat:1 }}{% else %}待接入{% endif %}</p><p class="mt-2 text-[10px] muted">没有同批次独立结果时不填分数</p></div></section><section class="panel"><header class="panel-header"><h2 class="section-title">能力边界</h2></header><div class="panel-body text-[11px] leading-5 muted">{{ limitations|default:"真实效果高度依赖仓库规模、权限边界、测试质量与用户监督。产品目录不是自动化授权依据。" }}</div></section></aside>
+  </div>
+  {% if scenarios %}<section class="panel mt-4"><header class="panel-header"><h2 class="section-title">场景表现</h2></header><div class="grid gap-3 p-4 md:grid-cols-3">{% for scenario in scenarios %}<article class="rounded-lg border hairline p-4"><div class="flex justify-between gap-3"><strong class="text-[12px]">{{ scenario.name }}</strong><span class="mono positive">{{ scenario.score }}</span></div><p class="mt-2 text-[10px] leading-5 muted">{{ scenario.note|default:scenario.description }}</p></article>{% endfor %}</div></section>{% endif %}
+</article>
+{% endwith %}
+{% endblock %}

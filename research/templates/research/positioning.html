@@ -1,0 +1,98 @@
+{% extends "research/base.html" %}
+{% block title %}CFTC 持仓 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Commitments of Traders" page_title="CFTC TFF 持仓与拥挤度" page_description="官方周报数据：分开展示持仓所属的报告日和 PRE 实际发布时间，用历史净仓百分位识别拥挤。" as_of=as_of source=source quality_status=quality_status %}
+
+  {% if required_notices %}
+    <aside class="callout mb-4 text-[10px] leading-5" aria-label="数据授权声明">
+      {% for notice in required_notices %}<p{% if not forloop.first %} class="mt-2"{% endif %}>{{ notice }}</p>{% endfor %}
+    </aside>
+  {% endif %}
+
+  <form class="filter-bar mb-4" method="get">
+    <label class="field field-grow">
+      <span class="field-label">合约 / 资产</span>
+      <input class="control" name="q" value="{{ request.GET.q }}" placeholder="例如 S&amp;P 500、SOFR、日元">
+    </label>
+    <label class="field">
+      <span class="field-label">报告类型</span>
+      <select class="control" name="report">
+        {% for value, label in report_types %}<option value="{{ value }}" {% if report == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="field">
+      <span class="field-label">交易者分类</span>
+      <select class="control" name="group">
+        <option value="">全部分类</option>
+        {% for value, label in group_labels.items %}<option value="{{ value }}" {% if selected_group == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <button class="button button-primary" type="submit">应用筛选</button>
+  </form>
+
+  {% if metrics %}
+    <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      {% for metric in metrics %}{% include "research/includes/metric_card.html" with metric=metric %}{% endfor %}
+    </div>
+  {% else %}
+    <div class="callout mb-4 text-[11px] leading-5">暂无通过当前来源许可校验的 CFTC TFF 批次。页面保持空缺，不使用演示持仓。</div>
+  {% endif %}
+
+  {% if as_of %}
+    <div class="callout mb-4 grid gap-2 text-[11px] leading-5 md:grid-cols-2 xl:grid-cols-4">
+      <p><strong>持仓报告日</strong><br><span class="mono">{{ as_of|date:"Y-m-d" }}</span><br><span class="muted">通常为周二收盘后持仓</span></p>
+      <p><strong>PRE 初始发布</strong><br><span class="mono">{{ published_at_et_display|default:"未提供" }}</span><br><span class="muted">来自官方行记录 <code>:created_at</code></span></p>
+      <p><strong>PRE 最后更新</strong><br><span class="mono">{{ source_updated_at_et_display|default:"未提供" }}</span><br><span class="muted">来自官方行记录 <code>:updated_at</code></span></p>
+      <p><strong>本站抓取</strong><br><span class="mono">{{ fetched_at|date:"Y-m-d H:i T"|default:"未提供" }}</span><br><span class="muted">不冒充 CFTC 发布时间</span></p>
+    </div>
+  {% endif %}
+
+  <div class="grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(18rem,.65fr)]">
+    {% include "research/includes/chart_panel.html" with chart_id="cot-history-chart" chart_title="净仓历史" chart_description=focus_name|add:" · "|add:focus_group_label|add:"；净仓 = 多头 − 空头" chart_data=chart_data chart_kind="line" chart_class="chart-tall" source=source as_of=as_of %}
+    <section class="panel">
+      <header class="panel-header">
+        <div><h2 class="section-title">拥挤度雷达</h2><p class="section-deck">最近 {{ percentile_window }} 周净仓百分位</p></div>
+      </header>
+      <div class="panel-body grid gap-3">
+        {% for item in positions %}
+          <a class="rounded-lg border hairline p-3" href="?report={{ report|urlencode }}&amp;group={{ selected_group|urlencode }}&amp;q={{ request.GET.q|urlencode }}&amp;market={{ item.symbol|urlencode }}&amp;focus_group={{ item.trader_group|urlencode }}">
+            <div class="flex justify-between gap-4">
+              <span><strong class="block text-[12px]">{{ item.name }}</strong><small class="muted">{{ item.group }}</small></span>
+              {% if item.percentile != None %}<span class="mono {% if item.percentile >= 90 or item.percentile <= 10 %}negative{% elif item.percentile >= 80 or item.percentile <= 20 %}warning{% else %}positive{% endif %}">P{{ item.percentile|floatformat:0 }}</span>{% else %}<span class="muted">样本不足</span>{% endif %}
+            </div>
+            {% if item.percentile != None %}<div class="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--surface-3)]"><span class="block h-full rounded-full bg-[var(--accent)]" style="width: {{ item.percentile }}%"></span></div>{% endif %}
+          </a>
+        {% empty %}<p class="muted">当前筛选没有可发布的持仓记录。</p>{% endfor %}
+      </div>
+    </section>
+  </div>
+
+  <section class="panel mt-4">
+    <header class="panel-header"><div><h2 class="section-title">最新持仓</h2><p class="section-deck">TFF 五类交易者；百分位至少需要 26 个周观测</p></div><span class="badge">周频</span></header>
+    <div class="data-table-wrap">
+      <table class="data-table">
+        <thead><tr><th>合约 / 类别</th><th class="numeric">多头</th><th class="numeric">空头</th><th class="numeric">净仓</th><th class="numeric">周变动</th><th class="numeric">净仓 / OI</th><th class="numeric">历史百分位</th><th>拥挤度</th></tr></thead>
+        <tbody>
+          {% for row in positions %}
+            <tr>
+              <td><a href="?report={{ report|urlencode }}&amp;group={{ selected_group|urlencode }}&amp;q={{ request.GET.q|urlencode }}&amp;market={{ row.symbol|urlencode }}&amp;focus_group={{ row.trader_group|urlencode }}"><strong>{{ row.name }}</strong></a><p class="text-[10px] muted">{{ row.group }} · {{ row.symbol }}</p></td>
+              <td class="numeric">{{ row.long_positions }}</td>
+              <td class="numeric">{{ row.short_positions }}</td>
+              <td class="numeric {% if row.net_position > 0 %}positive{% elif row.net_position < 0 %}negative{% endif %}">{{ row.net_position }}</td>
+              <td class="numeric {% if row.weekly_change > 0 %}positive{% elif row.weekly_change < 0 %}negative{% endif %}">{% if row.weekly_change != None %}{% if row.weekly_change > 0 %}+{% endif %}{{ row.weekly_change }}{% else %}—{% endif %}</td>
+              <td class="numeric">{% if row.net_oi_pct != None %}{{ row.net_oi_pct|floatformat:1 }}%{% else %}—{% endif %}</td>
+              <td class="numeric">{% if row.percentile != None %}{{ row.percentile|floatformat:0 }}%{% else %}—{% endif %}</td>
+              <td><span class="badge {% if row.crowding_level == 'extreme' %}badge-negative{% elif row.crowding_level == 'crowded' %}badge-warning{% endif %}">{{ row.crowding }}</span></td>
+            </tr>
+          {% empty %}<tr><td colspan="8" class="muted text-center">等待 CFTC 官方发布批次。</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <aside class="callout mt-4 text-[11px] leading-5">
+    <strong>口径：</strong>净仓 = 多头持仓 − 空头持仓；百分位使用最近 156 个已入库周观测，不足 26 周时不给出拥挤结论。P80/P20 进入拥挤区，P90/P10 为极端区；该指标不是机械反向交易信号。CFTC 说明报告通常于周五美东 15:30 发布前一周二的持仓，联邦节假日可延后 1–2 天。<a href="https://www.cftc.gov/MarketReports/CommitmentsofTraders/ReleaseSchedule/index.htm" rel="noopener noreferrer" target="_blank">查看官方发布日程</a>。
+  </aside>
+</div>
+{% endblock %}

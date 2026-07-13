@@ -1,0 +1,4 @@
+<span class="badge {% if quality_status == 'stale' %}badge-warning{% elif quality_status == 'fallback' or quality_status == 'estimated' %}badge-warning{% elif quality_status == 'error' %}badge-negative{% else %}badge-positive{% endif %}" title="{% if source.attribution %}{{ source.attribution }}{% else %}数据来源{% endif %}">
+  {% if source.name %}{{ source.name }}{% else %}{{ source }}{% endif %}
+  {% if quality_status == "stale" %}· 已过期{% elif quality_status == "fallback" %}· 备用源{% elif quality_status == "estimated" %}· 模型估算{% elif quality_status == "error" %}· 异常{% endif %}
+</span>

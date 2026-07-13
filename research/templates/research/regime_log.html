@@ -1,0 +1,35 @@
+{% extends "research/base.html" %}
+{% block title %}复盘账本 · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Decision ledger" page_title="复盘账本" page_description="不只记录当时说对了什么，也记录证伪、偏差与模拟组合结果。" show_copy=True %}
+  {% if metrics or summary_stats %}
+    <div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+      {% for metric in metrics|default:summary_stats %}{% include "research/includes/metric_card.html" with metric=metric %}{% endfor %}
+    </div>
+  {% endif %}
+  {% if sample_count != None %}<div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-3"><article class="metric-card"><p class="metric-label">已复盘样本</p><p class="metric-value">{{ sample_count }}</p></article><article class="metric-card"><p class="metric-label">平均命中率</p><p class="metric-value">{{ avg_hit|floatformat:1|default:"—" }}%</p></article><article class="metric-card"><p class="metric-label">平均模拟收益</p><p class="metric-value {% if avg_return > 0 %}positive{% elif avg_return < 0 %}negative{% endif %}">{{ avg_return|floatformat:2|default:"—" }}%</p></article></div>{% endif %}
+  <section class="panel">
+    <header class="panel-header"><div><h2 class="section-title">历史判断</h2><p class="section-deck">每条 Thesis 保留当日快照，后续结果只做追加</p></div><span class="badge badge-accent">可审计</span></header>
+    <div class="data-table-wrap">
+      <table class="data-table">
+        <thead><tr><th>日期</th><th>市场状态</th><th>置信度</th><th>复盘状态</th><th class="numeric">命中率</th><th class="numeric">模拟收益</th><th><span class="sr-only">详情</span></th></tr></thead>
+        <tbody>
+          {% for item in theses %}
+            <tr>
+              <td class="mono whitespace-nowrap">{{ item.date|date:"Y-m-d" }}</td>
+              <td><strong>{{ item.regime }}</strong><p class="mt-1 max-w-xl text-[11px] text-[var(--muted)] line-clamp-2">{{ item.summary }}</p></td>
+              <td><span class="badge">{{ item.confidence }}</span></td>
+              <td><span class="badge {% if item.status == 'hit' %}badge-positive{% elif item.status == 'missed' %}badge-negative{% elif item.status == 'partial' %}badge-warning{% endif %}">{{ item.get_status_display|default:item.status }}</span></td>
+              <td class="numeric">{% if item.hit_rate != None %}{{ item.hit_rate|floatformat:1 }}%{% else %}—{% endif %}</td>
+              <td class="numeric {% if item.simulated_return > 0 %}positive{% elif item.simulated_return < 0 %}negative{% endif %}">{% if item.simulated_return != None %}{% if item.simulated_return > 0 %}+{% endif %}{{ item.simulated_return|floatformat:2 }}%{% else %}—{% endif %}</td>
+              <td class="text-right"><a class="button !min-h-8" href="{{ item.get_absolute_url }}">查看</a></td>
+            </tr>
+          {% empty %}<tr><td colspan="7">{% include "research/includes/empty_state.html" with empty_title="复盘账本为空" %}</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {% include "research/includes/pagination.html" %}
+</div>
+{% endblock %}

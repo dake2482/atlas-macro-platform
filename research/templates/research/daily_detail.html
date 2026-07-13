@@ -1,0 +1,46 @@
+{% extends "research/base.html" %}
+{% block title %}{{ object.regime }} · {{ site_name }}{% endblock %}
+{% block content %}
+{% with item=object %}
+<article class="content-wrap">
+  <header class="mx-auto max-w-4xl border-b hairline pb-7 pt-3">
+    <div class="flex flex-wrap items-center gap-2"><span class="eyebrow">Daily brief</span><span class="badge">{{ item.date|date:"Y-m-d" }}</span><span class="badge badge-positive">人工审核</span>{% if snapshot_metadata.stale %}<span class="badge badge-warning">历史冻结 · 不代表实时状态</span>{% endif %}</div>
+    <h1 class="page-title mt-4">{{ item.regime }}</h1>
+    <p class="page-deck">{{ item.summary }}</p>
+    <div class="source-line mt-5"><span>复盘状态：{{ item.get_status_display }}</span><span>审核：{{ item.reviewed_by }} · {{ item.reviewed_at|date:"Y-m-d H:i" }}</span><span>数据截至：{{ snapshot_metadata.as_of|date:"Y-m-d H:i" }}</span></div>
+  </header>
+  <div class="mx-auto mt-6 grid max-w-6xl gap-5 lg:grid-cols-[minmax(0,1fr)_18rem]">
+    <div class="panel"><div class="panel-body !p-6 sm:!p-8">
+      <div class="prose-atlas"><p>{{ item.summary }}</p>
+        <h2>核心证据</h2>
+        <ol>{% for evidence in evidence_items %}<li><strong>{{ evidence.label }}</strong> · {{ evidence.body }} <span class="mono">{{ evidence.value }}</span><br><a href="{{ evidence.source_url }}" target="_blank" rel="noopener noreferrer">{{ evidence.source_name }}</a> · 数值 {{ evidence.value_date|date:"Y-m-d H:i" }} · 抓取 {{ evidence.fetched_at|date:"Y-m-d H:i" }} · 批次 <span class="mono">{{ evidence.batch_id }}</span> · {{ evidence.quality_status }} · {{ evidence.license_scope }}</li>{% endfor %}</ol>
+        <h2>观察触发器</h2>
+        <ul>{% for trigger in trigger_items %}<li><strong>{{ trigger.name }}</strong> · {{ trigger.condition }}{% if trigger.display_threshold %} · {{ trigger.display_threshold }}{% endif %}</li>{% endfor %}</ul>
+        {% if invalidation_record %}<blockquote><strong>证伪条件：</strong>{{ invalidation_record.condition }}</blockquote>{% endif %}
+      </div>
+    </div></div>
+    <aside class="grid content-start gap-4">
+      <section class="panel"><header class="panel-header"><h2 class="section-title">报告元数据</h2></header><dl class="panel-body grid gap-3 text-[11px]">
+        <div class="flex justify-between gap-3"><dt class="muted">日期</dt><dd class="mono">{{ item.date|date:"Y-m-d" }}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">置信度</dt><dd>{{ item.confidence|default:"—" }}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">证据合同</dt><dd class="mono">daily-evidence v1</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">快照 ID</dt><dd class="mono">{{ snapshot_metadata.id }}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">发布批次</dt><dd class="mono break-all text-right">{{ snapshot_metadata.batch_id }}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">来源</dt><dd class="text-right">{{ snapshot_metadata.source_name }}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">质量</dt><dd>{{ snapshot_metadata.quality_status }}</dd></div>
+        <div class="grid gap-1"><dt class="muted">许可口径</dt><dd class="break-words text-right">{{ snapshot_metadata.license_scope|default:"—" }}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">当前鲜度</dt><dd>{% if snapshot_metadata.stale %}历史冻结{% else %}仍在鲜度窗口{% endif %}</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">证据数</dt><dd class="mono">{{ evidence_items|length }}</dd></div>
+      </dl></section>
+      <div class="callout text-[11px] leading-5">本页是研究快照，不会用后见之明覆盖当日信息边界。</div>
+      {% for notice in source_notices %}<div class="callout text-[10px] leading-5">{{ notice }}</div>{% endfor %}
+    </aside>
+  </div>
+  <nav class="mx-auto mt-6 flex max-w-6xl items-center justify-between gap-4 border-t hairline pt-5" aria-label="相邻报告">
+    <div>{% if previous %}<a class="button" href="{{ previous.get_absolute_url }}">← 较早报告</a>{% endif %}</div>
+    <a class="button button-ghost" href="/daily-report/">返回报告库</a>
+    <div>{% if following %}<a class="button" href="{{ following.get_absolute_url }}">较新报告 →</a>{% endif %}</div>
+  </nav>
+</article>
+{% endwith %}
+{% endblock %}

@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+
+# Django
+db.sqlite3
+db.sqlite3-*
+staticfiles/
+media/
+
+# Runtime data and secrets
+.env
+.env.*
+!.env.example
+*.log
+celerybeat-schedule
+celerybeat-schedule.*
+artifacts/
+data/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Frontend dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+research/static/research/js/*.map
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp

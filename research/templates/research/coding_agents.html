@@ -1,0 +1,29 @@
+{% extends "research/base.html" %}
+{% block title %}Coding Agents · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Coding agent directory" page_title=title page_description="只展示厂商官方可核验的产品信息；没有同批次独立评测时，不用伪精确分数排名。" as_of=as_of source=source %}
+  <div class="mb-4 grid grid-cols-2 gap-3 md:grid-cols-3">
+    <article class="metric-card"><p class="metric-label">官方来源产品</p><p class="metric-value">{{ total_count }}</p></article>
+    <article class="metric-card"><p class="metric-label">当前筛选</p><p class="metric-value">{{ filtered_count }}</p></article>
+    <article class="metric-card col-span-2 md:col-span-1"><p class="metric-label">统一独立评分</p><p class="metric-value">—</p><p class="metric-meta">待同环境评测</p></article>
+  </div>
+  <form class="filter-bar mb-4" method="get">
+    <label class="field field-grow"><span class="field-label">搜索</span><input class="control" type="search" name="q" value="{{ filters.q }}" placeholder="产品、厂商、形态或描述"></label>
+    <label class="field"><span class="field-label">产品形态</span><select class="control" name="type"><option value="">全部</option>{% for option in product_types %}<option value="{{ option }}" {% if filters.type == option %}selected{% endif %}>{{ option }}</option>{% endfor %}</select></label>
+    <button class="button button-primary" type="submit">筛选</button>
+  </form>
+  <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+    {% for agent in agents %}
+      <article class="panel p-4">
+        <div class="flex items-start justify-between gap-3"><div><span class="eyebrow">{{ agent.provider }}</span><h2 class="mt-2 text-lg font-semibold">{{ agent.name }}</h2></div><span class="badge">{{ agent.product_type }}</span></div>
+        <p class="mt-3 text-[11px] leading-5 muted">{{ agent.description }}</p>
+        <dl class="mt-4 grid grid-cols-2 gap-3 text-[10px]"><div><dt class="metric-label">官方发布日</dt><dd class="mono mt-1">{{ agent.release_date|date:"Y-m-d"|default:"—" }}</dd></div><div><dt class="metric-label">计费口径</dt><dd class="mt-1">{{ agent.price_label }}</dd></div></dl>
+        <div class="mt-4 flex flex-wrap gap-2"><a class="button !min-h-8" href="{{ agent.get_absolute_url }}">资料详情</a><a class="button !min-h-8" href="{{ agent.homepage }}" target="_blank" rel="noopener noreferrer">官方来源 ↗</a></div>
+      </article>
+    {% empty %}
+      <div class="panel p-6 md:col-span-2 xl:col-span-3">{% include "research/includes/empty_state.html" with empty_title="没有匹配的 Coding Agent" empty_href=request.path %}</div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

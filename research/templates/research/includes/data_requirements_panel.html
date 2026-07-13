@@ -1,0 +1,28 @@
+<section class="panel" aria-labelledby="data-coverage-title">
+  <header class="panel-header">
+    <div>
+      <p class="eyebrow">Data coverage contract</p>
+      <h2 class="section-title" id="data-coverage-title">数据覆盖与采购状态</h2>
+      <p class="section-deck">未授权的指标不会用合成数值伪装；每个缺口都给出数据源或采购建议。</p>
+    </div>
+    <a class="button !min-h-8" href="/data-sources/">完整台账 →</a>
+  </header>
+  <div class="data-table-wrap">
+    <table class="data-table">
+      <thead><tr><th>指标</th><th>状态</th><th>来源 / 采购建议</th><th>说明</th></tr></thead>
+      <tbody>
+        {% for requirement in data_requirements %}
+          <tr>
+            <td><strong>{{ requirement.metric_name }}</strong></td>
+            <td><span class="badge {% if requirement.status == 'live' %}badge-positive{% elif requirement.status == 'purchase_required' %}badge-negative{% else %}badge-warning{% endif %}">{{ requirement.get_status_display }}</span></td>
+            <td>
+              {% if requirement.source_url %}<a class="text-[var(--accent)]" href="{{ requirement.source_url }}" target="_blank" rel="noopener noreferrer">{{ requirement.source_name|default:requirement.vendor }} ↗</a>{% else %}<span>{{ requirement.vendor|default:requirement.source_name|default:"待确定" }}</span>{% endif %}
+              {% if requirement.product %}<p class="mt-1 text-[9px] muted">{{ requirement.product }}</p>{% endif %}
+            </td>
+            <td class="max-w-xl text-[10px] muted">{{ requirement.reason }}{% if requirement.proxy_description %}<p class="mt-1"><strong>透明代理：</strong>{{ requirement.proxy_description }}</p>{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>

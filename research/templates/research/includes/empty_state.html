@@ -1,0 +1,8 @@
+<div class="empty-state">
+  <div>
+    <span class="empty-glyph" aria-hidden="true">∅</span>
+    <h2 class="section-title">{{ empty_title|default:"暂无匹配数据" }}</h2>
+    <p class="mx-auto mt-2 max-w-md text-[12px]">{{ empty_message|default:"数据源尚未返回结果，或当前筛选条件没有匹配项。" }}</p>
+    {% if empty_href %}<a class="button mt-4" href="{{ empty_href }}">{{ empty_action|default:"清除筛选" }}</a>{% endif %}
+  </div>
+</div>

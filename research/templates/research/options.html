@@ -1,0 +1,38 @@
+{% extends "research/base.html" %}
+{% block title %}期权与 GEX · {{ site_name }}{% endblock %}
+{% block content %}
+<div class="content-wrap">
+  {% include "research/includes/page_header.html" with eyebrow="Options positioning" page_title="期权结构与 Dealer Greeks" page_description="用统一模型估算 GEX、DEX、Vanna、Charm 与关键墙位；所有派生值均明确标记为模型估算。" as_of=as_of source=source quality_status=quality_status %}
+  <form class="filter-bar mb-4" method="get">
+    <label class="field"><span class="field-label">标的</span><select class="control" name="symbol">{% for symbol in symbols|default:available_symbols %}<option value="{{ symbol.symbol|default:symbol }}" {% if selected_symbol == symbol.symbol or selected_symbol == symbol or instrument.symbol == symbol.symbol %}selected{% endif %}>{{ symbol.symbol|default:symbol }}{% if symbol.name %} · {{ symbol.name }}{% endif %}</option>{% empty %}<option>{{ selected_symbol|default:"SPY" }}</option>{% endfor %}</select></label>
+    <label class="field"><span class="field-label">到期日</span><select class="control" name="expiry"><option value="">全部到期</option>{% for expiry in expiries %}<option value="{{ expiry|date:'Y-m-d' }}" {% if request.GET.expiry == expiry|date:'Y-m-d' %}selected{% endif %}>{{ expiry|date:"Y-m-d" }}</option>{% endfor %}</select></label>
+    <button class="button button-primary" type="submit">更新视图</button>
+    <span class="badge badge-warning ml-auto">模型估算</span>
+  </form>
+  {% if metrics %}<div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-6">{% for metric in metrics %}{% include "research/includes/metric_card.html" with metric=metric %}{% endfor %}</div>{% endif %}
+  {% if net_gex != None %}<div class="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-5"><article class="metric-card"><p class="metric-label">Spot</p><p class="metric-value">{{ spot|floatformat:2 }}</p></article><article class="metric-card"><p class="metric-label">Net GEX</p><p class="metric-value">{{ net_gex|floatformat:0 }}</p><p class="metric-delta muted">模型估算</p></article><article class="metric-card"><p class="metric-label">Net DEX</p><p class="metric-value">{{ net_dex|floatformat:0 }}</p></article><article class="metric-card"><p class="metric-label">Call Wall</p><p class="metric-value">{{ call_wall|floatformat:2|default:"—" }}</p></article><article class="metric-card"><p class="metric-label">Put Wall</p><p class="metric-value">{{ put_wall|floatformat:2|default:"—" }}</p></article></div>{% endif %}
+
+  <div data-tabs>
+    <div class="mb-3 flex max-w-full gap-1 overflow-x-auto rounded-lg border hairline bg-[var(--surface)] p-1" role="tablist" aria-label="期权视图">
+      <button class="button button-ghost !min-h-8 !border-0 aria-selected:!bg-[var(--accent-soft)] aria-selected:!text-[var(--accent)]" type="button" role="tab" aria-selected="true" data-tab-target="gex">GEX</button>
+      <button class="button button-ghost !min-h-8 !border-0 aria-selected:!bg-[var(--accent-soft)] aria-selected:!text-[var(--accent)]" type="button" role="tab" aria-selected="false" data-tab-target="dex">DEX</button>
+      <button class="button button-ghost !min-h-8 !border-0 aria-selected:!bg-[var(--accent-soft)] aria-selected:!text-[var(--accent)]" type="button" role="tab" aria-selected="false" data-tab-target="iv">IV / Skew</button>
+      <button class="button button-ghost !min-h-8 !border-0 aria-selected:!bg-[var(--accent-soft)] aria-selected:!text-[var(--accent)]" type="button" role="tab" aria-selected="false" data-tab-target="vanna">Vanna</button>
+      <button class="button button-ghost !min-h-8 !border-0 aria-selected:!bg-[var(--accent-soft)] aria-selected:!text-[var(--accent)]" type="button" role="tab" aria-selected="false" data-tab-target="charm">Charm</button>
+      <button class="button button-ghost !min-h-8 !border-0 aria-selected:!bg-[var(--accent-soft)] aria-selected:!text-[var(--accent)]" type="button" role="tab" aria-selected="false" data-tab-target="oi">Open Interest</button>
+    </div>
+    <div data-tab-panel="gex">{% include "research/includes/chart_panel.html" with chart_id="options-gex-chart" chart_title="Gamma Exposure by Strike" chart_description="正 Gamma 倾向压低波动，负 Gamma 可能放大追涨杀跌" chart_data=gex_data|default:chart_data chart_kind="bar" chart_class="chart-tall" source=source as_of=as_of chart_badge="Estimated" %}</div>
+    <div data-tab-panel="dex" hidden>{% include "research/includes/chart_panel.html" with chart_id="options-dex-chart" chart_title="Delta Exposure" chart_data=dex_data chart_kind="bar" chart_class="chart-tall" chart_badge="Estimated" %}</div>
+    <div data-tab-panel="iv" hidden>{% include "research/includes/chart_panel.html" with chart_id="options-iv-chart" chart_title="Implied Volatility & Skew" chart_data=iv_data chart_kind="line" chart_class="chart-tall" %}</div>
+    <div data-tab-panel="vanna" hidden>{% include "research/includes/chart_panel.html" with chart_id="options-vanna-chart" chart_title="Vanna Exposure" chart_data=vanna_data chart_kind="bar" chart_class="chart-tall" chart_badge="Estimated" %}</div>
+    <div data-tab-panel="charm" hidden>{% include "research/includes/chart_panel.html" with chart_id="options-charm-chart" chart_title="Charm Exposure" chart_data=charm_data chart_kind="bar" chart_class="chart-tall" chart_badge="Estimated" %}</div>
+    <div data-tab-panel="oi" hidden>{% include "research/includes/chart_panel.html" with chart_id="options-oi-chart" chart_title="Open Interest by Strike" chart_data=oi_data chart_kind="bar" chart_class="chart-tall" %}</div>
+  </div>
+
+  <div class="mt-4 grid gap-4 xl:grid-cols-[1fr_2fr]">
+    <section class="panel"><header class="panel-header"><div><h2 class="section-title">关键结构</h2><p class="section-deck">墙位与翻转点</p></div></header><dl class="panel-body grid grid-cols-2 gap-4">{% for level in key_levels %}<div><dt class="text-[10px] muted">{{ level.label|default:level.name }}</dt><dd class="mono mt-1 text-lg">{{ level.display_value|default:level.value }}</dd></div>{% empty %}<div class="col-span-2 muted">等待期权链快照。</div>{% endfor %}</dl></section>
+    <section class="panel"><header class="panel-header"><div><h2 class="section-title">期权链摘要</h2><p class="section-deck">原始 OI、成交量、IV 与 Greeks</p></div></header><div class="data-table-wrap"><table class="data-table"><thead><tr><th>到期</th><th class="numeric">Strike</th><th>类型</th><th class="numeric">OI</th><th class="numeric">Volume</th><th class="numeric">IV</th><th class="numeric">Delta</th><th class="numeric">Gamma</th></tr></thead><tbody>{% for contract in contracts %}<tr><td class="mono">{{ contract.expiry|date:"Y-m-d" }}</td><td class="numeric">{{ contract.strike|floatformat:2 }}</td><td><span class="badge {% if contract.option_type == 'call' %}badge-positive{% else %}badge-negative{% endif %}">{{ contract.option_type|upper }}</span></td><td class="numeric">{{ contract.open_interest }}</td><td class="numeric">{{ contract.volume }}</td><td class="numeric">{{ contract.implied_volatility|floatformat:3 }}</td><td class="numeric">{{ contract.delta|floatformat:3 }}</td><td class="numeric">{{ contract.gamma|floatformat:5 }}</td></tr>{% empty %}<tr><td colspan="8" class="muted text-center">暂无期权链数据。</td></tr>{% endfor %}</tbody></table></div></section>
+  </div>
+  <details class="panel mt-4"><summary class="panel-header cursor-pointer list-none"><div><h2 class="section-title">计算口径与限制</h2><p class="section-deck">Gamma Flip、Wall、Max Pain 均为模型估算</p></div><span>＋</span></summary><div class="panel-body prose-atlas">{{ methodology|default:"当授权数据源未提供 Greeks 时，平台按统一 BSM 假设计算。结果对隐含波动率、无风险利率和交易商方向假设敏感，不等同于交易所或做市商真实持仓。"|linebreaks }}</div></details>
+</div>
+{% endblock %}

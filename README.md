@@ -49,6 +49,7 @@ docker compose run --rm web python manage.py refresh_treasury_curve_data --start
 docker compose run --rm web python manage.py refresh_prates_data
 docker compose run --rm web python manage.py refresh_h10_data
 docker compose run --rm web python manage.py refresh_h41_data
+docker compose run --rm web python manage.py refresh_h8_data
 docker compose run --rm web python manage.py refresh_macro_data
 docker compose run --rm web python manage.py refresh_cftc_data
 docker compose run --rm web python manage.py refresh_berkshire_letters
@@ -85,6 +86,8 @@ docker compose exec web python manage.py purge_demo_data --dry-run
 docker compose exec web python manage.py refresh_official_data
 docker compose exec web python manage.py refresh_prates_data
 docker compose exec web python manage.py refresh_h10_data
+docker compose exec web python manage.py refresh_h41_data
+docker compose exec web python manage.py refresh_h8_data
 docker compose exec web python manage.py refresh_macro_data
 docker compose exec web python manage.py refresh_berkshire_letters
 docker compose exec web python manage.py sync_ai_glossary_catalog

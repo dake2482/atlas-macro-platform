@@ -329,14 +329,22 @@ PAGE_CONFIGS = {
     "fed-balance-sheet": {
         "title": "美联储资产负债表",
         "eyebrow": "H.4.1",
-        "description": "总资产、国债、MBS、准备金和净流动性统一到可比较单位。",
+        "description": (
+            "H.4.1 四项直接值与 ON RRP、TGA 只在精确共同周三"
+            "原子发布，不做前值填充。"
+        ),
+        "snapshot_contract_version": 1,
         "metrics": [
-            metric("总资产", "$7.22T", "周 -$8B", source="Fed H.4.1"),
-            metric("国债持有", "$4.52T", "周 -$4B"),
-            metric("MBS", "$2.31T", "周 -$5B"),
-            metric("净流动性", "$5.42T", "20D -$64B"),
+            metric("总资产"),
+            metric("美债持有"),
+            metric("MBS 持有"),
+            metric("准备金"),
+            metric("净流动性代理"),
         ],
-        "analysis": "缩表速度温和，但财政账户变化使市场可用流动性波动更大。",
+        "analysis": (
+            "净流动性是 Atlas Macro 以 WALCL - ON RRP - TGA 计算的"
+            "透明代理，不是 Federal Reserve 官方指标，也不是 LPI 综合分。"
+        ),
     },
     "operations": {
         "title": "公开市场操作",
@@ -434,14 +442,28 @@ PAGE_CONFIGS = {
     "subsurface": {
         "title": "次表层资金流",
         "eyebrow": "Repo Microstructure",
-        "description": "SOFR 尾部分位、成交量、SRF 与央行互换捕捉均衡价格下的摩擦。",
+        "description": (
+            "SOFR 尾部与成交量、IORB、非技术测试 SRF 和美元央行互换"
+            "按四个官方精确批次原子发布。"
+        ),
+        "snapshot_contract_version": 1,
         "metrics": [
-            metric("综合压力", "4.2 / 10", "正常"),
-            metric("SOFR 99P−IORB", "+4bp", "尾部温和"),
-            metric("成交量 Z", "-0.42", "正常"),
-            metric("SRF 激活", "否", "0 天/30D"),
+            metric("SOFR"),
+            metric("SOFR 99P"),
+            metric("IORB"),
+            metric("SOFR 99P−SOFR"),
+            metric("SOFR 99P−IORB"),
+            metric("SOFR 成交量"),
+            metric("SOFR 成交量 Z60"),
+            metric("SRF 非测试接受额"),
+            metric("SRF 操作利率"),
+            metric("SRF 30D 非测试激活天数"),
+            metric("美元互换非测试在途"),
         ],
-        "analysis": "次表层尚无硬压力，主要风险来自尾部融资成本缓慢抬升。",
+        "analysis": (
+            "Z60、SRF 激活天数和剔除 small-value 的互换在途是 Atlas "
+            "Macro 透明代理，不是不透明综合压力分或官方压力指标。"
+        ),
     },
     "economy": {
         "title": "经济数据",

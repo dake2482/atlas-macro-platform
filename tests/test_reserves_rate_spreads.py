@@ -7,7 +7,13 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from research.models import DashboardSnapshot, Observation, SourceLicense
+from research.models import (
+    DashboardSnapshot,
+    MetricSnapshot,
+    Observation,
+    SeriesDefinition,
+    SourceLicense,
+)
 from research.official_data import (
     RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS,
     RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS,
@@ -159,13 +165,19 @@ def _business_dates(start: date, end: date) -> list[date]:
     return dates
 
 
-def _rate_records(identity: str, dates: list[date]) -> list[dict]:
+def _rate_records(
+    identity: str,
+    dates: list[date],
+    *,
+    value: Decimal | None = None,
+) -> list[dict]:
     specifications = {
         "sofr": ("SOFR", Decimal("3.55")),
         "iorb": ("IORB", Decimal("3.65")),
         "tbill": ("UST-BILL-13W-COUPON-EQUIVALENT", Decimal("3.80")),
     }
-    series_id, value = specifications[identity]
+    series_id, default_value = specifications[identity]
+    value = default_value if value is None else value
     records = []
     for period in dates:
         metadata = {}
@@ -190,17 +202,24 @@ def _rate_records(identity: str, dates: list[date]) -> list[dict]:
     return records
 
 
-def _record_rate_runs():
-    shared_dates = _business_dates(COMMON_DATE - timedelta(days=59), COMMON_DATE)
-    treasury_dates = [*shared_dates, date(2026, 7, 13)]
-    fetched_at = datetime(2026, 7, 13, 20, 0, tzinfo=UTC)
-    cycle = "reserves-rate-spreads-fixture"
+def _record_custom_rate_runs(
+    *,
+    sofr_dates: list[date],
+    tbill_dates: list[date],
+    iorb_dates: list[date],
+    cycle: str,
+    fetched_at: datetime,
+    values: dict[str, Decimal] | None = None,
+):
+    values = values or {}
     sofr = record_provider_result(
         ProviderResult(
             provider="ny-fed-markets",
             dataset="reference-rate:sofr",
             fetched_at=fetched_at,
-            records=_rate_records("sofr", shared_dates),
+            records=_rate_records(
+                "sofr", sofr_dates, value=values.get("sofr")
+            ),
             metadata={"refresh_cycle_id": cycle},
         ),
         persist=store_series_observations,
@@ -210,7 +229,9 @@ def _record_rate_runs():
             provider="us-treasury-rates",
             dataset="treasury-bill-rates:13w-coupon-equivalent",
             fetched_at=fetched_at,
-            records=_rate_records("tbill", treasury_dates),
+            records=_rate_records(
+                "tbill", tbill_dates, value=values.get("tbill")
+            ),
             metadata={"refresh_cycle_id": cycle},
         ),
         persist=store_series_observations,
@@ -220,11 +241,61 @@ def _record_rate_runs():
             provider="federal-reserve",
             dataset="prates:iorb",
             fetched_at=fetched_at,
-            records=_rate_records("iorb", shared_dates),
+            records=_rate_records(
+                "iorb", iorb_dates, value=values.get("iorb")
+            ),
         ),
         persist=store_series_observations,
     )
     return {"sofr": sofr, "tbill": tbill, "iorb": iorb}
+
+
+def _record_rate_runs():
+    shared_dates = _business_dates(COMMON_DATE - timedelta(days=59), COMMON_DATE)
+    return _record_custom_rate_runs(
+        sofr_dates=shared_dates,
+        tbill_dates=[*shared_dates, date(2026, 7, 13)],
+        iorb_dates=shared_dates,
+        fetched_at=datetime(2026, 7, 13, 20, 0, tzinfo=UTC),
+        cycle="reserves-rate-spreads-fixture",
+    )
+
+
+def _rate_metric_rows(snapshot: DashboardSnapshot):
+    return MetricSnapshot.objects.filter(
+        key__startswith="reserves-rate-spreads-",
+        batch_id=snapshot.batch_id,
+    ).order_by("pk")
+
+
+def _retained_publication_identity(snapshot: DashboardSnapshot) -> dict:
+    return {
+        "snapshot_pk": snapshot.pk,
+        "snapshot_batch": snapshot.batch_id,
+        "fingerprint": snapshot.data["fingerprint"],
+        "metric_pks": tuple(_rate_metric_rows(snapshot).values_list("pk", flat=True)),
+    }
+
+
+def _assert_only_previous_publication_is_stale(
+    snapshot: DashboardSnapshot,
+    identity: dict,
+    *,
+    failure_fragment: str,
+) -> None:
+    snapshot.refresh_from_db()
+    assert DashboardSnapshot.objects.filter(key="reserves-rate-spreads").count() == 1
+    assert snapshot.pk == identity["snapshot_pk"]
+    assert snapshot.batch_id == identity["snapshot_batch"]
+    assert snapshot.data["fingerprint"] == identity["fingerprint"]
+    assert snapshot.quality_status == Observation.Quality.STALE
+    assert failure_fragment in str(snapshot.data["refresh_failure"])
+    metric_pks = tuple(_rate_metric_rows(snapshot).values_list("pk", flat=True))
+    assert metric_pks == identity["metric_pks"]
+    assert len(metric_pks) == len(RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS)
+    assert not MetricSnapshot.objects.filter(
+        key__startswith="reserves-rate-spreads-"
+    ).exclude(batch_id=snapshot.batch_id).exists()
 
 
 @pytest.mark.django_db
@@ -297,6 +368,266 @@ def test_rate_spreads_public_selector_rechecks_current_source_licence():
     )
 
     assert select_public_reserves_rate_spreads_snapshot([snapshot]) is None
+
+
+@pytest.mark.django_db
+def test_rate_spreads_rejects_regressed_common_date_and_retains_previous(
+    monkeypatch,
+):
+    first_now = datetime(2026, 7, 12, 13, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "research.official_data.timezone.now", lambda: first_now
+    )
+    initial_dates = _business_dates(
+        COMMON_DATE - timedelta(days=59), COMMON_DATE
+    )
+    initial = _record_custom_rate_runs(
+        sofr_dates=initial_dates,
+        tbill_dates=initial_dates,
+        iorb_dates=initial_dates,
+        cycle="initial-common-date",
+        fetched_at=datetime(2026, 7, 11, 20, 0, tzinfo=UTC),
+    )
+    _coordinate_reserves_rate_spreads_dashboard([initial["tbill"]])
+    snapshot = DashboardSnapshot.objects.get(key="reserves-rate-spreads")
+    identity = _retained_publication_identity(snapshot)
+
+    regressed_date = COMMON_DATE - timedelta(days=1)
+    regressed_dates = _business_dates(
+        regressed_date - timedelta(days=59), regressed_date
+    )
+    second_now = datetime(2026, 7, 13, 13, 0, tzinfo=UTC)
+    monkeypatch.setattr(
+        "research.official_data.timezone.now", lambda: second_now
+    )
+    regressed = _record_custom_rate_runs(
+        sofr_dates=regressed_dates,
+        tbill_dates=regressed_dates,
+        iorb_dates=regressed_dates,
+        cycle="regressed-common-date",
+        fetched_at=datetime(2026, 7, 12, 20, 0, tzinfo=UTC),
+    )
+
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [regressed["tbill"]]
+    )
+
+    assert dashboards == []
+    assert stale == {"reserves-rate-spreads"}
+    _assert_only_previous_publication_is_stale(
+        snapshot,
+        identity,
+        failure_fragment="regressed behind the published v1 component",
+    )
+    assert snapshot.data["common_effective_date"] == COMMON_DATE.isoformat()
+
+
+@pytest.mark.django_db
+def test_rate_spreads_duplicate_trigger_and_same_value_recovery_are_idempotent():
+    initial = _record_rate_runs()
+    _coordinate_reserves_rate_spreads_dashboard([initial["tbill"]])
+    snapshot = DashboardSnapshot.objects.get(key="reserves-rate-spreads")
+    identity = _retained_publication_identity(snapshot)
+
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [initial["tbill"], initial["tbill"]]
+    )
+
+    assert dashboards == []
+    assert stale == set()
+    snapshot.refresh_from_db()
+    assert _retained_publication_identity(snapshot) == identity
+
+    failed = record_provider_result(
+        ProviderResult.failure(
+            "federal-reserve", "prates:iorb", "temporary recovery fixture"
+        )
+    )
+    _coordinate_reserves_rate_spreads_dashboard([failed])
+    snapshot.refresh_from_db()
+    assert snapshot.quality_status == Observation.Quality.STALE
+
+    recovered = _record_rate_runs()
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [recovered["tbill"]]
+    )
+
+    assert dashboards == []
+    assert stale == set()
+    snapshot.refresh_from_db()
+    assert DashboardSnapshot.objects.filter(key="reserves-rate-spreads").count() == 1
+    assert snapshot.pk == identity["snapshot_pk"]
+    assert snapshot.batch_id == identity["snapshot_batch"]
+    assert snapshot.data["fingerprint"] == identity["fingerprint"]
+    assert snapshot.quality_status == Observation.Quality.ESTIMATED
+    assert "refresh_failure" not in snapshot.data
+    recovered_batches = {str(run.batch_id) for run in recovered.values()}
+    assert set(snapshot.data["component_batches"]) == recovered_batches
+    assert {
+        item["batch_id"] for item in snapshot.data["input_datasets"]
+    } == recovered_batches
+    metric_rows = list(_rate_metric_rows(snapshot))
+    assert len(metric_rows) == len(RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS)
+    assert {item.pk for item in metric_rows} == set(identity["metric_pks"])
+    assert {item.batch_id for item in metric_rows} == {snapshot.batch_id}
+    assert set().union(
+        *(set(item.metadata["input_batch_ids"]) for item in metric_rows)
+    ) == recovered_batches
+    assert not MetricSnapshot.objects.filter(
+        key__startswith="reserves-rate-spreads-"
+    ).exclude(batch_id=snapshot.batch_id).exists()
+
+
+@pytest.mark.django_db
+def test_rate_spreads_rejects_mixed_batch_and_retains_previous():
+    initial = _record_rate_runs()
+    _coordinate_reserves_rate_spreads_dashboard([initial["tbill"]])
+    snapshot = DashboardSnapshot.objects.get(key="reserves-rate-spreads")
+    identity = _retained_publication_identity(snapshot)
+
+    mixed = _record_rate_runs()
+    target_observation = Observation.objects.filter(
+        source=mixed["sofr"].source,
+        series__key="sofr",
+        batch_id=mixed["sofr"].batch_id,
+    ).first()
+    assert target_observation is not None
+    unexpected_series = SeriesDefinition.objects.create(
+        key="unexpected-ny-fed-mixed-batch-series",
+        name="Unexpected NY Fed mixed-batch series",
+        unit="%",
+        frequency="daily",
+        source=mixed["sofr"].source,
+    )
+    Observation.objects.create(
+        series=unexpected_series,
+        instrument=None,
+        value=Decimal("3.50"),
+        value_date=target_observation.value_date,
+        as_of=target_observation.as_of,
+        fetched_at=target_observation.fetched_at,
+        batch_id=mixed["sofr"].batch_id,
+        source=mixed["sofr"].source,
+        fallback_source=None,
+        quality_status=Observation.Quality.FRESH,
+        metadata={"fixture": "unexpected non-target series in exact run batch"},
+    )
+    assert Observation.objects.filter(
+        source=mixed["sofr"].source,
+        series__key="sofr",
+        batch_id=mixed["sofr"].batch_id,
+    ).count() == mixed["sofr"].row_count
+    assert Observation.objects.filter(
+        source=mixed["sofr"].source,
+        batch_id=mixed["sofr"].batch_id,
+    ).count() == mixed["sofr"].row_count + 1
+
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [mixed["sofr"]]
+    )
+
+    assert dashboards == []
+    assert stale == {"reserves-rate-spreads"}
+    _assert_only_previous_publication_is_stale(
+        snapshot,
+        identity,
+        failure_fragment="mixed-batch",
+    )
+
+
+@pytest.mark.django_db
+def test_rate_spreads_rejects_intersection_below_thirty_and_retains_previous():
+    initial = _record_rate_runs()
+    _coordinate_reserves_rate_spreads_dashboard([initial["tbill"]])
+    snapshot = DashboardSnapshot.objects.get(key="reserves-rate-spreads")
+    identity = _retained_publication_identity(snapshot)
+
+    shared_dates = _business_dates(
+        COMMON_DATE - timedelta(days=59), COMMON_DATE
+    )
+    insufficient = _record_custom_rate_runs(
+        sofr_dates=shared_dates,
+        tbill_dates=[*shared_dates, date(2026, 7, 13)],
+        iorb_dates=shared_dates[-29:],
+        cycle="insufficient-common-sample",
+        fetched_at=datetime(2026, 7, 13, 21, 0, tzinfo=UTC),
+    )
+
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [insufficient["tbill"]]
+    )
+
+    assert dashboards == []
+    assert stale == {"reserves-rate-spreads"}
+    _assert_only_previous_publication_is_stale(
+        snapshot,
+        identity,
+        failure_fragment="insufficient-sample",
+    )
+
+
+@pytest.mark.django_db
+def test_rate_spreads_publication_postcondition_failure_rolls_back_new_rows(
+    monkeypatch,
+):
+    initial = _record_rate_runs()
+    _coordinate_reserves_rate_spreads_dashboard([initial["tbill"]])
+    snapshot = DashboardSnapshot.objects.get(key="reserves-rate-spreads")
+    identity = _retained_publication_identity(snapshot)
+
+    shared_dates = _business_dates(
+        COMMON_DATE - timedelta(days=59), COMMON_DATE
+    )
+    changed = _record_custom_rate_runs(
+        sofr_dates=shared_dates,
+        tbill_dates=[*shared_dates, date(2026, 7, 13)],
+        iorb_dates=shared_dates,
+        cycle="changed-values-before-postcondition",
+        fetched_at=datetime(2026, 7, 13, 21, 0, tzinfo=UTC),
+        values={"sofr": Decimal("3.56")},
+    )
+    attempted: dict = {}
+
+    def reject_new_publication(candidate, **_kwargs):
+        attempted.update(
+            {
+                "snapshot_pk": candidate.pk,
+                "batch_id": candidate.batch_id,
+                "fingerprint": candidate.data["fingerprint"],
+                "metric_count": _rate_metric_rows(candidate).count(),
+            }
+        )
+        return False
+
+    monkeypatch.setattr(
+        "research.official_data._reserves_rate_spreads_snapshot_contract_is_valid",
+        reject_new_publication,
+    )
+
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [changed["tbill"]]
+    )
+
+    assert dashboards == []
+    assert stale == {"reserves-rate-spreads"}
+    assert attempted["snapshot_pk"] != identity["snapshot_pk"]
+    assert attempted["batch_id"] != identity["snapshot_batch"]
+    assert attempted["fingerprint"] != identity["fingerprint"]
+    assert attempted["metric_count"] == len(
+        RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS
+    )
+    assert not DashboardSnapshot.objects.filter(
+        pk=attempted["snapshot_pk"]
+    ).exists()
+    assert not MetricSnapshot.objects.filter(
+        key__startswith="reserves-rate-spreads-",
+        batch_id=attempted["batch_id"],
+    ).exists()
+    _assert_only_previous_publication_is_stale(
+        snapshot,
+        identity,
+        failure_fragment="publication postcondition",
+    )
 
 
 def _weekly_records(series_id: str, *, count: int = 60) -> list[dict]:

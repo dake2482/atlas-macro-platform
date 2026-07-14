@@ -144,7 +144,7 @@ Important settings are:
 | `BLS_REGISTRATION_KEY` | Optional higher BLS public API quota |
 | `BEA_API_KEY` / `CENSUS_API_KEY` | BEA API is reserved for explicit backfills; Census key is required for the current 1992-present MARTS retail batch, while archived workbooks remain revision witnesses |
 | `SEC_USER_AGENT` | Required descriptive identity for SEC requests |
-| `RAW_ARTIFACT_ROOT` | Private content-addressed storage for immutable SEC response bytes; defaults to `data/artifacts/` |
+| `RAW_ARTIFACT_ROOT` | Private content-addressed storage for immutable official response bytes, including SEC and New York Fed payloads; defaults to `data/artifacts/` |
 | `MARKET_DATA_PROVIDER` | Redistribution-approved provider; default `none` |
 | `MARKET_DATA_API_KEY` | Credential for a redistribution-approved provider |
 | `AI_PROVIDER` / `AI_API_KEY` | Optional evidence-bound analysis provider |
@@ -166,6 +166,11 @@ Treasury interest-rate and FiscalData APIs, BLS, CFTC PRE, Federal Reserve RSS,
 H.4.1, H.10, PRATES and Consumer Credit G.19; the consumer page also uses BEA
 Personal Income and Outlays, Census MARTS API plus archived revision witnesses, and New York Fed Household Debt and
 Credit workbooks with the required Consumer Credit Panel / Equifax attribution.
+The dedicated Federal Reserve balance-sheet and subsurface-liquidity contracts
+publish only exact, latest-attempt component batches. The subsurface contract
+keeps SOFR, Standing Repo and U.S.-dollar swap JSON as immutable private
+artifacts, separates small-value technical exercises, and reconciles direct
+values with transparent Atlas Macro calculations before publication.
 The employment page combines BLS CES/CPS/JOLTS with U.S. Department of Labor
 national weekly-claims XML and the current immutable weekly-release PDF. The PDF
 overrides the lagging XML tail, and advance/preliminary status remains visible.

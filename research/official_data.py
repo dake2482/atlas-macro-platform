@@ -80,6 +80,7 @@ from .providers import (
 from .services import (
     current_display_source_key_sets,
     ensure_source,
+    persist_private_raw_artifact,
     public_display_license_q,
     public_source_notices,
     publicly_displayable_source_keys,
@@ -131,7 +132,6 @@ CORE_PUBLICATION_KEYS = frozenset(
         "transmission-chain",
         "operations",
         "global-dollar",
-        "subsurface",
     }
 )
 AUCTION_CONTRACT_VERSION = 1
@@ -140,7 +140,91 @@ AUCTION_DATASET = (
     "treasury-fiscal-data",
     "treasury-securities-auctions",
 )
-INDEPENDENT_PUBLICATION_KEYS = frozenset({"auctions", "rrp-tga"})
+FED_BALANCE_SHEET_CONTRACT_VERSION = 1
+FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS = 20
+FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS = frozenset(
+    {"walcl", "wshotsl", "wshomcb", "wrbwfrbl", "net-liquidity"}
+)
+FED_BALANCE_SHEET_REQUIRED_CHART_KEYS = frozenset(
+    {
+        "fed-balance-sheet-history",
+        "fed-balance-sheet-net-liquidity-history",
+    }
+)
+FED_BALANCE_SHEET_REQUIRED_SECTION_KEY = "recent-fed-balance-sheet"
+FED_BALANCE_SHEET_NET_FORMULA = "WALCL - ONRRP - TGA"
+SUBSURFACE_CONTRACT_VERSION = 1
+SUBSURFACE_MINIMUM_Z60_ROWS = 60
+SUBSURFACE_REQUIRED_METRIC_KEYS = frozenset(
+    {
+        "sofr",
+        "sofr-p99",
+        "iorb",
+        "sofr-p99-minus-rate",
+        "sofr-p99-minus-iorb",
+        "sofr-volume",
+        "sofr-volume-z60",
+        "srf-non-small-value-total",
+        "srf-rate",
+        "srf-active-days-30d",
+        "fxswap-outstanding-non-small-value",
+    }
+)
+SUBSURFACE_REQUIRED_CHART_KEYS = frozenset(
+    {
+        "subsurface-sofr-tail-history",
+        "subsurface-sofr-volume-history",
+        "subsurface-srf-history",
+        "subsurface-swap-drawdowns",
+    }
+)
+SUBSURFACE_REQUIRED_SECTION_KEYS = frozenset(
+    {"recent-subsurface-observations", "recent-srf-operations"}
+)
+SUBSURFACE_DATASETS = {
+    "sofr": ("ny-fed-markets", "reference-rate:sofr"),
+    "iorb": ("federal-reserve", "prates:iorb"),
+    "srf": (
+        "ny-fed-markets",
+        "repo:standing-repo-full-allotment-results",
+    ),
+    "swaps": ("ny-fed-markets", "fx-swaps:usdollar"),
+}
+SUBSURFACE_REQUIRED_SERIES = {
+    "sofr": frozenset({"sofr"}),
+    "iorb": frozenset({"iorb"}),
+    "srf": frozenset(
+        {
+            "srp-non-small-value-total",
+            "srp-small-value-total",
+            "srp-non-small-value-treasury",
+            "srp-non-small-value-agency",
+            "srp-non-small-value-mbs",
+            "srp-non-small-value-rate",
+        }
+    ),
+    "swaps": frozenset(
+        {
+            "fxswap-usd-drawdown-non-small-value",
+            "fxswap-usd-drawdown-small-value",
+            "fxswap-usd-outstanding",
+            "fxswap-usd-outstanding-non-small-value",
+            "fxswap-usd-outstanding-small-value",
+        }
+    ),
+}
+SUBSURFACE_FORMULAS = {
+    "sofr-p99-minus-rate": "100 * (SOFR_99P - SOFR)",
+    "sofr-p99-minus-iorb": "100 * (SOFR_99P - IORB)",
+    "sofr-volume-z60": "(V_t - mean(V_t..V_t-59)) / population_std(V_t..V_t-59)",
+    "srf-active-days-30d": "sum(1[daily non-small-value accepted > 0]) over [t-29d,t]",
+    "fxswap-outstanding-non-small-value": (
+        "FXSWAP-USD-OUTSTANDING - FXSWAP-USD-OUTSTANDING-SMALL-VALUE"
+    ),
+}
+INDEPENDENT_PUBLICATION_KEYS = frozenset(
+    {"auctions", "rrp-tga", "fed-balance-sheet", "subsurface"}
+)
 AUCTION_REQUIRED_METRIC_KEYS = frozenset(
     {
         "days-to-next-auction",
@@ -202,9 +286,9 @@ YIELD_CURVE_REQUIRED_METRIC_KEYS = frozenset(
 REAL_RATES_REQUIRED_METRIC_KEYS = frozenset(
     {"tips-5y", "tips-10y", "5y-bei", "10y-bei"}
 )
-H41_PUBLICATION_KEYS = frozenset({"fed-balance-sheet"})
+H41_PUBLICATION_KEYS = frozenset()
 PRATES_PUBLICATION_KEYS = frozenset(
-    {"transmission-chain", "subsurface"}
+    {"transmission-chain"}
 )
 H10_PUBLICATION_KEYS = frozenset({"assets-fx"})
 CREDIT_PUBLICATION_KEYS = frozenset({"credit", "credit-spreads", "credit-stress"})
@@ -258,6 +342,12 @@ LIQUIDITY_DATASETS = {
     "h41": ("federal-reserve", "h41"),
     "onrrp": ("ny-fed-markets", "repo:reverse-repo-fixed-results"),
     "tga": ("treasury-fiscal-data", "daily-treasury-statement:tga"),
+}
+FED_BALANCE_SHEET_DATASETS = dict(LIQUIDITY_DATASETS)
+FED_BALANCE_SHEET_SERIES = {
+    "h41": ("walcl", "wshotsl", "wshomcb", "wrbwfrbl"),
+    "onrrp": ("onrrp",),
+    "tga": ("tga",),
 }
 RRP_TGA_DATASETS = {
     "onrrp": LIQUIDITY_DATASETS["onrrp"],
@@ -8035,6 +8125,4469 @@ def _coordinate_reserves_rate_spreads_dashboard(
     return ([published] if published is not None else []), set()
 
 
+def _fed_balance_sheet_run_identity(run: IngestionRun) -> str | None:
+    for identity, (source_key, dataset) in FED_BALANCE_SHEET_DATASETS.items():
+        if run.source.key == source_key and run.dataset == dataset:
+            return identity
+    return None
+
+
+def _latest_fed_balance_sheet_attempt(identity: str) -> IngestionRun | None:
+    source_key, dataset = FED_BALANCE_SHEET_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(source__key=source_key, dataset=dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _latest_successful_fed_balance_sheet_run(
+    identity: str,
+) -> IngestionRun | None:
+    source_key, dataset = FED_BALANCE_SHEET_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(
+            source__key=source_key,
+            dataset=dataset,
+            status=IngestionRun.Status.SUCCESS,
+            row_count__gt=0,
+        )
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _fed_balance_sheet_run_state(
+    identity: str,
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    source_key, dataset = FED_BALANCE_SHEET_DATASETS[identity]
+    return {
+        "component": identity,
+        "kind": "ingestion_run",
+        "source": source_key,
+        "dataset": dataset,
+        "status": status or (run.status if run else "missing"),
+        "reason": (
+            reason or (run.error if run else "required dataset run missing")
+        )[:320],
+        "ingestion_run_id": run.pk if run else None,
+        "batch_id": str(run.batch_id) if run else None,
+        "row_count": run.row_count if run else 0,
+        "refresh_cycle_id": (
+            str((run.metadata or {}).get("refresh_cycle_id") or "")
+            if run
+            else ""
+        ),
+        "completed_at": (
+            run.completed_at.isoformat() if run and run.completed_at else None
+        ),
+    }
+
+
+def _fed_balance_sheet_failure(
+    component: str,
+    reason: str,
+    *,
+    status: str = "invalid",
+    run: IngestionRun | None = None,
+) -> dict[str, Any]:
+    if component in FED_BALANCE_SHEET_DATASETS:
+        return _fed_balance_sheet_run_state(
+            component, run, status=status, reason=reason
+        )
+    return {
+        "component": component,
+        "kind": "contract",
+        "status": status,
+        "reason": reason[:320],
+    }
+
+
+def _select_fed_balance_sheet_runs(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
+    relevant: dict[str, list[IngestionRun]] = {
+        identity: [] for identity in FED_BALANCE_SHEET_DATASETS
+    }
+    for run in trigger_runs:
+        identity = _fed_balance_sheet_run_identity(run)
+        if identity:
+            relevant[identity].append(run)
+    if not any(relevant.values()):
+        return None, [], False
+
+    # A delayed task is a pure no-op. It must not stale or republish a state
+    # already established by a newer attempt for the same exact dataset.
+    for identity, identity_runs in relevant.items():
+        if not identity_runs:
+            continue
+        latest = _latest_fed_balance_sheet_attempt(identity)
+        if (
+            latest is None
+            or len(identity_runs) != 1
+            or identity_runs[0].pk != latest.pk
+        ):
+            return None, [], False
+
+    selected_optional = {
+        identity: _latest_fed_balance_sheet_attempt(identity)
+        for identity in FED_BALANCE_SHEET_DATASETS
+    }
+    states = [
+        _fed_balance_sheet_run_state(identity, selected_optional[identity])
+        for identity in FED_BALANCE_SHEET_DATASETS
+    ]
+    if any(
+        run is None
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in selected_optional.values()
+    ):
+        return None, states, True
+    selected = {
+        identity: run
+        for identity, run in selected_optional.items()
+        if run is not None
+    }
+    onrrp_cycle = str(
+        (selected["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    tga_cycle = str(
+        (selected["tga"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    if not onrrp_cycle or onrrp_cycle != tga_cycle:
+        states = [
+            (
+                _fed_balance_sheet_run_state(
+                    identity,
+                    run,
+                    status="invalid-cycle",
+                    reason=(
+                        "ON RRP and TGA are not from the same non-empty "
+                        "refresh cycle"
+                    ),
+                )
+                if identity in {"onrrp", "tga"}
+                else _fed_balance_sheet_run_state(identity, run)
+            )
+            for identity, run in selected.items()
+        ]
+        return None, states, True
+    return selected, states, True
+
+
+def _fed_balance_sheet_runs_still_latest(
+    selected: dict[str, IngestionRun],
+) -> bool:
+    return all(
+        (latest := _latest_fed_balance_sheet_attempt(identity)) is not None
+        and latest.pk == run.pk
+        for identity, run in selected.items()
+    )
+
+
+def _fed_balance_sheet_direct_lineage(
+    observation: Observation,
+    *,
+    license_scope: str,
+    fresh_until: datetime,
+) -> dict[str, Any]:
+    return {
+        "series_key": observation.series.key,
+        "value": float(observation.value),
+        "raw_value": str(observation.value),
+        "unit": observation.series.unit,
+        "source_key": observation.source.key,
+        "source_name": observation.source.name,
+        "source_keys": [observation.source.key],
+        "license_scope": license_scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": str(observation.batch_id),
+        "quality_status": observation.quality_status,
+        "fallback_source": None,
+    }
+
+
+def _fed_balance_sheet_exact_inputs(
+    selected: dict[str, IngestionRun],
+    *,
+    now: datetime | None = None,
+    allow_expired: bool = False,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    now = now or timezone.now()
+    today_et = now.astimezone(ZoneInfo("America/New_York")).date()
+    required_sources = {
+        "federal-reserve",
+        "ny-fed-markets",
+        "treasury-fiscal-data",
+        "internal",
+    }
+    public_keys, derived_keys = current_display_source_key_sets(required_sources)
+    if public_keys != required_sources or derived_keys != required_sources:
+        return None, [
+            _fed_balance_sheet_failure(
+                "licence",
+                "every direct input and Atlas derived output requires a current "
+                "public and derived display licence",
+                status="unlicensed",
+            )
+        ]
+    licence_scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return None, [
+                _fed_balance_sheet_failure(
+                    "licence",
+                    f"{source_key} lacks a current public/derived licence",
+                    status="unlicensed",
+                )
+            ]
+        licence_scopes[source_key] = licence.scope
+
+    maps: dict[str, dict[date, Observation]] = {}
+    component_deadlines: dict[str, datetime] = {}
+    expected_source_by_component = {
+        identity: FED_BALANCE_SHEET_DATASETS[identity][0]
+        for identity in FED_BALANCE_SHEET_DATASETS
+    }
+    for identity, run in selected.items():
+        expected_source = expected_source_by_component[identity]
+        if (
+            run.source.key != expected_source
+            or run.dataset != FED_BALANCE_SHEET_DATASETS[identity][1]
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+        ):
+            return None, [
+                _fed_balance_sheet_failure(
+                    identity,
+                    "selected run does not match the successful source/dataset contract",
+                    run=run,
+                )
+            ]
+        run_fetched_at = _parse_payload_datetime(
+            (run.metadata or {}).get("fetched_at")
+        )
+        if (
+            run_fetched_at is None
+            or run_fetched_at > now + timedelta(minutes=5)
+        ):
+            return None, [
+                _fed_balance_sheet_failure(
+                    identity,
+                    "selected run has a missing or future fetched_at",
+                    run=run,
+                )
+            ]
+        exact_source_count = Observation.objects.filter(
+            source=run.source, batch_id=run.batch_id
+        ).count()
+        exact_total_count = Observation.objects.filter(
+            batch_id=run.batch_id
+        ).count()
+        if (
+            exact_source_count != run.row_count
+            or exact_total_count != run.row_count
+        ):
+            return None, [
+                _fed_balance_sheet_failure(
+                    identity,
+                    "run.row_count does not match the complete source exact batch",
+                    status="batch-pollution",
+                    run=run,
+                )
+            ]
+
+        for series_key in FED_BALANCE_SHEET_SERIES[identity]:
+            rows = list(
+                Observation.objects.filter(
+                    source=run.source,
+                    batch_id=run.batch_id,
+                    series__key=series_key,
+                )
+                .select_related("series", "series__source", "source", "fallback_source")
+                .order_by("value_date", "fetched_at", "id")
+            )
+            if not rows:
+                return None, [
+                    _fed_balance_sheet_failure(
+                        identity,
+                        f"required exact-batch series {series_key} is missing",
+                        status="missing",
+                        run=run,
+                    )
+                ]
+            by_date: dict[date, Observation] = {}
+            for observation in rows:
+                period = observation.value_date.date()
+                if period in by_date:
+                    return None, [
+                        _fed_balance_sheet_failure(
+                            identity,
+                            f"{series_key} contains a duplicate value_date",
+                            status="duplicate",
+                            run=run,
+                        )
+                    ]
+                if period > today_et:
+                    return None, [
+                        _fed_balance_sheet_failure(
+                            identity,
+                            f"{series_key} contains a future value_date",
+                            status="future",
+                            run=run,
+                        )
+                    ]
+                if (
+                    observation.source.key != expected_source
+                    or observation.series.source_id != run.source_id
+                    or observation.batch_id != run.batch_id
+                    or observation.series.unit != "USD millions"
+                    or observation.fallback_source_id is not None
+                    or observation.quality_status != Observation.Quality.FRESH
+                    or observation.fetched_at != run_fetched_at
+                    or observation.fetched_at > now + timedelta(minutes=5)
+                    or observation.as_of > now + timedelta(minutes=5)
+                ):
+                    return None, [
+                        _fed_balance_sheet_failure(
+                            identity,
+                            f"{series_key} contains wrong-source, wrong-unit, mixed, "
+                            "fallback, stale/error or future lineage",
+                            status="invalid-lineage",
+                            run=run,
+                        )
+                    ]
+                if identity == "h41" and period.weekday() != 2:
+                    return None, [
+                        _fed_balance_sheet_failure(
+                            identity,
+                            f"{series_key} contains a non-Wednesday H.4.1 point",
+                            status="invalid-date",
+                            run=run,
+                        )
+                    ]
+                by_date[period] = observation
+            maps[series_key] = by_date
+            component_deadlines[series_key] = _fresh_until(
+                by_date[max(by_date)]
+            )
+
+    expired_series = sorted(
+        series_key
+        for series_key, deadline in component_deadlines.items()
+        if deadline < now
+    )
+    if expired_series and not allow_expired:
+        return None, [
+            _fed_balance_sheet_failure(
+                "freshness",
+                "latest exact-batch component is stale: "
+                + ", ".join(expired_series),
+                status=Observation.Quality.STALE,
+            )
+        ]
+
+    h41_date_sets = [
+        set(maps[series_key]) for series_key in FED_BALANCE_SHEET_SERIES["h41"]
+    ]
+    if not h41_date_sets or any(
+        dates != h41_date_sets[0] for dates in h41_date_sets[1:]
+    ):
+        return None, [
+            _fed_balance_sheet_failure(
+                "h41",
+                "the four required H.4.1 series do not have one identical exact-batch "
+                "Wednesday date set",
+                status="mixed-date-set",
+                run=selected["h41"],
+            )
+        ]
+
+    common_dates = sorted(
+        set.intersection(
+            *(set(maps[series_key]) for series_key in (
+                "walcl",
+                "wshotsl",
+                "wshomcb",
+                "wrbwfrbl",
+                "onrrp",
+                "tga",
+            ))
+        )
+    )
+    if (
+        len(common_dates) < FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS
+        or any(period > today_et or period.weekday() != 2 for period in common_dates)
+    ):
+        return None, [
+            _fed_balance_sheet_failure(
+                "common-wednesdays",
+                "the six exact-batch series have fewer than 20 common non-future "
+                "Wednesdays",
+                status="insufficient-sample",
+            )
+        ]
+    return {
+        "maps": maps,
+        "common_dates": common_dates,
+        "page_fresh_until": min(component_deadlines.values()),
+        "licence_scopes": licence_scopes,
+        "refresh_cycle_id": str(
+            (selected["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
+        ),
+    }, []
+
+
+def _fed_balance_sheet_direct_metric(
+    *,
+    key: str,
+    label: str,
+    current: Observation,
+    previous: Observation,
+    license_scope: str,
+    fresh_until: datetime,
+) -> dict[str, Any]:
+    scale = Decimal("0.000001")
+    value = current.value * scale
+    previous_value = previous.value * scale
+    current_lineage = _fed_balance_sheet_direct_lineage(
+        current, license_scope=license_scope, fresh_until=fresh_until
+    )
+    previous_lineage = _fed_balance_sheet_direct_lineage(
+        previous, license_scope=license_scope, fresh_until=fresh_until
+    )
+    return {
+        "key": key,
+        "label": label,
+        "value": float(value),
+        "display_value": f"{value:,.6f} USD tn",
+        "change": float(value - previous_value),
+        "change_unit": " USD tn",
+        "unit": " USD tn",
+        "quality_status": Observation.Quality.FRESH,
+        "source": current.source.name,
+        "source_key": current.source.key,
+        "source_keys": [current.source.key],
+        "fallback_source": None,
+        "license_scope": license_scope,
+        "value_date": current.value_date.isoformat(),
+        "as_of": current.as_of.isoformat(),
+        "fetched_at": current.fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": str(current.batch_id),
+        "metadata": {
+            "normalization": "raw USD millions / 1,000,000 = USD trillions",
+            "common_effective_date": current.value_date.date().isoformat(),
+            "input_series": [current.series.key],
+            "input_batch_ids": [str(current.batch_id)],
+            "input_value_dates": [current.value_date.isoformat()],
+            "input_lineage": [current_lineage],
+            "previous_value": float(previous_value),
+            "previous_value_date": previous.value_date.isoformat(),
+            "previous_input_lineage": [previous_lineage],
+        },
+    }
+
+
+def _fed_balance_sheet_net_lineage(
+    *,
+    period_inputs: dict[str, Observation],
+    licence_scopes: dict[str, str],
+    fresh_until: datetime,
+) -> dict[str, Any]:
+    input_keys = ("walcl", "onrrp", "tga")
+    inputs = [
+        _fed_balance_sheet_direct_lineage(
+            period_inputs[key],
+            license_scope=licence_scopes[period_inputs[key].source.key],
+            fresh_until=fresh_until,
+        )
+        for key in input_keys
+    ]
+    input_batches = sorted({item["batch_id"] for item in inputs})
+    return {
+        "series_key": "net-liquidity",
+        "source_key": "internal",
+        "source_name": ensure_source("internal").name,
+        "source_keys": [
+            "federal-reserve",
+            "internal",
+            "ny-fed-markets",
+            "treasury-fiscal-data",
+        ],
+        "license_scope": licence_scopes["internal"],
+        "value_date": period_inputs["walcl"].value_date.isoformat(),
+        "as_of": min(period_inputs[key].as_of for key in input_keys).isoformat(),
+        "fetched_at": max(
+            period_inputs[key].fetched_at for key in input_keys
+        ).isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": ",".join(input_batches),
+        "input_batch_ids": input_batches,
+        "input_lineage": inputs,
+        "formula": FED_BALANCE_SHEET_NET_FORMULA,
+        "quality_status": Observation.Quality.ESTIMATED,
+        "fallback_source": None,
+    }
+
+
+def _fed_balance_sheet_net_value(
+    period_inputs: dict[str, Observation],
+) -> Decimal:
+    return (
+        period_inputs["walcl"].value
+        - period_inputs["onrrp"].value
+        - period_inputs["tga"].value
+    ) * Decimal("0.000001")
+
+
+def _fed_balance_sheet_net_metric(
+    *,
+    current: dict[str, Observation],
+    previous: dict[str, Observation],
+    licence_scopes: dict[str, str],
+    fresh_until: datetime,
+) -> dict[str, Any]:
+    value = _fed_balance_sheet_net_value(current)
+    previous_value = _fed_balance_sheet_net_value(previous)
+    lineage = _fed_balance_sheet_net_lineage(
+        period_inputs=current,
+        licence_scopes=licence_scopes,
+        fresh_until=fresh_until,
+    )
+    previous_lineage = _fed_balance_sheet_net_lineage(
+        period_inputs=previous,
+        licence_scopes=licence_scopes,
+        fresh_until=fresh_until,
+    )
+    return {
+        "key": "net-liquidity",
+        "label": "净流动性代理",
+        "value": float(value),
+        "display_value": f"{value:,.6f} USD tn",
+        "change": float(value - previous_value),
+        "change_unit": " USD tn",
+        "unit": " USD tn",
+        "quality_status": Observation.Quality.ESTIMATED,
+        "source": "Atlas Macro 透明代理（非 Federal Reserve 官方指标/LPI）",
+        "source_key": "internal",
+        "source_keys": lineage["source_keys"],
+        "fallback_source": None,
+        "license_scope": licence_scopes["internal"],
+        "value_date": current["walcl"].value_date.isoformat(),
+        "as_of": lineage["as_of"],
+        "fetched_at": lineage["fetched_at"],
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": lineage["batch_id"],
+        "metadata": {
+            "formula": FED_BALANCE_SHEET_NET_FORMULA,
+            "calculation_owner": "Atlas Macro",
+            "model_label": (
+                "Atlas transparent proxy; not a Federal Reserve official "
+                "indicator or LPI composite"
+            ),
+            "normalization": (
+                "subtract raw USD millions, then divide by 1,000,000 for USD trillions"
+            ),
+            "common_effective_date": current["walcl"].value_date.date().isoformat(),
+            "input_series": ["walcl", "onrrp", "tga"],
+            "input_batch_ids": lineage["input_batch_ids"],
+            "input_value_dates": [current["walcl"].value_date.isoformat()],
+            "input_lineage": lineage["input_lineage"],
+            "previous_value": float(previous_value),
+            "previous_value_date": previous["walcl"].value_date.isoformat(),
+            "previous_input_lineage": previous_lineage["input_lineage"],
+        },
+    }
+
+
+def _fed_balance_sheet_page_data(
+    selected: dict[str, IngestionRun],
+) -> tuple[
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None,
+    list[dict[str, Any]],
+]:
+    context, failures = _fed_balance_sheet_exact_inputs(selected)
+    if context is None:
+        return None, failures
+    maps: dict[str, dict[date, Observation]] = context["maps"]
+    common_dates: list[date] = context["common_dates"]
+    fresh_until: datetime = context["page_fresh_until"]
+    licence_scopes: dict[str, str] = context["licence_scopes"]
+    current_date, previous_date = common_dates[-1], common_dates[-2]
+    current = {key: maps[key][current_date] for key in maps}
+    previous = {key: maps[key][previous_date] for key in maps}
+    metrics = [
+        _fed_balance_sheet_direct_metric(
+            key="walcl",
+            label="总资产",
+            current=current["walcl"],
+            previous=previous["walcl"],
+            license_scope=licence_scopes["federal-reserve"],
+            fresh_until=fresh_until,
+        ),
+        _fed_balance_sheet_direct_metric(
+            key="wshotsl",
+            label="美债持有",
+            current=current["wshotsl"],
+            previous=previous["wshotsl"],
+            license_scope=licence_scopes["federal-reserve"],
+            fresh_until=fresh_until,
+        ),
+        _fed_balance_sheet_direct_metric(
+            key="wshomcb",
+            label="MBS 持有",
+            current=current["wshomcb"],
+            previous=previous["wshomcb"],
+            license_scope=licence_scopes["federal-reserve"],
+            fresh_until=fresh_until,
+        ),
+        _fed_balance_sheet_direct_metric(
+            key="wrbwfrbl",
+            label="准备金",
+            current=current["wrbwfrbl"],
+            previous=previous["wrbwfrbl"],
+            license_scope=licence_scopes["federal-reserve"],
+            fresh_until=fresh_until,
+        ),
+        _fed_balance_sheet_net_metric(
+            current=current,
+            previous=previous,
+            licence_scopes=licence_scopes,
+            fresh_until=fresh_until,
+        ),
+    ]
+
+    balance_rows: list[dict[str, Any]] = []
+    net_rows: list[dict[str, Any]] = []
+    table_rows: list[dict[str, Any]] = []
+    direct_fields = {
+        "Total assets": "walcl",
+        "Treasuries": "wshotsl",
+        "MBS": "wshomcb",
+        "Reserve balances": "wrbwfrbl",
+    }
+    for period in common_dates:
+        period_inputs = {key: maps[key][period] for key in maps}
+        direct_lineage = {
+            field: _fed_balance_sheet_direct_lineage(
+                period_inputs[series_key],
+                license_scope=licence_scopes["federal-reserve"],
+                fresh_until=fresh_until,
+            )
+            for field, series_key in direct_fields.items()
+        }
+        balance_rows.append(
+            {
+                "date": period.isoformat(),
+                **{
+                    field: float(
+                        period_inputs[series_key].value * Decimal("0.000001")
+                    )
+                    for field, series_key in direct_fields.items()
+                },
+                "_source_keys": ["federal-reserve"],
+                "_lineage": direct_lineage,
+            }
+        )
+        net_value = _fed_balance_sheet_net_value(period_inputs)
+        net_lineage = _fed_balance_sheet_net_lineage(
+            period_inputs=period_inputs,
+            licence_scopes=licence_scopes,
+            fresh_until=fresh_until,
+        )
+        net_rows.append(
+            {
+                "date": period.isoformat(),
+                "Net liquidity": float(net_value),
+                "_source_keys": net_lineage["source_keys"],
+                "_lineage": {"Net liquidity": net_lineage},
+            }
+        )
+        if period in common_dates[-20:]:
+            row_values = {
+                "Total assets": balance_rows[-1]["Total assets"],
+                "Treasuries": balance_rows[-1]["Treasuries"],
+                "MBS": balance_rows[-1]["MBS"],
+                "Net liquidity": float(net_value),
+            }
+            table_rows.append(
+                {
+                    "date": period.isoformat(),
+                    **row_values,
+                    "cells_list": [
+                        {"key": "date", "cell": {"value": period.isoformat()}},
+                        *[
+                            {
+                                "key": field.lower().replace(" ", "-"),
+                                "cell": {"value": f"{row_values[field]:,.6f}"},
+                            }
+                            for field in (
+                                "Total assets",
+                                "Treasuries",
+                                "MBS",
+                                "Net liquidity",
+                            )
+                        ],
+                    ],
+                    "_source_keys": net_lineage["source_keys"],
+                    "_lineage": {
+                        "Total assets": direct_lineage["Total assets"],
+                        "Treasuries": direct_lineage["Treasuries"],
+                        "MBS": direct_lineage["MBS"],
+                        "Net liquidity": net_lineage,
+                    },
+                }
+            )
+
+    balance_chart = _lineage_chart(
+        key="fed-balance-sheet-history",
+        title="H.4.1 资产负债表分项",
+        description=(
+            "WALCL、WSHOTSL、WSHOMCB 与 WRBWFRBL 只取同一 H.4.1 "
+            "精确批次且六序列共同的周三，单位：USD trillions。"
+        ),
+        rows=balance_rows,
+        fields=tuple(direct_fields),
+        tab="balance-sheet",
+        frequency="weekly",
+        include_internal=False,
+    )
+    net_chart = _lineage_chart(
+        key="fed-balance-sheet-net-liquidity-history",
+        title="净流动性透明代理",
+        description=(
+            "先以原始 USD millions 计算 WALCL - ON RRP - TGA，再转为 "
+            "USD trillions；不是 Federal Reserve 官方指标或 LPI。"
+        ),
+        rows=net_rows,
+        fields=("Net liquidity",),
+        tab="net-liquidity",
+        frequency="weekly",
+    )
+    if balance_chart is None or net_chart is None or len(table_rows) != 20:
+        return None, [
+            _fed_balance_sheet_failure(
+                "artifacts", "required charts or recent-20 table are not buildable"
+            )
+        ]
+    component_runs = [
+        _fed_balance_sheet_run_state(identity, selected[identity], status="valid")
+        for identity in FED_BALANCE_SHEET_DATASETS
+    ]
+    sections = [
+        {
+            "key": FED_BALANCE_SHEET_REQUIRED_SECTION_KEY,
+            "title": "近期精确共同周三（最近20条）",
+            "description": (
+                "Date / Total assets / Treasuries / MBS / Net liquidity；"
+                "不做前值填充，金额单位为 USD trillions。"
+            ),
+            "columns": [
+                {"key": "date", "label": "Date"},
+                {"key": "total-assets", "label": "Total assets"},
+                {"key": "treasuries", "label": "Treasuries"},
+                {"key": "mbs", "label": "MBS"},
+                {"key": "net-liquidity", "label": "Net liquidity"},
+            ],
+            "rows": table_rows,
+            "status": Observation.Quality.ESTIMATED,
+            "quality_status": Observation.Quality.ESTIMATED,
+            "source_key": "internal",
+            "source_keys": [
+                "federal-reserve",
+                "internal",
+                "ny-fed-markets",
+                "treasury-fiscal-data",
+            ],
+            "license_scope": licence_scopes["internal"],
+            "fallback_source": None,
+            "as_of": metrics[-1]["as_of"],
+            "fetched_at": metrics[-1]["fetched_at"],
+            "fresh_until": fresh_until.isoformat(),
+            "batch_id": metrics[-1]["batch_id"],
+            "full_width": True,
+        }
+    ]
+    extra_data = {
+        "contract_version": FED_BALANCE_SHEET_CONTRACT_VERSION,
+        "common_effective_date": current_date.isoformat(),
+        "minimum_common_rows": FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS,
+        "common_row_count": len(common_dates),
+        "refresh_cycle_id": context["refresh_cycle_id"],
+        "component_runs": component_runs,
+        "model_disclaimer": (
+            "Atlas Macro proxy calculated as WALCL - ONRRP - TGA from raw USD "
+            "millions; not a Federal Reserve official indicator or LPI composite."
+        ),
+        "formula": FED_BALANCE_SHEET_NET_FORMULA,
+    }
+    if not _fed_balance_sheet_page_contract_is_buildable(
+        metrics, [balance_chart, net_chart], extra_data, sections=sections
+    ):
+        return None, [
+            _fed_balance_sheet_failure(
+                "contract", "prepared page failed the fed-balance-sheet v1 validator"
+            )
+        ]
+    return (metrics, [balance_chart, net_chart], sections, extra_data), []
+
+
+def _fed_balance_sheet_decimal_equal(left: Any, right: Any) -> bool:
+    try:
+        return Decimal(str(left)).quantize(Decimal("0.00000001")) == Decimal(
+            str(right)
+        ).quantize(Decimal("0.00000001"))
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+def _fed_balance_sheet_decimal_value(raw: Any) -> Decimal | None:
+    try:
+        value = Decimal(str(raw))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return value if value.is_finite() else None
+
+
+def _fed_balance_sheet_net_from_lineage(
+    lineage: Any,
+) -> Decimal | None:
+    if not isinstance(lineage, list) or len(lineage) != 3:
+        return None
+    values: dict[str, Decimal] = {}
+    try:
+        for item in lineage:
+            if not isinstance(item, dict):
+                return None
+            key = str(item.get("series_key") or "").lower()
+            if key in values:
+                return None
+            value = Decimal(str(item.get("raw_value")))
+            if not value.is_finite():
+                return None
+            values[key] = value
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if set(values) != {"walcl", "onrrp", "tga"}:
+        return None
+    return (
+        values["walcl"] - values["onrrp"] - values["tga"]
+    ) * Decimal("0.000001")
+
+
+def _fed_balance_sheet_safe_direct_lineage(
+    lineage: Any,
+    *,
+    expected_series: str,
+    expected_date: str,
+) -> bool:
+    raw_value = (
+        _fed_balance_sheet_decimal_value(lineage.get("raw_value"))
+        if isinstance(lineage, dict)
+        else None
+    )
+    return bool(
+        isinstance(lineage, dict)
+        and str(lineage.get("series_key") or "").lower() == expected_series
+        and lineage.get("source_key")
+        == (
+            "federal-reserve"
+            if expected_series in FED_BALANCE_SHEET_SERIES["h41"]
+            else "ny-fed-markets"
+            if expected_series == "onrrp"
+            else "treasury-fiscal-data"
+        )
+        and lineage.get("unit") == "USD millions"
+        and str(lineage.get("value_date") or "")[:10] == expected_date
+        and lineage.get("as_of")
+        and lineage.get("fetched_at")
+        and lineage.get("batch_id")
+        and lineage.get("license_scope")
+        and lineage.get("quality_status") == Observation.Quality.FRESH
+        and lineage.get("fallback_source") is None
+        and raw_value is not None
+    )
+
+
+def _fed_balance_sheet_safe_net_lineage(
+    lineage: Any, *, expected_date: str, expected_value: Any
+) -> bool:
+    recomputed = (
+        _fed_balance_sheet_net_from_lineage(lineage.get("input_lineage"))
+        if isinstance(lineage, dict)
+        else None
+    )
+    return bool(
+        isinstance(lineage, dict)
+        and lineage.get("series_key") == "net-liquidity"
+        and lineage.get("source_key") == "internal"
+        and lineage.get("formula") == FED_BALANCE_SHEET_NET_FORMULA
+        and str(lineage.get("value_date") or "")[:10] == expected_date
+        and lineage.get("as_of")
+        and lineage.get("fetched_at")
+        and lineage.get("batch_id")
+        and lineage.get("license_scope")
+        and lineage.get("quality_status") == Observation.Quality.ESTIMATED
+        and lineage.get("fallback_source") is None
+        and recomputed is not None
+        and _fed_balance_sheet_decimal_equal(recomputed, expected_value)
+        and {
+            str(item.get("value_date") or "")[:10]
+            for item in lineage.get("input_lineage", [])
+        }
+        == {expected_date}
+        and all(
+            _fed_balance_sheet_safe_direct_lineage(
+                item,
+                expected_series=str(item.get("series_key") or "").lower(),
+                expected_date=expected_date,
+            )
+            for item in lineage.get("input_lineage", [])
+        )
+    )
+
+
+def _fed_balance_sheet_page_contract_is_buildable(
+    metrics: list[dict[str, Any]],
+    charts: list[dict[str, Any]],
+    extra_data: dict[str, Any],
+    *,
+    sections: list[dict[str, Any]] | None = None,
+) -> bool:
+    try:
+        common_row_count = int(extra_data.get("common_row_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    if (
+        extra_data.get("contract_version")
+        != FED_BALANCE_SHEET_CONTRACT_VERSION
+        or extra_data.get("formula") != FED_BALANCE_SHEET_NET_FORMULA
+        or common_row_count < FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS
+        or not str(extra_data.get("refresh_cycle_id") or "")
+        or "not a Federal Reserve official indicator or LPI"
+        not in str(extra_data.get("model_disclaimer") or "")
+        or len(metrics) != len(FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS)
+        or any(not isinstance(item, dict) for item in metrics)
+        or {str(item.get("key") or "") for item in metrics}
+        != set(FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS)
+        or len(charts) != len(FED_BALANCE_SHEET_REQUIRED_CHART_KEYS)
+        or any(not isinstance(item, dict) for item in charts)
+        or {str(item.get("key") or "") for item in charts}
+        != set(FED_BALANCE_SHEET_REQUIRED_CHART_KEYS)
+    ):
+        return False
+    metric_by_key = {str(item["key"]): item for item in metrics}
+    common_date = str(extra_data.get("common_effective_date") or "")
+    direct_metric_series = {
+        "walcl": "walcl",
+        "wshotsl": "wshotsl",
+        "wshomcb": "wshomcb",
+        "wrbwfrbl": "wrbwfrbl",
+    }
+    for key, series_key in direct_metric_series.items():
+        metric = metric_by_key[key]
+        metadata = metric.get("metadata") or {}
+        lineage = metadata.get("input_lineage")
+        previous_lineage = metadata.get("previous_input_lineage")
+        previous_date = str(metadata.get("previous_value_date") or "")[:10]
+        current_raw = (
+            _fed_balance_sheet_decimal_value(lineage[0].get("raw_value"))
+            if isinstance(lineage, list)
+            and len(lineage) == 1
+            and isinstance(lineage[0], dict)
+            else None
+        )
+        previous_raw = (
+            _fed_balance_sheet_decimal_value(
+                previous_lineage[0].get("raw_value")
+            )
+            if isinstance(previous_lineage, list)
+            and len(previous_lineage) == 1
+            and isinstance(previous_lineage[0], dict)
+            else None
+        )
+        metric_value = _fed_balance_sheet_decimal_value(metric.get("value"))
+        previous_metric_value = _fed_balance_sheet_decimal_value(
+            metadata.get("previous_value")
+        )
+        if (
+            metric.get("quality_status") != Observation.Quality.FRESH
+            or metric.get("fallback_source") is not None
+            or not isinstance(lineage, list)
+            or len(lineage) != 1
+            or not isinstance(lineage[0], dict)
+            or metric.get("source_key") != lineage[0].get("source_key")
+            or set(metric.get("source_keys") or [])
+            != {str(lineage[0].get("source_key") or "")}
+            or metric.get("batch_id") != lineage[0].get("batch_id")
+            or metric.get("license_scope") != lineage[0].get("license_scope")
+            or not metric.get("license_scope")
+            or str(metric.get("value_date") or "")[:10] != common_date
+            or current_raw is None
+            or not _fed_balance_sheet_safe_direct_lineage(
+                lineage[0], expected_series=series_key, expected_date=common_date
+            )
+            or not isinstance(previous_lineage, list)
+            or len(previous_lineage) != 1
+            or previous_raw is None
+            or metric_value is None
+            or previous_metric_value is None
+            or metric.get("display_value")
+            != f"{metric_value:,.6f} USD tn"
+            or not previous_date
+            or previous_date >= common_date
+            or not _fed_balance_sheet_safe_direct_lineage(
+                previous_lineage[0],
+                expected_series=series_key,
+                expected_date=previous_date,
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                metric.get("value"),
+                current_raw * Decimal("0.000001"),
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                metadata.get("previous_value"),
+                previous_raw * Decimal("0.000001"),
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                metric.get("change"),
+                metric_value - previous_metric_value,
+            )
+        ):
+            return False
+    net_metric = metric_by_key["net-liquidity"]
+    net_metadata = net_metric.get("metadata") or {}
+    net_value = _fed_balance_sheet_net_from_lineage(
+        net_metadata.get("input_lineage")
+    )
+    previous_net = _fed_balance_sheet_net_from_lineage(
+        net_metadata.get("previous_input_lineage")
+    )
+    net_lineage = list(net_metadata.get("input_lineage") or [])
+    previous_net_lineage = list(
+        net_metadata.get("previous_input_lineage") or []
+    )
+    previous_net_date = str(
+        net_metadata.get("previous_value_date") or ""
+    )[:10]
+    if (
+        net_metric.get("quality_status") != Observation.Quality.ESTIMATED
+        or net_metric.get("source_key") != "internal"
+        or set(net_metric.get("source_keys") or [])
+        != {
+            "federal-reserve",
+            "internal",
+            "ny-fed-markets",
+            "treasury-fiscal-data",
+        }
+        or net_metric.get("batch_id")
+        != ",".join(
+            sorted(
+                {
+                    str(item.get("batch_id") or "")
+                    for item in net_lineage
+                    if isinstance(item, dict)
+                }
+            )
+        )
+        or set(net_metadata.get("input_batch_ids") or [])
+        != {
+            str(item.get("batch_id") or "")
+            for item in net_lineage
+            if isinstance(item, dict)
+        }
+        or net_metric.get("fallback_source") is not None
+        or not net_metric.get("license_scope")
+        or net_metadata.get("formula") != FED_BALANCE_SHEET_NET_FORMULA
+        or str(net_metric.get("value_date") or "")[:10] != common_date
+        or net_value is None
+        or previous_net is None
+        or net_metric.get("display_value")
+        != f"{net_value:,.6f} USD tn"
+        or {
+            str(item.get("value_date") or "")[:10]
+            for item in net_lineage
+            if isinstance(item, dict)
+        }
+        != {common_date}
+        or not previous_net_date
+        or previous_net_date >= common_date
+        or {
+            str(item.get("value_date") or "")[:10]
+            for item in previous_net_lineage
+            if isinstance(item, dict)
+        }
+        != {previous_net_date}
+        or any(
+            not _fed_balance_sheet_safe_direct_lineage(
+                item,
+                expected_series=str(item.get("series_key") or "").lower(),
+                expected_date=common_date,
+            )
+            for item in net_lineage
+        )
+        or any(
+            not _fed_balance_sheet_safe_direct_lineage(
+                item,
+                expected_series=str(item.get("series_key") or "").lower(),
+                expected_date=previous_net_date,
+            )
+            for item in previous_net_lineage
+        )
+        or not _fed_balance_sheet_decimal_equal(net_metric.get("value"), net_value)
+        or not _fed_balance_sheet_decimal_equal(
+            net_metadata.get("previous_value"), previous_net
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            net_metric.get("change"), net_value - previous_net
+        )
+    ):
+        return False
+
+    chart_by_key = {str(item["key"]): item for item in charts}
+    balance_chart = chart_by_key["fed-balance-sheet-history"]
+    net_chart = chart_by_key["fed-balance-sheet-net-liquidity-history"]
+    balance_rows = list(balance_chart.get("data") or [])
+    net_rows = list(net_chart.get("data") or [])
+    balance_dates = [str(row.get("date") or "") for row in balance_rows]
+    net_dates = [str(row.get("date") or "") for row in net_rows]
+    try:
+        parsed_balance_dates = [
+            date.fromisoformat(period) for period in balance_dates
+        ]
+    except (TypeError, ValueError):
+        return False
+    if (
+        len(balance_dates) < FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS
+        or balance_dates != sorted(balance_dates)
+        or balance_dates != net_dates
+        or len(balance_dates) != len(set(balance_dates))
+        or not balance_dates
+        or balance_dates[-1] != common_date
+        or any(period.weekday() != 2 for period in parsed_balance_dates)
+        or any(
+            chart.get("lineage_mode") != "per-point"
+            or chart.get("fallback_sources")
+            or not chart.get("batch_ids")
+            or not chart.get("license_scopes")
+            for chart in charts
+        )
+    ):
+        return False
+    expected_balance_fields = {
+        "Total assets": "walcl",
+        "Treasuries": "wshotsl",
+        "MBS": "wshomcb",
+        "Reserve balances": "wrbwfrbl",
+    }
+    for row in balance_rows:
+        period = str(row["date"])
+        lineage = row.get("_lineage") or {}
+        if set(lineage) != set(expected_balance_fields):
+            return False
+        for field, series_key in expected_balance_fields.items():
+            if (
+                field not in row
+                or not _fed_balance_sheet_safe_direct_lineage(
+                    lineage[field], expected_series=series_key, expected_date=period
+                )
+                or not _fed_balance_sheet_decimal_equal(
+                    row[field],
+                    Decimal(str(lineage[field].get("raw_value")))
+                    * Decimal("0.000001"),
+                )
+            ):
+                return False
+    for row in net_rows:
+        period = str(row["date"])
+        lineage = (row.get("_lineage") or {}).get("Net liquidity")
+        if (
+            set(row.get("_lineage") or {}) != {"Net liquidity"}
+            or not _fed_balance_sheet_safe_net_lineage(
+                lineage,
+                expected_date=period,
+                expected_value=row.get("Net liquidity"),
+            )
+        ):
+            return False
+
+    matching_sections = [
+        item
+        for item in (sections or [])
+        if isinstance(item, dict)
+        and item.get("key") == FED_BALANCE_SHEET_REQUIRED_SECTION_KEY
+    ]
+    if len(matching_sections) != 1:
+        return False
+    section = matching_sections[0]
+    if [item.get("label") for item in section.get("columns", [])] != [
+        "Date",
+        "Total assets",
+        "Treasuries",
+        "MBS",
+        "Net liquidity",
+    ]:
+        return False
+    table_rows = list(section.get("rows") or [])
+    if (
+        len(table_rows) != 20
+        or [str(row.get("date") or "") for row in table_rows]
+        != balance_dates[-20:]
+    ):
+        return False
+    balance_by_date = {str(row["date"]): row for row in balance_rows}
+    net_by_date = {str(row["date"]): row for row in net_rows}
+    for row in table_rows:
+        period = str(row["date"])
+        lineage = row.get("_lineage") or {}
+        try:
+            expected_cells = [
+                {"key": "date", "cell": {"value": period}},
+                {
+                    "key": "total-assets",
+                    "cell": {"value": f"{row['Total assets']:,.6f}"},
+                },
+                {
+                    "key": "treasuries",
+                    "cell": {"value": f"{row['Treasuries']:,.6f}"},
+                },
+                {"key": "mbs", "cell": {"value": f"{row['MBS']:,.6f}"}},
+                {
+                    "key": "net-liquidity",
+                    "cell": {"value": f"{row['Net liquidity']:,.6f}"},
+                },
+            ]
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            row.get("cells_list") != expected_cells
+            or set(lineage)
+            != {"Total assets", "Treasuries", "MBS", "Net liquidity"}
+            or any(
+                not _fed_balance_sheet_decimal_equal(
+                    row[field], balance_by_date[period][field]
+                )
+                for field in ("Total assets", "Treasuries", "MBS")
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                row["Net liquidity"], net_by_date[period]["Net liquidity"]
+            )
+            or any(
+                not _fed_balance_sheet_safe_direct_lineage(
+                    lineage[field],
+                    expected_series=expected_balance_fields[field],
+                    expected_date=period,
+                )
+                for field in ("Total assets", "Treasuries", "MBS")
+            )
+            or not _fed_balance_sheet_safe_net_lineage(
+                lineage["Net liquidity"],
+                expected_date=period,
+                expected_value=row["Net liquidity"],
+            )
+        ):
+            return False
+    return True
+
+
+def _latest_fed_balance_sheet_snapshot() -> DashboardSnapshot | None:
+    return (
+        DashboardSnapshot.objects.filter(
+            key="fed-balance-sheet",
+            is_published=True,
+            data__contract_version=FED_BALANCE_SHEET_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+
+
+def _fed_balance_sheet_snapshot_effective_date(
+    snapshot: DashboardSnapshot,
+) -> date:
+    try:
+        return date.fromisoformat(
+            str((snapshot.data or {}).get("common_effective_date") or "")
+        )
+    except ValueError:
+        return snapshot.as_of.date()
+
+
+def _fed_balance_sheet_lineage_matches_observation(
+    lineage: Any,
+    observation: Observation,
+    *,
+    license_scope: str,
+) -> bool:
+    return bool(
+        _fed_balance_sheet_safe_direct_lineage(
+            lineage,
+            expected_series=observation.series.key,
+            expected_date=observation.value_date.date().isoformat(),
+        )
+        and lineage.get("source_key") == observation.source.key
+        and lineage.get("batch_id") == str(observation.batch_id)
+        and lineage.get("license_scope") == license_scope
+        and lineage.get("value_date") == observation.value_date.isoformat()
+        and lineage.get("as_of") == observation.as_of.isoformat()
+        and lineage.get("fetched_at") == observation.fetched_at.isoformat()
+        and _fed_balance_sheet_decimal_equal(
+            lineage.get("raw_value"), observation.value
+        )
+    )
+
+
+def _fed_balance_sheet_normalized_metrics_match(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    data = dict(snapshot.data or {})
+    normalized = {
+        item.key: item
+        for item in MetricSnapshot.objects.filter(
+            batch_id=snapshot.batch_id,
+            key__startswith="fed-balance-sheet-",
+        ).select_related("source", "fallback_source")
+    }
+    expected_normalized = {
+        f"fed-balance-sheet-{key}"
+        for key in FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS
+    }
+    if set(normalized) != expected_normalized:
+        return False
+    for metric in data.get("metrics", []):
+        stored = normalized.get(f"fed-balance-sheet-{metric['key']}")
+        metadata = metric.get("metadata") or {}
+        if (
+            stored is None
+            or stored.value is None
+            or not _fed_balance_sheet_decimal_equal(
+                stored.value, metric.get("value")
+            )
+            or stored.source.key != metric.get("source_key")
+            or stored.fallback_source_id is not None
+            or stored.value_date
+            != _parse_payload_datetime(metric.get("value_date"))
+            or stored.as_of != _parse_payload_datetime(metric.get("as_of"))
+            or stored.fetched_at
+            != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.quality_status != metric.get("quality_status")
+            or stored.license_scope
+            != str(metric.get("license_scope") or "")[:120]
+            or stored.metadata.get("component_batch_id")
+            != metric.get("batch_id")
+            or stored.metadata.get("formula") != metadata.get("formula")
+            or stored.metadata.get("input_lineage")
+            != metadata.get("input_lineage")
+            or stored.metadata.get("previous_input_lineage")
+            != metadata.get("previous_input_lineage")
+            or set(stored.metadata.get("input_batch_ids") or [])
+            != set(metadata.get("input_batch_ids") or [])
+        ):
+            return False
+    return True
+
+
+def _fed_balance_sheet_refresh_failure_is_valid(value: Any) -> bool:
+    """Validate the durable coordinator-failure audit payload."""
+
+    if not isinstance(value, dict):
+        return False
+    checked_at = value.get("checked_at")
+    reason = value.get("reason")
+    components = value.get("components")
+    return bool(
+        isinstance(checked_at, str)
+        and _parse_payload_datetime(checked_at) is not None
+        and isinstance(reason, str)
+        and reason.strip()
+        and isinstance(components, list)
+        and components
+        and all(
+            isinstance(component, dict)
+            and {"component", "status", "reason"} <= set(component)
+            and isinstance(component["component"], str)
+            and bool(component["component"].strip())
+            and isinstance(component["status"], str)
+            and bool(component["status"].strip())
+            and isinstance(component["reason"], str)
+            for component in components
+        )
+    )
+
+
+def _fed_balance_sheet_snapshot_contract_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    selected_runs: dict[str, IngestionRun],
+    allow_retained_stale: bool = False,
+    allow_natural_expiry: bool = False,
+) -> bool:
+    data = dict(snapshot.data or {})
+    expected_batches = {str(run.batch_id) for run in selected_runs.values()}
+    if allow_retained_stale:
+        valid_publication_state = bool(
+            snapshot.quality_status == Observation.Quality.STALE
+            and _fed_balance_sheet_refresh_failure_is_valid(
+                data.get("refresh_failure")
+            )
+        )
+    elif allow_natural_expiry:
+        valid_publication_state = bool(
+            snapshot.quality_status
+            in {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+            and "refresh_failure" not in data
+        )
+    else:
+        valid_publication_state = bool(
+            snapshot.quality_status == Observation.Quality.ESTIMATED
+            and "refresh_failure" not in data
+        )
+    if (
+        snapshot.key != "fed-balance-sheet"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or data.get("demo") is not False
+        or data.get("contract_version")
+        != FED_BALANCE_SHEET_CONTRACT_VERSION
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or str(data.get("fingerprint") or "")
+        != _dashboard_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or set(data.get("component_batches") or []) != expected_batches
+        or set(data.get("source_keys") or [])
+        != {
+            "federal-reserve",
+            "internal",
+            "ny-fed-markets",
+            "treasury-fiscal-data",
+        }
+        or not valid_publication_state
+        or not _fed_balance_sheet_page_contract_is_buildable(
+            list(data.get("metrics") or []),
+            list(data.get("charts") or []),
+            data,
+            sections=list(data.get("sections") or []),
+        )
+    ):
+        return False
+    references = data.get("component_runs")
+    if (
+        not isinstance(references, list)
+        or {str(item.get("component") or "") for item in references}
+        != set(FED_BALANCE_SHEET_DATASETS)
+        or {
+            str(item.get("batch_id") or "")
+            for item in references
+            if isinstance(item, dict)
+        }
+        != expected_batches
+    ):
+        return False
+    references_by_component = {
+        str(item.get("component") or ""): item
+        for item in references
+        if isinstance(item, dict)
+    }
+    for identity, run in selected_runs.items():
+        reference = references_by_component.get(identity) or {}
+        if (
+            reference.get("kind") != "ingestion_run"
+            or reference.get("status") != "valid"
+            or reference.get("source")
+            != FED_BALANCE_SHEET_DATASETS[identity][0]
+            or reference.get("dataset")
+            != FED_BALANCE_SHEET_DATASETS[identity][1]
+            or reference.get("ingestion_run_id") != run.pk
+            or reference.get("batch_id") != str(run.batch_id)
+            or reference.get("row_count") != run.row_count
+        ):
+            return False
+    onrrp_cycle = str(
+        (selected_runs["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    tga_cycle = str(
+        (selected_runs["tga"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    if (
+        not onrrp_cycle
+        or onrrp_cycle != tga_cycle
+        or data.get("refresh_cycle_id") != onrrp_cycle
+    ):
+        return False
+    context, _failures = _fed_balance_sheet_exact_inputs(
+        selected_runs, allow_expired=allow_natural_expiry
+    )
+    if context is None:
+        return False
+    maps: dict[str, dict[date, Observation]] = context["maps"]
+    common_dates: list[date] = context["common_dates"]
+    scopes: dict[str, str] = context["licence_scopes"]
+    if (
+        data.get("common_effective_date") != common_dates[-1].isoformat()
+        or data.get("common_row_count") != len(common_dates)
+    ):
+        return False
+    chart_by_key = {
+        str(item.get("key") or ""): item for item in data.get("charts", [])
+    }
+    balance_rows = chart_by_key["fed-balance-sheet-history"]["data"]
+    net_rows = chart_by_key[
+        "fed-balance-sheet-net-liquidity-history"
+    ]["data"]
+    if [row["date"] for row in balance_rows] != [
+        period.isoformat() for period in common_dates
+    ] or [row["date"] for row in net_rows] != [
+        period.isoformat() for period in common_dates
+    ]:
+        return False
+    direct_fields = {
+        "Total assets": "walcl",
+        "Treasuries": "wshotsl",
+        "MBS": "wshomcb",
+        "Reserve balances": "wrbwfrbl",
+    }
+
+    def input_lineage_matches(
+        items: Any, expected: dict[str, Observation]
+    ) -> bool:
+        if not isinstance(items, list):
+            return False
+        by_series = {
+            str(item.get("series_key") or "").lower(): item
+            for item in items
+            if isinstance(item, dict)
+        }
+        return set(by_series) == set(expected) and all(
+            _fed_balance_sheet_lineage_matches_observation(
+                by_series[series_key],
+                observation,
+                license_scope=scopes[observation.source.key],
+            )
+            for series_key, observation in expected.items()
+        )
+
+    metric_by_key = {
+        str(item.get("key") or ""): item for item in data.get("metrics", [])
+    }
+    if metric_by_key["net-liquidity"].get("license_scope") != scopes[
+        "internal"
+    ]:
+        return False
+    current_period = common_dates[-1]
+    previous_period = common_dates[-2]
+    for metric_key in ("walcl", "wshotsl", "wshomcb", "wrbwfrbl"):
+        metadata = metric_by_key[metric_key].get("metadata") or {}
+        if not input_lineage_matches(
+            metadata.get("input_lineage"),
+            {metric_key: maps[metric_key][current_period]},
+        ) or not input_lineage_matches(
+            metadata.get("previous_input_lineage"),
+            {metric_key: maps[metric_key][previous_period]},
+        ):
+            return False
+    net_metadata = metric_by_key["net-liquidity"].get("metadata") or {}
+    if not input_lineage_matches(
+        net_metadata.get("input_lineage"),
+        {
+            key: maps[key][current_period]
+            for key in ("walcl", "onrrp", "tga")
+        },
+    ) or not input_lineage_matches(
+        net_metadata.get("previous_input_lineage"),
+        {
+            key: maps[key][previous_period]
+            for key in ("walcl", "onrrp", "tga")
+        },
+    ):
+        return False
+
+    expected_chart_batches = {
+        "fed-balance-sheet-history": {str(selected_runs["h41"].batch_id)},
+        "fed-balance-sheet-net-liquidity-history": expected_batches,
+    }
+    expected_chart_sources = {
+        "fed-balance-sheet-history": {"federal-reserve"},
+        "fed-balance-sheet-net-liquidity-history": {
+            "federal-reserve",
+            "internal",
+            "ny-fed-markets",
+            "treasury-fiscal-data",
+        },
+    }
+    for chart_key, chart in chart_by_key.items():
+        if (
+            set(chart.get("batch_ids") or [])
+            != expected_chart_batches[chart_key]
+            or set(chart.get("source_keys") or [])
+            != expected_chart_sources[chart_key]
+            or chart.get("fallback_sources")
+        ):
+            return False
+    for period, balance_row, net_row in zip(
+        common_dates, balance_rows, net_rows, strict=True
+    ):
+        for field, series_key in direct_fields.items():
+            if not _fed_balance_sheet_lineage_matches_observation(
+                balance_row["_lineage"][field],
+                maps[series_key][period],
+                license_scope=scopes["federal-reserve"],
+            ):
+                return False
+        net_lineage = net_row["_lineage"]["Net liquidity"]
+        expected_inputs = {
+            key: maps[key][period] for key in ("walcl", "onrrp", "tga")
+        }
+        if not input_lineage_matches(
+            net_lineage.get("input_lineage"), expected_inputs
+        ):
+            return False
+    section = next(
+        item
+        for item in data.get("sections", [])
+        if item.get("key") == FED_BALANCE_SHEET_REQUIRED_SECTION_KEY
+    )
+    if (
+        set(section.get("source_keys") or [])
+        != {
+            "federal-reserve",
+            "internal",
+            "ny-fed-markets",
+            "treasury-fiscal-data",
+        }
+        or set(_payload_batch_ids(section)) != expected_batches
+        or section.get("fallback_source") is not None
+        or section.get("license_scope") != scopes["internal"]
+    ):
+        return False
+    for period, row in zip(common_dates[-20:], section["rows"], strict=True):
+        expected = {
+            "Total assets": maps["walcl"][period],
+            "Treasuries": maps["wshotsl"][period],
+            "MBS": maps["wshomcb"][period],
+        }
+        if any(
+            not _fed_balance_sheet_lineage_matches_observation(
+                row["_lineage"][field],
+                observation,
+                license_scope=scopes["federal-reserve"],
+            )
+            for field, observation in expected.items()
+        ) or not input_lineage_matches(
+            row["_lineage"]["Net liquidity"].get("input_lineage"),
+            {
+                key: maps[key][period]
+                for key in ("walcl", "onrrp", "tga")
+            },
+        ):
+            return False
+
+    return _fed_balance_sheet_normalized_metrics_match(snapshot)
+
+
+def _fed_balance_sheet_retained_stale_is_displayable(
+    snapshot: DashboardSnapshot,
+    *,
+    require_persisted_failure: bool = True,
+) -> bool:
+    """Revalidate a retained v1 snapshot from its immutable payload.
+
+    A newer successful ingestion can replace normalized Observation rows before
+    its page candidate later fails the publication contract.  In that case the
+    last complete page remains auditable through its component-run references,
+    embedded point lineage and normalized MetricSnapshot rows even though the
+    old raw-batch rows are no longer present in the current observation table.
+    Durable retention requires the coordinator's persisted stale/failure state;
+    a transient refresh window instead requires no fabricated failure.
+    """
+
+    data = dict(snapshot.data or {})
+    required_sources = {
+        "federal-reserve",
+        "internal",
+        "ny-fed-markets",
+        "treasury-fiscal-data",
+    }
+    public_keys, derived_keys = current_display_source_key_sets(required_sources)
+    if public_keys != required_sources or derived_keys != required_sources:
+        return False
+    scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return False
+        scopes[source_key] = licence.scope
+
+    if (
+        snapshot.key != "fed-balance-sheet"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or data.get("demo") is not False
+        or data.get("contract_version")
+        != FED_BALANCE_SHEET_CONTRACT_VERSION
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or (
+            require_persisted_failure
+            and (
+                snapshot.quality_status != Observation.Quality.STALE
+                or not _fed_balance_sheet_refresh_failure_is_valid(
+                    data.get("refresh_failure")
+                )
+            )
+        )
+        or (
+            not require_persisted_failure
+            and (
+                snapshot.quality_status != Observation.Quality.ESTIMATED
+                or "refresh_failure" in data
+            )
+        )
+        or set(data.get("source_keys") or []) != required_sources
+        or str(data.get("fingerprint") or "")
+        != _dashboard_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _fed_balance_sheet_page_contract_is_buildable(
+            list(data.get("metrics") or []),
+            list(data.get("charts") or []),
+            data,
+            sections=list(data.get("sections") or []),
+        )
+    ):
+        return False
+
+    references = data.get("component_runs")
+    if not isinstance(references, list) or len(references) != len(
+        FED_BALANCE_SHEET_DATASETS
+    ):
+        return False
+    references_by_component = {
+        str(item.get("component") or ""): item
+        for item in references
+        if isinstance(item, dict)
+    }
+    if set(references_by_component) != set(FED_BALANCE_SHEET_DATASETS):
+        return False
+    selected_runs: dict[str, IngestionRun] = {}
+    for identity, (source_key, dataset) in FED_BALANCE_SHEET_DATASETS.items():
+        reference = references_by_component[identity]
+        run_id = reference.get("ingestion_run_id")
+        run = (
+            IngestionRun.objects.select_related("source")
+            .filter(pk=run_id)
+            .first()
+            if run_id
+            else None
+        )
+        if (
+            run is None
+            or run.source.key != source_key
+            or run.dataset != dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or reference.get("kind") != "ingestion_run"
+            or reference.get("status") != "valid"
+            or reference.get("source") != source_key
+            or reference.get("dataset") != dataset
+            or reference.get("batch_id") != str(run.batch_id)
+            or reference.get("row_count") != run.row_count
+        ):
+            return False
+        selected_runs[identity] = run
+    expected_batches = {str(run.batch_id) for run in selected_runs.values()}
+    onrrp_cycle = str(
+        (selected_runs["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    tga_cycle = str(
+        (selected_runs["tga"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    if (
+        set(data.get("component_batches") or []) != expected_batches
+        or not onrrp_cycle
+        or onrrp_cycle != tga_cycle
+        or data.get("refresh_cycle_id") != onrrp_cycle
+    ):
+        return False
+
+    component_for_series = {
+        "walcl": "h41",
+        "wshotsl": "h41",
+        "wshomcb": "h41",
+        "wrbwfrbl": "h41",
+        "onrrp": "onrrp",
+        "tga": "tga",
+    }
+
+    def embedded_direct_is_valid(
+        lineage: Any, *, series_key: str, expected_date: str
+    ) -> bool:
+        identity = component_for_series[series_key]
+        run = selected_runs[identity]
+        return bool(
+            _fed_balance_sheet_safe_direct_lineage(
+                lineage,
+                expected_series=series_key,
+                expected_date=expected_date,
+            )
+            and lineage.get("source_key") == run.source.key
+            and lineage.get("batch_id") == str(run.batch_id)
+            and lineage.get("license_scope") == scopes[run.source.key]
+            and lineage.get("fallback_source") is None
+        )
+
+    def embedded_input_set_is_valid(
+        items: Any, *, series_keys: set[str], expected_date: str
+    ) -> bool:
+        if not isinstance(items, list):
+            return False
+        by_series = {
+            str(item.get("series_key") or "").lower(): item
+            for item in items
+            if isinstance(item, dict)
+        }
+        return set(by_series) == series_keys and all(
+            embedded_direct_is_valid(
+                by_series[series_key],
+                series_key=series_key,
+                expected_date=expected_date,
+            )
+            for series_key in series_keys
+        )
+
+    metric_by_key = {
+        str(item.get("key") or ""): item for item in data.get("metrics", [])
+    }
+    common_date = str(data.get("common_effective_date") or "")
+    if metric_by_key["net-liquidity"].get("license_scope") != scopes[
+        "internal"
+    ]:
+        return False
+    for series_key in ("walcl", "wshotsl", "wshomcb", "wrbwfrbl"):
+        metadata = metric_by_key[series_key].get("metadata") or {}
+        previous_date = str(metadata.get("previous_value_date") or "")[:10]
+        if not embedded_input_set_is_valid(
+            metadata.get("input_lineage"),
+            series_keys={series_key},
+            expected_date=common_date,
+        ) or not embedded_input_set_is_valid(
+            metadata.get("previous_input_lineage"),
+            series_keys={series_key},
+            expected_date=previous_date,
+        ):
+            return False
+    net_metadata = metric_by_key["net-liquidity"].get("metadata") or {}
+    previous_net_date = str(net_metadata.get("previous_value_date") or "")[:10]
+    if not embedded_input_set_is_valid(
+        net_metadata.get("input_lineage"),
+        series_keys={"walcl", "onrrp", "tga"},
+        expected_date=common_date,
+    ) or not embedded_input_set_is_valid(
+        net_metadata.get("previous_input_lineage"),
+        series_keys={"walcl", "onrrp", "tga"},
+        expected_date=previous_net_date,
+    ):
+        return False
+
+    chart_by_key = {
+        str(item.get("key") or ""): item for item in data.get("charts", [])
+    }
+    expected_chart_batches = {
+        "fed-balance-sheet-history": {str(selected_runs["h41"].batch_id)},
+        "fed-balance-sheet-net-liquidity-history": expected_batches,
+    }
+    expected_chart_sources = {
+        "fed-balance-sheet-history": {"federal-reserve"},
+        "fed-balance-sheet-net-liquidity-history": required_sources,
+    }
+    for chart_key, chart in chart_by_key.items():
+        if (
+            set(chart.get("batch_ids") or [])
+            != expected_chart_batches[chart_key]
+            or set(chart.get("source_keys") or [])
+            != expected_chart_sources[chart_key]
+            or chart.get("fallback_sources")
+        ):
+            return False
+    direct_fields = {
+        "Total assets": "walcl",
+        "Treasuries": "wshotsl",
+        "MBS": "wshomcb",
+        "Reserve balances": "wrbwfrbl",
+    }
+    for row in chart_by_key["fed-balance-sheet-history"].get("data", []):
+        period = str(row.get("date") or "")
+        if any(
+            not embedded_direct_is_valid(
+                (row.get("_lineage") or {}).get(field),
+                series_key=series_key,
+                expected_date=period,
+            )
+            for field, series_key in direct_fields.items()
+        ):
+            return False
+    for row in chart_by_key[
+        "fed-balance-sheet-net-liquidity-history"
+    ].get("data", []):
+        period = str(row.get("date") or "")
+        net_lineage = (row.get("_lineage") or {}).get("Net liquidity") or {}
+        if not embedded_input_set_is_valid(
+            net_lineage.get("input_lineage"),
+            series_keys={"walcl", "onrrp", "tga"},
+            expected_date=period,
+        ):
+            return False
+
+    section = next(
+        (
+            item
+            for item in data.get("sections", [])
+            if item.get("key") == FED_BALANCE_SHEET_REQUIRED_SECTION_KEY
+        ),
+        None,
+    )
+    if (
+        section is None
+        or set(section.get("source_keys") or []) != required_sources
+        or set(_payload_batch_ids(section)) != expected_batches
+        or section.get("fallback_source") is not None
+        or section.get("license_scope") != scopes["internal"]
+    ):
+        return False
+    for row in section.get("rows", []):
+        period = str(row.get("date") or "")
+        lineage = row.get("_lineage") or {}
+        if any(
+            not embedded_direct_is_valid(
+                lineage.get(field),
+                series_key=series_key,
+                expected_date=period,
+            )
+            for field, series_key in {
+                "Total assets": "walcl",
+                "Treasuries": "wshotsl",
+                "MBS": "wshomcb",
+            }.items()
+        ) or not embedded_input_set_is_valid(
+            (lineage.get("Net liquidity") or {}).get("input_lineage"),
+            series_keys={"walcl", "onrrp", "tga"},
+            expected_date=period,
+        ):
+            return False
+    return _fed_balance_sheet_normalized_metrics_match(snapshot)
+
+
+def _fed_balance_sheet_has_component_transition(
+    snapshot: DashboardSnapshot,
+    *,
+    latest_attempts: dict[str, IngestionRun | None] | None = None,
+) -> bool:
+    """Return whether a newer component attempt exists than the published page."""
+
+    references = (snapshot.data or {}).get("component_runs")
+    if not isinstance(references, list):
+        return False
+    referenced_run_ids = {
+        str(item.get("component") or ""): item.get("ingestion_run_id")
+        for item in references
+        if isinstance(item, dict)
+    }
+    if set(referenced_run_ids) != set(FED_BALANCE_SHEET_DATASETS):
+        return False
+    attempts = latest_attempts or {
+        identity: _latest_fed_balance_sheet_attempt(identity)
+        for identity in FED_BALANCE_SHEET_DATASETS
+    }
+    if set(attempts) != set(FED_BALANCE_SHEET_DATASETS) or any(
+        attempt is None for attempt in attempts.values()
+    ):
+        return False
+    return any(
+        attempt is not None
+        and attempt.pk != referenced_run_ids[identity]
+        for identity, attempt in attempts.items()
+    )
+
+
+def fed_balance_sheet_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    latest_attempts = {
+        identity: _latest_fed_balance_sheet_attempt(identity)
+        for identity in FED_BALANCE_SHEET_DATASETS
+    }
+    successful = {
+        identity: _latest_successful_fed_balance_sheet_run(identity)
+        for identity in FED_BALANCE_SHEET_DATASETS
+    }
+    if any(run is None for run in latest_attempts.values()) or any(
+        run is None for run in successful.values()
+    ):
+        return False
+    selected = {
+        identity: run
+        for identity, run in successful.items()
+        if run is not None
+    }
+    latest_success_is_current = all(
+        latest_attempts[identity].status == IngestionRun.Status.SUCCESS
+        and latest_attempts[identity].row_count > 0
+        and latest_attempts[identity].pk == selected[identity].pk
+        for identity in FED_BALANCE_SHEET_DATASETS
+    )
+    if latest_success_is_current:
+        deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+        naturally_expired = deadline is not None and deadline < timezone.now()
+        if _fed_balance_sheet_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_natural_expiry=naturally_expired,
+        ):
+            return True
+    # A completed coordinator failure is durable only with its explicit stale
+    # quality and refresh_failure audit record.
+    if _fed_balance_sheet_retained_stale_is_displayable(snapshot):
+        return True
+    # During a normal refresh window, a newer SUCCESS, RUNNING, PARTIAL or
+    # FAILED component can temporarily disagree with the last atomic page.
+    # Revalidate that page entirely from its embedded v1 contract, but do not
+    # fabricate a durable ingestion failure in a read-only selector.
+    return _fed_balance_sheet_has_component_transition(
+        snapshot,
+        latest_attempts=latest_attempts,
+    ) and _fed_balance_sheet_retained_stale_is_displayable(
+        snapshot,
+        require_persisted_failure=False,
+    )
+
+
+def select_public_fed_balance_sheet_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="fed-balance-sheet",
+                is_published=True,
+                data__contract_version=FED_BALANCE_SHEET_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if fed_balance_sheet_snapshot_is_publicly_displayable(candidate)
+        ),
+        None,
+    )
+    if selected is not None:
+        deadline = _parse_payload_datetime((selected.data or {}).get("fresh_until"))
+        if (
+            deadline is not None
+            and deadline < timezone.now()
+            or _fed_balance_sheet_has_component_transition(selected)
+        ):
+            # Natural clock expiry is not an ingestion failure. Keep the last
+            # complete contract visible during expiry or a component refresh
+            # window, but make its stale state explicit to the route without
+            # mutating the durable snapshot or fabricating refresh_failure.
+            selected.quality_status = Observation.Quality.STALE
+    return selected
+
+
+def _mark_fed_balance_sheet_stale(
+    components: list[dict[str, Any]], *, reason: str
+) -> None:
+    latest = (
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="fed-balance-sheet",
+            is_published=True,
+            data__contract_version=FED_BALANCE_SHEET_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return
+    summary = "；".join(
+        f"{item.get('component', 'unknown')}"
+        f"[{item.get('status', 'invalid')}] "
+        f"{item.get('reason', 'unknown failure')}"
+        for item in components
+    )
+    data = dict(latest.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason": f"{reason} 失败组件：{summary}" if summary else reason,
+        "components": components,
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+@transaction.atomic
+def _coordinate_fed_balance_sheet_dashboard(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    source_keys = {
+        "internal",
+        *(source_key for source_key, _ in FED_BALANCE_SHEET_DATASETS.values()),
+    }
+    for source_key in sorted(source_keys):
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in=source_keys)
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(source__key__in=source_keys, is_current=True)
+        .order_by("source__key")
+        .values_list("pk", flat=True)
+    )
+    selected, states, triggered = _select_fed_balance_sheet_runs(trigger_runs)
+    if not triggered:
+        return [], set()
+    if selected is None:
+        _mark_fed_balance_sheet_stale(
+            states,
+            reason=(
+                "最新 H.4.1、ON RRP 或 TGA attempt 未形成成功且"
+                "ON RRP/TGA 同刷新周期的三批组合；继续保留上一完整快照。"
+            ),
+        )
+        return [], {"fed-balance-sheet"}
+    list(
+        IngestionRun.objects.select_for_update()
+        .filter(pk__in=[run.pk for run in selected.values()])
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    previous = _latest_fed_balance_sheet_snapshot()
+    expected_batches = {str(run.batch_id) for run in selected.values()}
+    if (
+        previous is not None
+        and set((previous.data or {}).get("component_batches") or [])
+        == expected_batches
+        and not (previous.data or {}).get("refresh_failure")
+        and _fed_balance_sheet_snapshot_contract_is_valid(
+            previous, selected_runs=selected
+        )
+    ):
+        return [], set()
+    prepared, failures = _fed_balance_sheet_page_data(selected)
+    if prepared is None:
+        _mark_fed_balance_sheet_stale(
+            failures,
+            reason=(
+                "六序列未通过精确批次、共同周三、许可、"
+                "质量、无 fallback 或逐点血缘检查；继续保留上一完整快照。"
+            ),
+        )
+        return [], {"fed-balance-sheet"}
+    metrics, charts, sections, extra_data = prepared
+    candidate_date = date.fromisoformat(extra_data["common_effective_date"])
+    if (
+        previous is not None
+        and candidate_date < _fed_balance_sheet_snapshot_effective_date(previous)
+    ):
+        _mark_fed_balance_sheet_stale(
+            [
+                _fed_balance_sheet_failure(
+                    "common-wednesdays",
+                    "candidate common Wednesday is older than the published v1 snapshot",
+                    status=Observation.Quality.STALE,
+                )
+            ],
+            reason="候选共同周三发生回退；拒绝发布并保留上一版。",
+        )
+        return [], {"fed-balance-sheet"}
+    try:
+        with transaction.atomic():
+            publication_batch = uuid.uuid4()
+            published = _publish_dashboard(
+                key="fed-balance-sheet",
+                title="美联储资产负债表",
+                summary=(
+                    "WALCL、WSHOTSL、WSHOMCB 与 WRBWFRBL 来自同一最新"
+                    "成功 H.4.1 精确批次；ON RRP 与 TGA 来自同一非空"
+                    "刷新周期的各自最新成功批次。六序列只在共同非未来"
+                    "周三发布，不做前值填充。净流动性为 Atlas 代理，"
+                    "不是 Federal Reserve 官方指标或 LPI。"
+                ),
+                metrics=metrics,
+                charts=charts,
+                sections=sections,
+                extra_data=extra_data,
+                required_metric_keys=FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS,
+                batch_id=publication_batch,
+            )
+            latest = _latest_fed_balance_sheet_snapshot()
+            if (
+                latest is None
+                or not _fed_balance_sheet_runs_still_latest(selected)
+                or not _fed_balance_sheet_snapshot_contract_is_valid(
+                    latest, selected_runs=selected
+                )
+            ):
+                raise ValueError(
+                    "fed-balance-sheet publication postcondition failed"
+                )
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ):
+        _mark_fed_balance_sheet_stale(
+            [
+                _fed_balance_sheet_failure(
+                    "publication",
+                    "publication postcondition or latest-attempt concurrency check failed",
+                )
+            ],
+            reason=(
+                "fed-balance-sheet v1 发布后置条件未满足；新写入已回滚，"
+                "继续保留上一完整快照。"
+            ),
+        )
+        return [], {"fed-balance-sheet"}
+    return ([published] if published is not None else []), set()
+
+
+def _subsurface_run_identity(run: IngestionRun) -> str | None:
+    for identity, (source_key, dataset) in SUBSURFACE_DATASETS.items():
+        if run.source.key == source_key and run.dataset == dataset:
+            return identity
+    return None
+
+
+def _latest_subsurface_attempt(identity: str) -> IngestionRun | None:
+    source_key, dataset = SUBSURFACE_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(source__key=source_key, dataset=dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _latest_successful_subsurface_run(identity: str) -> IngestionRun | None:
+    source_key, dataset = SUBSURFACE_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(
+            source__key=source_key,
+            dataset=dataset,
+            status=IngestionRun.Status.SUCCESS,
+            row_count__gt=0,
+        )
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _subsurface_run_state(
+    identity: str,
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    source_key, dataset = SUBSURFACE_DATASETS[identity]
+    return {
+        "component": identity,
+        "kind": "ingestion_run",
+        "source": source_key,
+        "dataset": dataset,
+        "status": status or (run.status if run else "missing"),
+        "reason": (
+            reason
+            or (run.error if run and run.error else "component is not publishable")
+        )[:320],
+        "ingestion_run_id": run.pk if run else None,
+        "batch_id": str(run.batch_id) if run else None,
+        "row_count": run.row_count if run else 0,
+        "refresh_cycle_id": (
+            str((run.metadata or {}).get("refresh_cycle_id") or "")
+            if run
+            else ""
+        ),
+        "completed_at": (
+            run.completed_at.isoformat() if run and run.completed_at else None
+        ),
+    }
+
+
+def _subsurface_failure(
+    component: str,
+    reason: str,
+    *,
+    status: str = "invalid",
+    run: IngestionRun | None = None,
+) -> dict[str, Any]:
+    if component in SUBSURFACE_DATASETS:
+        return _subsurface_run_state(
+            component, run, status=status, reason=reason
+        )
+    return {
+        "component": component,
+        "kind": "contract",
+        "status": status,
+        "reason": reason[:320],
+    }
+
+
+def _select_subsurface_runs(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
+    relevant: dict[str, list[IngestionRun]] = {
+        identity: [] for identity in SUBSURFACE_DATASETS
+    }
+    for run in trigger_runs:
+        identity = _subsurface_run_identity(run)
+        if identity:
+            relevant[identity].append(run)
+    if not any(relevant.values()):
+        return None, [], False
+    for identity, identity_runs in relevant.items():
+        if not identity_runs:
+            continue
+        latest = _latest_subsurface_attempt(identity)
+        if (
+            latest is None
+            or len(identity_runs) != 1
+            or identity_runs[0].pk != latest.pk
+        ):
+            return None, [], False
+    optional = {
+        identity: _latest_subsurface_attempt(identity)
+        for identity in SUBSURFACE_DATASETS
+    }
+    states = [
+        _subsurface_run_state(identity, optional[identity])
+        for identity in SUBSURFACE_DATASETS
+    ]
+    if any(
+        run is None
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in optional.values()
+    ):
+        return None, states, True
+    selected = {
+        identity: run for identity, run in optional.items() if run is not None
+    }
+    cycles = {
+        str((selected[identity].metadata or {}).get("refresh_cycle_id") or "")
+        for identity in ("sofr", "srf", "swaps")
+    }
+    if len(cycles) != 1 or not next(iter(cycles), ""):
+        return (
+            None,
+            [
+                (
+                    _subsurface_run_state(
+                        identity,
+                        run,
+                        status="invalid-cycle",
+                        reason="SOFR, SRF and swaps require one non-empty refresh cycle",
+                    )
+                    if identity in {"sofr", "srf", "swaps"}
+                    else _subsurface_run_state(identity, run)
+                )
+                for identity, run in selected.items()
+            ],
+            True,
+        )
+    return selected, states, True
+
+
+def _subsurface_runs_still_latest(selected: dict[str, IngestionRun]) -> bool:
+    return all(
+        (latest := _latest_subsurface_attempt(identity)) is not None
+        and latest.pk == run.pk
+        for identity, run in selected.items()
+    )
+
+
+def _subsurface_artifact_is_valid(
+    identity: str, run: IngestionRun
+) -> bool:
+    artifacts = list(RawArtifact.objects.filter(run=run))
+    if len(artifacts) != 1:
+        return False
+    artifact = artifacts[0]
+    metadata = dict(run.metadata or {})
+    if identity in {"sofr", "srf", "swaps"}:
+        digest = str(metadata.get("sha256") or "").lower()
+        try:
+            size = int(metadata.get("byte_length") or 0)
+        except (TypeError, ValueError):
+            return False
+        content_type = str(
+            metadata.get("content_type") or "application/octet-stream"
+        )
+        expected_uri = (
+            f"private://ny-fed-markets/{digest[:2]}/{digest}.bin"
+        )
+    else:
+        declarations = metadata.get("artifacts")
+        if isinstance(declarations, list) and len(declarations) == 1:
+            declaration = declarations[0]
+            if not isinstance(declaration, dict):
+                return False
+            digest = str(declaration.get("sha256") or "").lower()
+            try:
+                size = int(
+                    declaration.get("size")
+                    or declaration.get("size_bytes")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                return False
+            source_url = str(
+                declaration.get("url")
+                or declaration.get("uri")
+                or metadata.get("source_url")
+                or ""
+            )
+            content_type = str(
+                declaration.get("content_type") or "application/zip"
+            )
+        else:
+            digest = str(metadata.get("archive_sha256") or "").lower()
+            try:
+                size = int(metadata.get("archive_size") or 0)
+            except (TypeError, ValueError):
+                return False
+            source_url = str(metadata.get("source_url") or "")
+            content_type = "application/zip"
+        expected_uri = f"{source_url}#sha256={digest}"
+    return bool(
+        len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and size > 0
+        and artifact.sha256.lower() == digest
+        and artifact.size_bytes == size
+        and artifact.content_type == content_type
+        and artifact.uri == expected_uri
+    )
+
+
+def _subsurface_direct_lineage(
+    observation: Observation,
+    *,
+    license_scope: str,
+    raw_value: Any | None = None,
+    upstream_field: str | None = None,
+) -> dict[str, Any]:
+    lineage = {
+        "series_key": observation.series.key,
+        "value": float(observation.value if raw_value is None else raw_value),
+        "raw_value": str(observation.value if raw_value is None else raw_value),
+        "unit": observation.series.unit,
+        "source_key": observation.source.key,
+        "source_name": observation.source.name,
+        "source_keys": [observation.source.key],
+        "license_scope": license_scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": _fresh_until(observation).isoformat(),
+        "batch_id": str(observation.batch_id),
+        "quality_status": observation.quality_status,
+        "fallback_source": None,
+    }
+    if upstream_field:
+        lineage["upstream_field"] = upstream_field
+    return lineage
+
+
+def _subsurface_population_z(values: list[Decimal]) -> Decimal | None:
+    if len(values) != SUBSURFACE_MINIMUM_Z60_ROWS:
+        return None
+    mean = sum(values, Decimal("0")) / Decimal(len(values))
+    variance = sum((value - mean) ** 2 for value in values) / Decimal(
+        len(values)
+    )
+    if variance <= 0:
+        return None
+    return (values[-1] - mean) / variance.sqrt()
+
+
+def _subsurface_operation_is_small_value(operation: dict[str, Any]) -> bool:
+    explicit = str(operation.get("isSmallValue") or "").strip().upper()
+    note = (
+        str(operation.get("note") or "")
+        .lower()
+        .replace("-", " ")
+        .replace("_", " ")
+    )
+    return explicit in {"1", "TRUE", "Y", "YES"} or (
+        "small value" in note and ("exercise" in note or "test" in note)
+    )
+
+
+def _subsurface_swap_operations_total(
+    operations: Any,
+    *,
+    as_of: date,
+    expected_small_value: bool | None,
+    settlement_date: date | None = None,
+) -> tuple[Decimal, list[str]] | None:
+    if not isinstance(operations, list):
+        return None
+    total = Decimal("0")
+    canonical_operations: list[str] = []
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return None
+        try:
+            settlement = date.fromisoformat(str(operation.get("settlementDate")))
+            maturity = date.fromisoformat(str(operation.get("maturityDate")))
+            amount = Decimal(str(operation.get("amount"))) / Decimal("1000000")
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if (
+            not amount.is_finite()
+            or amount < 0
+            or not settlement <= as_of < maturity
+            or (settlement_date is not None and settlement != settlement_date)
+            or (
+                expected_small_value is not None
+                and _subsurface_operation_is_small_value(operation)
+                != expected_small_value
+            )
+        ):
+            return None
+        total += amount
+        canonical_operations.append(
+            json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
+        )
+    return total, sorted(canonical_operations)
+
+
+def _subsurface_swap_observation_total(
+    observation: Observation,
+    *,
+    expected_small_value: bool | None,
+) -> tuple[Decimal, list[str]] | None:
+    metadata = observation.metadata or {}
+    try:
+        as_of = date.fromisoformat(str(metadata.get("as_of")))
+    except (TypeError, ValueError):
+        return None
+    if as_of != observation.value_date.date():
+        return None
+    return _subsurface_swap_operations_total(
+        metadata.get("active_operations"),
+        as_of=as_of,
+        expected_small_value=expected_small_value,
+    )
+
+
+def _subsurface_srf_operation_summary(
+    operations: Any,
+    *,
+    period: date,
+    expected_small_value: bool,
+) -> tuple[Decimal, dict[str, Decimal], set[Decimal]] | None:
+    if not isinstance(operations, list):
+        return None
+    collateral = {
+        "Treasury": Decimal("0"),
+        "Agency": Decimal("0"),
+        "Mortgage-Backed": Decimal("0"),
+    }
+    total = Decimal("0")
+    rates: set[Decimal] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return None
+        try:
+            operation_date = date.fromisoformat(
+                str(operation.get("operationDate"))
+            )
+            accepted = Decimal(
+                str(operation.get("totalAmtAccepted") or "0")
+            ) / Decimal("1000000")
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if (
+            operation_date != period
+            or not accepted.is_finite()
+            or accepted < 0
+            or _subsurface_operation_is_small_value(operation)
+            != expected_small_value
+        ):
+            return None
+        details = operation.get("details")
+        if not isinstance(details, list):
+            return None
+        total += accepted
+        for detail in details:
+            if not isinstance(detail, dict):
+                return None
+            security_type = str(detail.get("securityType") or "")
+            if security_type in collateral:
+                try:
+                    detail_amount = Decimal(
+                        str(detail.get("amtAccepted") or "0")
+                    ) / Decimal("1000000")
+                except (ArithmeticError, TypeError, ValueError):
+                    return None
+                if not detail_amount.is_finite() or detail_amount < 0:
+                    return None
+                collateral[security_type] += detail_amount
+            raw_rate = detail.get(
+                "percentOfferingRate", detail.get("minimumBidRate")
+            )
+            if raw_rate is not None:
+                try:
+                    rate = Decimal(str(raw_rate))
+                except (ArithmeticError, TypeError, ValueError):
+                    return None
+                if not rate.is_finite() or rate < 0:
+                    return None
+                rates.add(rate)
+    return total, collateral, rates
+
+
+def _subsurface_exact_inputs(
+    selected: dict[str, IngestionRun],
+    *,
+    now: datetime | None = None,
+    allow_expired: bool = False,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    now = now or timezone.now()
+    today_et = now.astimezone(ZoneInfo("America/New_York")).date()
+    required_sources = {"ny-fed-markets", "federal-reserve", "internal"}
+    public_keys, derived_keys = current_display_source_key_sets(required_sources)
+    if public_keys != required_sources or derived_keys != required_sources:
+        return None, [
+            _subsurface_failure(
+                "licence",
+                "all direct and derived inputs require current display licences",
+                status="unlicensed",
+            )
+        ]
+    scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(
+                source, require_public=True, require_derived=True
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return None, [
+                _subsurface_failure(
+                    "licence",
+                    f"{source_key} lacks a current display licence",
+                    status="unlicensed",
+                )
+            ]
+        scopes[source_key] = licence.scope
+    maps: dict[str, dict[date, Observation]] = {}
+    for identity, run in selected.items():
+        source_key, dataset = SUBSURFACE_DATASETS[identity]
+        if (
+            run.source.key != source_key
+            or run.dataset != dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or not _subsurface_artifact_is_valid(identity, run)
+        ):
+            return None, [
+                _subsurface_failure(
+                    identity,
+                    "selected run or immutable artifact failed the exact contract",
+                    run=run,
+                )
+            ]
+        fetched_at = _parse_payload_datetime((run.metadata or {}).get("fetched_at"))
+        if fetched_at is None or fetched_at > now + timedelta(minutes=5):
+            return None, [
+                _subsurface_failure(identity, "run fetched_at is missing or future", run=run)
+            ]
+        if (
+            Observation.objects.filter(source=run.source, batch_id=run.batch_id).count()
+            != run.row_count
+            or Observation.objects.filter(batch_id=run.batch_id).count()
+            != run.row_count
+        ):
+            return None, [
+                _subsurface_failure(
+                    identity,
+                    "run row_count does not match one complete source batch",
+                    status="batch-pollution",
+                    run=run,
+                )
+            ]
+        for series_key in SUBSURFACE_REQUIRED_SERIES[identity]:
+            rows = list(
+                Observation.objects.filter(
+                    source=run.source,
+                    batch_id=run.batch_id,
+                    series__key=series_key,
+                )
+                .select_related("series", "source", "fallback_source")
+                .order_by("value_date", "id")
+            )
+            if not rows:
+                return None, [
+                    _subsurface_failure(
+                        identity,
+                        f"required series {series_key} is missing",
+                        status="missing",
+                        run=run,
+                    )
+                ]
+            by_date: dict[date, Observation] = {}
+            for observation in rows:
+                period = observation.value_date.date()
+                if (
+                    period in by_date
+                    or (identity != "iorb" and period > today_et)
+                    or observation.source_id != run.source_id
+                    or observation.series.source_id != run.source_id
+                    or observation.batch_id != run.batch_id
+                    or observation.fallback_source_id is not None
+                    or observation.quality_status != Observation.Quality.FRESH
+                    or observation.fetched_at != fetched_at
+                    or observation.as_of > now + timedelta(minutes=5)
+                    or not observation.value.is_finite()
+                    or observation.value < 0
+                ):
+                    return None, [
+                        _subsurface_failure(
+                            identity,
+                            f"{series_key} has duplicate, future, fallback or invalid lineage",
+                            status="invalid-lineage",
+                            run=run,
+                        )
+                    ]
+                by_date[period] = observation
+            maps[series_key] = by_date
+    cycles = {
+        str((selected[identity].metadata or {}).get("refresh_cycle_id") or "")
+        for identity in ("sofr", "srf", "swaps")
+    }
+    if len(cycles) != 1 or not next(iter(cycles), ""):
+        return None, [
+            _subsurface_failure(
+                "refresh-cycle", "SOFR, SRF and swaps require one main cycle"
+            )
+        ]
+    sofr_dates = sorted(period for period in maps["sofr"] if period <= today_et)
+    if not sofr_dates:
+        return None, [_subsurface_failure("sofr", "SOFR has no non-future day")]
+    current_date = sofr_dates[-1]
+    if current_date not in maps["iorb"]:
+        return None, [
+            _subsurface_failure(
+                "common-date",
+                "latest SOFR day lacks exact same-day IORB; older days are not promoted",
+            )
+        ]
+    for period in sofr_dates:
+        observation = maps["sofr"][period]
+        try:
+            percentile = Decimal(str(observation.metadata["percentPercentile99"]))
+            volume = Decimal(str(observation.metadata["volumeInBillions"]))
+        except (ArithmeticError, KeyError, TypeError, ValueError):
+            return None, [
+                _subsurface_failure(
+                    "sofr", "SOFR exact batch lacks valid 99P or volume metadata"
+                )
+            ]
+        if not percentile.is_finite() or not volume.is_finite() or volume < 0:
+            return None, [
+                _subsurface_failure("sofr", "SOFR 99P or volume metadata is invalid")
+            ]
+    if len(sofr_dates) < SUBSURFACE_MINIMUM_Z60_ROWS:
+        return None, [
+            _subsurface_failure("z60", "SOFR exact batch has fewer than 60 observations")
+        ]
+    current_z = _subsurface_population_z(
+        [
+            Decimal(str(maps["sofr"][period].metadata["volumeInBillions"]))
+            for period in sofr_dates[-60:]
+        ]
+    )
+    if current_z is None:
+        return None, [
+            _subsurface_failure("z60", "SOFR volume Z60 has zero or invalid population std")
+        ]
+    srf_sets = [set(maps[key]) for key in SUBSURFACE_REQUIRED_SERIES["srf"]]
+    if not srf_sets or any(periods != srf_sets[0] for periods in srf_sets[1:]):
+        return None, [
+            _subsurface_failure("srf", "SRF required series have mixed date sets")
+        ]
+    window_start = current_date - timedelta(days=29)
+    srf_dates = sorted(
+        period
+        for period in srf_sets[0]
+        if window_start <= period <= current_date and period in maps["sofr"]
+    )
+    if not srf_dates or current_date not in srf_dates:
+        return None, [
+            _subsurface_failure(
+                "srf", "SRF 30D window lacks the current SOFR business date"
+            )
+        ]
+    collateral_series = {
+        "Treasury": "srp-non-small-value-treasury",
+        "Agency": "srp-non-small-value-agency",
+        "Mortgage-Backed": "srp-non-small-value-mbs",
+    }
+    for period in srf_dates:
+        regular = maps["srp-non-small-value-total"][period]
+        small = maps["srp-small-value-total"][period]
+        regular_metadata = regular.metadata or {}
+        small_metadata = small.metadata or {}
+        regular_operations = regular_metadata.get("operations")
+        small_operations = small_metadata.get("operations")
+        regular_summary = _subsurface_srf_operation_summary(
+            regular_operations,
+            period=period,
+            expected_small_value=False,
+        )
+        small_summary = _subsurface_srf_operation_summary(
+            small_operations,
+            period=period,
+            expected_small_value=True,
+        )
+        if (
+            regular_summary is None
+            or small_summary is None
+            or regular_metadata.get("small_value_excluded") is not True
+            or regular_metadata.get("classification") != "non-small-value"
+            or small_metadata.get("small_value_only") is not True
+            or small_metadata.get("classification")
+            != "small-value-technical-exercise"
+        ):
+            return None, [
+                _subsurface_failure(
+                    "srf", "SRF regular/small-value operation classification failed"
+                )
+            ]
+        regular_total, collateral_totals, regular_rates = regular_summary
+        small_total, _small_collateral, _small_rates = small_summary
+        collateral_observations = {
+            security_type: maps[series_key][period]
+            for security_type, series_key in collateral_series.items()
+        }
+        rate_observation = maps["srp-non-small-value-rate"][period]
+        rate_metadata = rate_observation.metadata or {}
+        reported_rates = rate_metadata.get("reported_rates")
+        try:
+            parsed_reported_rates = (
+                {Decimal(str(item)) for item in reported_rates}
+                if isinstance(reported_rates, list)
+                else set()
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            parsed_reported_rates = set()
+        if (
+            not _fed_balance_sheet_decimal_equal(regular_total, regular.value)
+            or not _fed_balance_sheet_decimal_equal(small_total, small.value)
+            or any(
+                not _fed_balance_sheet_decimal_equal(
+                    collateral_observations[security_type].value,
+                    collateral_totals[security_type],
+                )
+                for security_type in collateral_series
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                sum(
+                    (
+                        observation.value
+                        for observation in collateral_observations.values()
+                    ),
+                    Decimal("0"),
+                ),
+                regular.value,
+            )
+            or len(regular_rates) != 1
+            or not isinstance(reported_rates, list)
+            or len(reported_rates) != 1
+            or parsed_reported_rates != regular_rates
+            or not _fed_balance_sheet_decimal_equal(
+                rate_observation.value, next(iter(regular_rates), Decimal("-1"))
+            )
+            or rate_metadata.get("operations") != regular_operations
+            or rate_metadata.get("small_value_excluded") is not True
+            or any(
+                (observation.metadata or {}).get("operations")
+                != regular_operations
+                or (observation.metadata or {}).get("small_value_excluded")
+                is not True
+                for observation in collateral_observations.values()
+            )
+        ):
+            return None, [
+                _subsurface_failure(
+                    "srf",
+                    "SRF totals, collateral split or single reported rate failed",
+                )
+            ]
+    drawdown_dates = set(maps["fxswap-usd-drawdown-non-small-value"])
+    if drawdown_dates != set(maps["fxswap-usd-drawdown-small-value"]):
+        return None, [
+            _subsurface_failure("swaps", "swap drawdown series have mixed date sets")
+        ]
+    for period in drawdown_dates:
+        regular_drawdown = maps[
+            "fxswap-usd-drawdown-non-small-value"
+        ][period]
+        small_drawdown = maps["fxswap-usd-drawdown-small-value"][period]
+        regular_result = _subsurface_swap_operations_total(
+            (regular_drawdown.metadata or {}).get("operations"),
+            as_of=period,
+            expected_small_value=False,
+            settlement_date=period,
+        )
+        small_result = _subsurface_swap_operations_total(
+            (small_drawdown.metadata or {}).get("operations"),
+            as_of=period,
+            expected_small_value=True,
+            settlement_date=period,
+        )
+        if (
+            regular_result is None
+            or small_result is None
+            or (regular_drawdown.metadata or {}).get("small_value_excluded")
+            is not True
+            or (regular_drawdown.metadata or {}).get("classification")
+            != "non-small-value"
+            or (small_drawdown.metadata or {}).get("small_value_only") is not True
+            or (small_drawdown.metadata or {}).get("classification")
+            != "small-value-technical-exercise"
+            or not _fed_balance_sheet_decimal_equal(
+                regular_result[0], regular_drawdown.value
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                small_result[0], small_drawdown.value
+            )
+        ):
+            return None, [
+                _subsurface_failure(
+                    "swaps", "swap drawdown operation classification failed"
+                )
+            ]
+    outstanding_keys = (
+        "fxswap-usd-outstanding",
+        "fxswap-usd-outstanding-small-value",
+        "fxswap-usd-outstanding-non-small-value",
+    )
+    outstanding_sets = [set(maps[key]) for key in outstanding_keys]
+    if any(periods != outstanding_sets[0] for periods in outstanding_sets[1:]):
+        return None, [
+            _subsurface_failure("swaps", "swap outstanding series have mixed date sets")
+        ]
+    for period in outstanding_sets[0]:
+        total_observation = maps["fxswap-usd-outstanding"][period]
+        small_observation = maps[
+            "fxswap-usd-outstanding-small-value"
+        ][period]
+        non_small_observation = maps[
+            "fxswap-usd-outstanding-non-small-value"
+        ][period]
+        total_result = _subsurface_swap_observation_total(
+            total_observation, expected_small_value=None
+        )
+        small_result = _subsurface_swap_observation_total(
+            small_observation, expected_small_value=True
+        )
+        non_small_result = _subsurface_swap_observation_total(
+            non_small_observation, expected_small_value=False
+        )
+        if (
+            total_result is None
+            or small_result is None
+            or non_small_result is None
+            or (small_observation.metadata or {}).get("small_value_only") is not True
+            or (non_small_observation.metadata or {}).get("small_value_excluded")
+            is not True
+            or total_result[1] != sorted(small_result[1] + non_small_result[1])
+            or not _fed_balance_sheet_decimal_equal(
+                total_result[0], total_observation.value
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                small_result[0], small_observation.value
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                non_small_result[0], non_small_observation.value
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                total_observation.value - small_observation.value,
+                non_small_observation.value,
+            )
+        ):
+            return None, [
+                _subsurface_failure(
+                    "swaps",
+                    "swap total, small-value and non-small-value outstanding failed",
+                )
+            ]
+    swap_as_of = max(outstanding_sets[0])
+    swap_total = maps["fxswap-usd-outstanding"][swap_as_of]
+    swap_small = maps["fxswap-usd-outstanding-small-value"][swap_as_of]
+    swap_outstanding = maps[
+        "fxswap-usd-outstanding-non-small-value"
+    ][swap_as_of]
+    deadlines = [
+        _fresh_until(maps["sofr"][current_date]),
+        _fresh_until(maps["iorb"][current_date]),
+        _fresh_until(maps["srp-non-small-value-total"][current_date]),
+        _fresh_until(swap_total),
+        _fresh_until(swap_small),
+        _fresh_until(swap_outstanding),
+    ]
+    if not allow_expired and min(deadlines) < now:
+        return None, [
+            _subsurface_failure("freshness", "one required component is expired", status="stale")
+        ]
+    return {
+        "maps": maps,
+        "scopes": scopes,
+        "sofr_dates": sofr_dates,
+        "common_dates": [period for period in sofr_dates if period in maps["iorb"]],
+        "current_date": current_date,
+        "current_z": current_z,
+        "srf_dates": srf_dates,
+        "window_start": window_start,
+        "swap_as_of": swap_as_of,
+        "swap_total": swap_total,
+        "swap_small": swap_small,
+        "swap_outstanding": swap_outstanding,
+        "fresh_until": min(deadlines),
+        "refresh_cycle_id": next(iter(cycles)),
+    }, []
+
+
+def _subsurface_page_data(
+    selected: dict[str, IngestionRun],
+    *,
+    allow_expired: bool = False,
+) -> tuple[
+    tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]
+    | None,
+    list[dict[str, Any]],
+]:
+    context, failures = _subsurface_exact_inputs(
+        selected, allow_expired=allow_expired
+    )
+    if context is None:
+        return None, failures
+    maps: dict[str, dict[date, Observation]] = context["maps"]
+    scopes: dict[str, str] = context["scopes"]
+    current_date: date = context["current_date"]
+    sofr_dates: list[date] = context["sofr_dates"]
+    common_dates: list[date] = context["common_dates"]
+    srf_dates: list[date] = context["srf_dates"]
+    swap_as_of: date = context["swap_as_of"]
+    current_sofr = maps["sofr"][current_date]
+    current_iorb = maps["iorb"][current_date]
+    current_srf = maps["srp-non-small-value-total"][current_date]
+    current_srf_rate = maps["srp-non-small-value-rate"][current_date]
+    current_swap_total = context["swap_total"]
+    current_swap_small = context["swap_small"]
+    current_swap = context["swap_outstanding"]
+    p99 = Decimal(str(current_sofr.metadata["percentPercentile99"]))
+    volume = Decimal(str(current_sofr.metadata["volumeInBillions"]))
+    z60: Decimal = context["current_z"]
+    p99_sofr = (p99 - current_sofr.value) * Decimal("100")
+    p99_iorb = (p99 - current_iorb.value) * Decimal("100")
+    active_days = sum(
+        1
+        for period in srf_dates
+        if maps["srp-non-small-value-total"][period].value > 0
+    )
+    def direct(
+        observation: Observation,
+        *,
+        raw_value: Any | None = None,
+        upstream_field: str | None = None,
+    ) -> dict[str, Any]:
+        return _subsurface_direct_lineage(
+            observation,
+            license_scope=scopes[observation.source.key],
+            raw_value=raw_value,
+            upstream_field=upstream_field,
+        )
+
+    def metric(
+        *,
+        key: str,
+        label: str,
+        value: Decimal,
+        display_value: str,
+        unit: str,
+        observation: Observation,
+        lineage: list[dict[str, Any]],
+        derived: bool = False,
+        formula: str | None = None,
+        sample_count: int | None = None,
+    ) -> dict[str, Any]:
+        source_key = "internal" if derived else observation.source.key
+        source_keys = sorted(
+            {item["source_key"] for item in lineage}
+            | ({"internal"} if derived else set())
+        )
+        batches = sorted({str(item["batch_id"]) for item in lineage})
+        metadata: dict[str, Any] = {
+            "input_series": sorted({str(item["series_key"]) for item in lineage}),
+            "input_batch_ids": batches,
+            "input_value_dates": sorted(
+                {str(item["value_date"]) for item in lineage}
+            ),
+            "input_lineage": lineage,
+        }
+        if formula:
+            metadata["formula"] = formula
+            metadata["calculation_owner"] = "Atlas Macro"
+        if sample_count is not None:
+            metadata["sample_count"] = sample_count
+            metadata["sample_window"] = "official observation days"
+        fresh_until = min(
+            str(item["fresh_until"]) for item in lineage
+        )
+        return {
+            "key": key,
+            "label": label,
+            "value": float(value),
+            "display_value": display_value,
+            "change": None,
+            "unit": unit,
+            "quality_status": (
+                Observation.Quality.ESTIMATED
+                if derived
+                else Observation.Quality.FRESH
+            ),
+            "source": (
+                "Atlas Macro transparent calculation"
+                if derived
+                else observation.source.name
+            ),
+            "source_key": source_key,
+            "source_keys": source_keys,
+            "license_scope": scopes[source_key],
+            "fallback_source": None,
+            "as_of": max(str(item["as_of"]) for item in lineage),
+            "value_date": observation.value_date.isoformat(),
+            "fetched_at": max(str(item["fetched_at"]) for item in lineage),
+            "fresh_until": fresh_until,
+            "batch_id": ",".join(batches),
+            "metadata": metadata,
+        }
+
+    sofr_lineage = direct(current_sofr)
+    p99_lineage = direct(
+        current_sofr,
+        raw_value=p99,
+        upstream_field="percentPercentile99",
+    )
+    volume_lineage = direct(
+        current_sofr,
+        raw_value=volume,
+        upstream_field="volumeInBillions",
+    )
+    iorb_lineage = direct(current_iorb)
+    z_lineage = [
+        direct(
+            maps["sofr"][period],
+            raw_value=maps["sofr"][period].metadata["volumeInBillions"],
+            upstream_field="volumeInBillions",
+        )
+        for period in sofr_dates[-60:]
+    ]
+    srf_lineage = direct(current_srf)
+    srf_rate_lineage = direct(current_srf_rate)
+    active_lineage = [
+        direct(maps["srp-non-small-value-total"][period])
+        for period in srf_dates
+    ]
+    swap_total_lineage = direct(current_swap_total)
+    swap_small_lineage = direct(current_swap_small)
+    swap_lineage = direct(current_swap)
+    swap_value = current_swap_total.value - current_swap_small.value
+    metrics = [
+        metric(
+            key="sofr",
+            label="SOFR",
+            value=current_sofr.value,
+            display_value=f"{current_sofr.value:,.2f}%",
+            unit="%",
+            observation=current_sofr,
+            lineage=[sofr_lineage],
+        ),
+        metric(
+            key="sofr-p99",
+            label="SOFR 99P",
+            value=p99,
+            display_value=f"{p99:,.2f}%",
+            unit="%",
+            observation=current_sofr,
+            lineage=[p99_lineage],
+        ),
+        metric(
+            key="iorb",
+            label="IORB",
+            value=current_iorb.value,
+            display_value=f"{current_iorb.value:,.2f}%",
+            unit="%",
+            observation=current_iorb,
+            lineage=[iorb_lineage],
+        ),
+        metric(
+            key="sofr-p99-minus-rate",
+            label="SOFR 99P−SOFR",
+            value=p99_sofr,
+            display_value=f"{p99_sofr:+,.2f}bp",
+            unit="bp",
+            observation=current_sofr,
+            lineage=[p99_lineage, sofr_lineage],
+            derived=True,
+            formula=SUBSURFACE_FORMULAS["sofr-p99-minus-rate"],
+        ),
+        metric(
+            key="sofr-p99-minus-iorb",
+            label="SOFR 99P−IORB",
+            value=p99_iorb,
+            display_value=f"{p99_iorb:+,.2f}bp",
+            unit="bp",
+            observation=current_sofr,
+            lineage=[p99_lineage, iorb_lineage],
+            derived=True,
+            formula=SUBSURFACE_FORMULAS["sofr-p99-minus-iorb"],
+        ),
+        metric(
+            key="sofr-volume",
+            label="SOFR 成交量",
+            value=volume,
+            display_value=f"{volume:,.2f} USD bn",
+            unit="USD billions",
+            observation=current_sofr,
+            lineage=[volume_lineage],
+        ),
+        metric(
+            key="sofr-volume-z60",
+            label="SOFR 成交量 Z60",
+            value=z60,
+            display_value=f"{z60:+,.4f}",
+            unit="z-score",
+            observation=current_sofr,
+            lineage=z_lineage,
+            derived=True,
+            formula=SUBSURFACE_FORMULAS["sofr-volume-z60"],
+            sample_count=60,
+        ),
+        metric(
+            key="srf-non-small-value-total",
+            label="SRF 非测试接受额",
+            value=current_srf.value,
+            display_value=f"{current_srf.value:,.2f} USD mn",
+            unit="USD millions",
+            observation=current_srf,
+            lineage=[srf_lineage],
+        ),
+        metric(
+            key="srf-rate",
+            label="SRF 操作利率",
+            value=current_srf_rate.value,
+            display_value=f"{current_srf_rate.value:,.2f}%",
+            unit="%",
+            observation=current_srf_rate,
+            lineage=[srf_rate_lineage],
+        ),
+        metric(
+            key="srf-active-days-30d",
+            label="SRF 30D 非测试激活天数",
+            value=Decimal(active_days),
+            display_value=f"{active_days} days",
+            unit="days",
+            observation=current_srf,
+            lineage=active_lineage,
+            derived=True,
+            formula=SUBSURFACE_FORMULAS["srf-active-days-30d"],
+            sample_count=len(active_lineage),
+        ),
+        metric(
+            key="fxswap-outstanding-non-small-value",
+            label="美元互换非测试在途",
+            value=swap_value,
+            display_value=f"{swap_value:,.2f} USD mn",
+            unit="USD millions",
+            observation=current_swap,
+            lineage=[swap_total_lineage, swap_small_lineage, swap_lineage],
+            derived=True,
+            formula=SUBSURFACE_FORMULAS[
+                "fxswap-outstanding-non-small-value"
+            ],
+        ),
+    ]
+    metrics[-1]["metadata"]["active_operations"] = list(
+        (current_swap.metadata or {}).get("active_operations") or []
+    )
+    metrics[-1]["metadata"]["all_active_operations"] = list(
+        (current_swap_total.metadata or {}).get("active_operations") or []
+    )
+    metrics[-1]["metadata"]["small_value_active_operations"] = list(
+        (current_swap_small.metadata or {}).get("active_operations") or []
+    )
+    metrics[-1]["metadata"]["swap_total"] = float(current_swap_total.value)
+    metrics[-1]["metadata"]["swap_small_value"] = float(
+        current_swap_small.value
+    )
+    metrics[-1]["metadata"]["swap_as_of"] = swap_as_of.isoformat()
+
+    source_names = {
+        item.key: item.name
+        for item in Source.objects.filter(
+            key__in={"ny-fed-markets", "federal-reserve", "internal"}
+        )
+    }
+
+    def chart(
+        *,
+        key: str,
+        title: str,
+        description: str,
+        rows: list[dict[str, Any]],
+        source_keys: set[str],
+        batch_ids: set[str],
+        quality_status: str,
+        fresh_until: str,
+    ) -> dict[str, Any]:
+        return {
+            "key": key,
+            "title": title,
+            "description": description,
+            "kind": "line",
+            "data": rows,
+            "source_keys": sorted(source_keys),
+            "license_scopes": [
+                f"{source_names[source_key]}: {scopes[source_key]}"
+                for source_key in sorted(source_keys)
+            ],
+            "fallback_sources": [],
+            "lineage_mode": "per-point",
+            "as_of": datetime.combine(
+                date.fromisoformat(
+                    max(str(item.get("date") or "") for item in rows)
+                ),
+                time.min,
+                tzinfo=UTC,
+            ).isoformat(),
+            "fetched_at": max(
+                (metric_item["fetched_at"] for metric_item in metrics),
+                default=None,
+            ),
+            "fresh_until": fresh_until,
+            "quality_status": quality_status,
+            "batch_ids": sorted(batch_ids),
+        }
+
+    tail_rows: list[dict[str, Any]] = []
+    for period in common_dates[-120:]:
+        sofr = maps["sofr"][period]
+        iorb = maps["iorb"][period]
+        percentile = Decimal(str(sofr.metadata["percentPercentile99"]))
+        tail_rows.append(
+            {
+                "date": period.isoformat(),
+                "SOFR": float(sofr.value),
+                "99P": float(percentile),
+                "IORB": float(iorb.value),
+                "99P−IORB": float((percentile - iorb.value) * Decimal("100")),
+                "_lineage": {
+                    "SOFR": direct(sofr),
+                    "99P": direct(
+                        sofr,
+                        raw_value=percentile,
+                        upstream_field="percentPercentile99",
+                    ),
+                    "IORB": direct(iorb),
+                    "99P−IORB": {
+                        "series_key": "sofr-p99-minus-iorb",
+                        "source_key": "internal",
+                        "formula": SUBSURFACE_FORMULAS[
+                            "sofr-p99-minus-iorb"
+                        ],
+                        "input_lineage": [
+                            direct(
+                                sofr,
+                                raw_value=percentile,
+                                upstream_field="percentPercentile99",
+                            ),
+                            direct(iorb),
+                        ],
+                        "quality_status": Observation.Quality.ESTIMATED,
+                        "fallback_source": None,
+                    },
+                },
+            }
+        )
+    volume_rows: list[dict[str, Any]] = []
+    for index in range(59, len(sofr_dates)):
+        period = sofr_dates[index]
+        window_periods = sofr_dates[index - 59 : index + 1]
+        window_values = [
+            Decimal(str(maps["sofr"][item].metadata["volumeInBillions"]))
+            for item in window_periods
+        ]
+        rolling_z = _subsurface_population_z(window_values)
+        if rolling_z is None:
+            return None, [
+                _subsurface_failure("z60", "a rolling SOFR volume window has zero std")
+            ]
+        current_volume = window_values[-1]
+        volume_rows.append(
+            {
+                "date": period.isoformat(),
+                "Volume": float(current_volume),
+                "Z60": float(rolling_z),
+                "_lineage": {
+                    "Volume": direct(
+                        maps["sofr"][period],
+                        raw_value=current_volume,
+                        upstream_field="volumeInBillions",
+                    ),
+                    "Z60": {
+                        "series_key": "sofr-volume-z60",
+                        "source_key": "internal",
+                        "formula": SUBSURFACE_FORMULAS["sofr-volume-z60"],
+                        "input_lineage": [
+                            direct(
+                                maps["sofr"][item],
+                                raw_value=maps["sofr"][item].metadata[
+                                    "volumeInBillions"
+                                ],
+                                upstream_field="volumeInBillions",
+                            )
+                            for item in window_periods
+                        ],
+                        "quality_status": Observation.Quality.ESTIMATED,
+                        "fallback_source": None,
+                    },
+                },
+            }
+        )
+    volume_rows = volume_rows[-120:]
+    srf_rows = [
+        {
+            "date": period.isoformat(),
+            "Non-test accepted": float(
+                maps["srp-non-small-value-total"][period].value
+            ),
+            "Treasury": float(
+                maps["srp-non-small-value-treasury"][period].value
+            ),
+            "Agency": float(maps["srp-non-small-value-agency"][period].value),
+            "MBS": float(maps["srp-non-small-value-mbs"][period].value),
+            "_lineage": {
+                "Non-test accepted": direct(
+                    maps["srp-non-small-value-total"][period]
+                ),
+                "Treasury": direct(
+                    maps["srp-non-small-value-treasury"][period]
+                ),
+                "Agency": direct(
+                    maps["srp-non-small-value-agency"][period]
+                ),
+                "MBS": direct(maps["srp-non-small-value-mbs"][period]),
+            },
+        }
+        for period in srf_dates
+    ]
+    swap_dates = sorted(
+        period
+        for period in maps["fxswap-usd-drawdown-non-small-value"]
+        if period <= swap_as_of
+    )[-120:]
+    swap_rows = [
+        {
+            "date": period.isoformat(),
+            "Non-test drawdown": float(
+                maps["fxswap-usd-drawdown-non-small-value"][period].value
+            ),
+            "_lineage": {
+                "Non-test drawdown": direct(
+                    maps["fxswap-usd-drawdown-non-small-value"][period]
+                )
+            },
+        }
+        for period in swap_dates
+    ]
+    common_fresh = min(
+        _fresh_until(current_sofr), _fresh_until(current_iorb)
+    ).isoformat()
+    charts = [
+        chart(
+            key="subsurface-sofr-tail-history",
+            title="SOFR 尾部与 IORB",
+            description="SOFR、99P、IORB 与 100×(99P−IORB)，不前值填充。",
+            rows=tail_rows,
+            source_keys={"ny-fed-markets", "federal-reserve", "internal"},
+            batch_ids={str(selected["sofr"].batch_id), str(selected["iorb"].batch_id)},
+            quality_status=Observation.Quality.ESTIMATED,
+            fresh_until=common_fresh,
+        ),
+        chart(
+            key="subsurface-sofr-volume-history",
+            title="SOFR 成交量与滚动 Z60",
+            description="每点严格使用此前含当日的 60 个官方观察日。",
+            rows=volume_rows,
+            source_keys={"ny-fed-markets", "internal"},
+            batch_ids={str(selected["sofr"].batch_id)},
+            quality_status=Observation.Quality.ESTIMATED,
+            fresh_until=_fresh_until(current_sofr).isoformat(),
+        ),
+        chart(
+            key="subsurface-srf-history",
+            title="SRF 非测试接受额",
+            description="闭区间 30D 内仅展示非 small-value 接受额及抵押品分项。",
+            rows=srf_rows,
+            source_keys={"ny-fed-markets"},
+            batch_ids={str(selected["srf"].batch_id)},
+            quality_status=Observation.Quality.FRESH,
+            fresh_until=_fresh_until(current_srf).isoformat(),
+        ),
+        chart(
+            key="subsurface-swap-drawdowns",
+            title="美元互换非测试 drawdown",
+            description="按 settlementDate 展示剔除 small-value 的美元互换提款。",
+            rows=swap_rows,
+            source_keys={"ny-fed-markets"},
+            batch_ids={str(selected["swaps"].batch_id)},
+            quality_status=Observation.Quality.FRESH,
+            fresh_until=_fresh_until(current_swap).isoformat(),
+        ),
+    ]
+
+    z_by_date = {row["date"]: row for row in volume_rows}
+    recent_rows: list[dict[str, Any]] = []
+    for row in tail_rows[-20:]:
+        period = row["date"]
+        volume_row = z_by_date.get(period)
+        sofr_observation = maps["sofr"][date.fromisoformat(period)]
+        raw_volume = Decimal(
+            str(sofr_observation.metadata["volumeInBillions"])
+        )
+        volume_lineage_for_row = direct(
+            sofr_observation,
+            raw_value=raw_volume,
+            upstream_field="volumeInBillions",
+        )
+        row_values = {
+            "date": period,
+            "SOFR": row["SOFR"],
+            "99P": row["99P"],
+            "IORB": row["IORB"],
+            "99P−IORB": row["99P−IORB"],
+            "Volume": (
+                volume_row["Volume"] if volume_row else float(raw_volume)
+            ),
+            "Z60": volume_row["Z60"] if volume_row else None,
+        }
+        recent_rows.append(
+            {
+                **row_values,
+                "cells_list": [
+                    {
+                        "key": key.lower().replace("−", "-").replace(" ", "-"),
+                        "cell": {
+                            "value": (
+                                "—" if row_values[key] is None else row_values[key]
+                            )
+                        },
+                    }
+                    for key in (
+                        "date",
+                        "SOFR",
+                        "99P",
+                        "IORB",
+                        "99P−IORB",
+                        "Volume",
+                        "Z60",
+                    )
+                ],
+                "_lineage": {
+                    **row["_lineage"],
+                    "Volume": volume_lineage_for_row,
+                    **(
+                        {"Z60": volume_row["_lineage"]["Z60"]}
+                        if volume_row
+                        else {}
+                    ),
+                },
+            }
+        )
+
+    operation_rows: list[dict[str, Any]] = []
+    for period in srf_dates[-20:]:
+        regular = maps["srp-non-small-value-total"][period]
+        small = maps["srp-small-value-total"][period]
+        for observation, is_small in ((regular, False), (small, True)):
+            operations = (observation.metadata or {}).get("operations")
+            if not isinstance(operations, list):
+                return None, [
+                    _subsurface_failure("srf", "SRF operation metadata is missing")
+                ]
+            summed = Decimal("0")
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    return None, [
+                        _subsurface_failure("srf", "SRF operation metadata is malformed")
+                    ]
+                try:
+                    operation_date = date.fromisoformat(
+                        str(operation.get("operationDate"))
+                    )
+                    accepted = Decimal(
+                        str(operation.get("totalAmtAccepted") or "0")
+                    ) / Decimal("1000000")
+                except (ArithmeticError, TypeError, ValueError):
+                    return None, [
+                        _subsurface_failure("srf", "SRF operation amount/date is malformed")
+                    ]
+                if operation_date != period or accepted < 0:
+                    return None, [
+                        _subsurface_failure("srf", "SRF operation metadata date/value mismatch")
+                    ]
+                summed += accepted
+                details = operation.get("details") or []
+                rates = [
+                    detail.get("percentOfferingRate", detail.get("minimumBidRate"))
+                    for detail in details
+                    if isinstance(detail, dict)
+                    and detail.get(
+                        "percentOfferingRate", detail.get("minimumBidRate")
+                    )
+                    is not None
+                ]
+                row_values = {
+                    "date": period.isoformat(),
+                    "session": str(operation.get("operationId") or "unknown"),
+                    "accepted": float(accepted),
+                    "rate": float(Decimal(str(rates[0]))) if rates else None,
+                    "is_small_value": is_small,
+                }
+                operation_rows.append(
+                    {
+                        **row_values,
+                        "cells_list": [
+                            {"key": "date", "cell": {"value": row_values["date"]}},
+                            {
+                                "key": "session",
+                                "cell": {"value": row_values["session"]},
+                            },
+                            {
+                                "key": "accepted",
+                                "cell": {"value": row_values["accepted"]},
+                            },
+                            {
+                                "key": "rate",
+                                "cell": {
+                                    "value": (
+                                        "—"
+                                        if row_values["rate"] is None
+                                        else row_values["rate"]
+                                    )
+                                },
+                            },
+                            {
+                                "key": "is-small-value",
+                                "cell": {
+                                    "value": (
+                                        "Yes" if row_values["is_small_value"] else "No"
+                                    )
+                                },
+                            },
+                        ],
+                        "_lineage": direct(observation),
+                    }
+                )
+            if not _fed_balance_sheet_decimal_equal(summed, observation.value):
+                return None, [
+                    _subsurface_failure("srf", "SRF operation rows do not sum to daily total")
+                ]
+    sections = [
+        {
+            "key": "recent-subsurface-observations",
+            "title": "最近 20 个 SOFR/IORB 精确共同日",
+            "description": "SOFR、99P、IORB、尾差、成交量与 Z60 均逐行可复算。",
+            "columns": [
+                {"key": key.lower().replace("−", "-").replace(" ", "-"), "label": key}
+                for key in ("Date", "SOFR", "99P", "IORB", "99P−IORB", "Volume", "Z60")
+            ],
+            "rows": recent_rows,
+            "status": Observation.Quality.ESTIMATED,
+            "quality_status": Observation.Quality.ESTIMATED,
+            "source_key": "internal",
+            "source_keys": ["ny-fed-markets", "federal-reserve", "internal"],
+            "license_scope": scopes["internal"],
+            "fallback_source": None,
+            "as_of": current_sofr.as_of.isoformat(),
+            "fetched_at": max(current_sofr.fetched_at, current_iorb.fetched_at).isoformat(),
+            "fresh_until": common_fresh,
+            "batch_id": ",".join(sorted({str(selected["sofr"].batch_id), str(selected["iorb"].batch_id)})),
+            "full_width": True,
+        },
+        {
+            "key": "recent-srf-operations",
+            "title": "最近 20 个 SRF 操作日与场次",
+            "description": "small-value 技术测试单列且不计入接受额或激活天数。",
+            "columns": [
+                {"key": "date", "label": "Date"},
+                {"key": "session", "label": "Session"},
+                {"key": "accepted", "label": "Accepted (USD mn)"},
+                {"key": "rate", "label": "Rate (%)"},
+                {"key": "is-small-value", "label": "Technical test"},
+            ],
+            "rows": operation_rows,
+            "status": Observation.Quality.FRESH,
+            "quality_status": Observation.Quality.FRESH,
+            "source_key": "ny-fed-markets",
+            "source_keys": ["ny-fed-markets"],
+            "license_scope": scopes["ny-fed-markets"],
+            "fallback_source": None,
+            "as_of": current_srf.as_of.isoformat(),
+            "fetched_at": current_srf.fetched_at.isoformat(),
+            "fresh_until": _fresh_until(current_srf).isoformat(),
+            "batch_id": str(selected["srf"].batch_id),
+            "full_width": True,
+        },
+    ]
+    extra_data = {
+        "contract_version": SUBSURFACE_CONTRACT_VERSION,
+        "common_effective_date": current_date.isoformat(),
+        "swap_as_of": swap_as_of.isoformat(),
+        "z60_sample_count": 60,
+        "srf_window_start": context["window_start"].isoformat(),
+        "srf_window_end": current_date.isoformat(),
+        "refresh_cycle_id": context["refresh_cycle_id"],
+        "component_runs": [
+            _subsurface_run_state(identity, selected[identity], status="valid")
+            for identity in SUBSURFACE_DATASETS
+        ],
+        "formulas": dict(SUBSURFACE_FORMULAS),
+        "model_disclaimer": (
+            "Z60, SRF activation days and small-value-excluded swap outstanding "
+            "are transparent Atlas Macro proxies, not official pressure indicators."
+        ),
+    }
+    return (metrics, charts, sections, extra_data), []
+
+
+def _subsurface_page_contract_is_buildable(data: dict[str, Any]) -> bool:
+    metrics = data.get("metrics")
+    charts = data.get("charts")
+    sections = data.get("sections")
+    if (
+        data.get("contract_version") != SUBSURFACE_CONTRACT_VERSION
+        or not isinstance(metrics, list)
+        or len(metrics) != len(SUBSURFACE_REQUIRED_METRIC_KEYS)
+        or {str(item.get("key") or "") for item in metrics if isinstance(item, dict)}
+        != set(SUBSURFACE_REQUIRED_METRIC_KEYS)
+        or not isinstance(charts, list)
+        or len(charts) != len(SUBSURFACE_REQUIRED_CHART_KEYS)
+        or {str(item.get("key") or "") for item in charts if isinstance(item, dict)}
+        != set(SUBSURFACE_REQUIRED_CHART_KEYS)
+        or not isinstance(sections, list)
+        or len(sections) != len(SUBSURFACE_REQUIRED_SECTION_KEYS)
+        or {str(item.get("key") or "") for item in sections if isinstance(item, dict)}
+        != set(SUBSURFACE_REQUIRED_SECTION_KEYS)
+        or data.get("formulas") != SUBSURFACE_FORMULAS
+        or int(data.get("z60_sample_count") or 0) != 60
+    ):
+        return False
+    metric_by_key = {str(item["key"]): item for item in metrics}
+    try:
+        p99 = Decimal(str(metric_by_key["sofr-p99"]["value"]))
+        sofr = Decimal(str(metric_by_key["sofr"]["value"]))
+        iorb = Decimal(str(metric_by_key["iorb"]["value"]))
+        z_metric = metric_by_key["sofr-volume-z60"]
+        z_inputs = (z_metric.get("metadata") or {}).get("input_lineage")
+        if not isinstance(z_inputs, list) or len(z_inputs) != 60:
+            return False
+        z_values = [Decimal(str(item["raw_value"])) for item in z_inputs]
+        recomputed_z = _subsurface_population_z(z_values)
+        active_metric = metric_by_key["srf-active-days-30d"]
+        active_inputs = (active_metric.get("metadata") or {}).get("input_lineage")
+        if not isinstance(active_inputs, list) or not active_inputs:
+            return False
+        active_days = sum(
+            1 for item in active_inputs if Decimal(str(item["raw_value"])) > 0
+        )
+        swap_metric = metric_by_key["fxswap-outstanding-non-small-value"]
+        swap_metadata = swap_metric.get("metadata") or {}
+        swap_as_of = date.fromisoformat(str(swap_metadata.get("swap_as_of")))
+        all_swap_result = _subsurface_swap_operations_total(
+            swap_metadata.get("all_active_operations"),
+            as_of=swap_as_of,
+            expected_small_value=None,
+        )
+        small_swap_result = _subsurface_swap_operations_total(
+            swap_metadata.get("small_value_active_operations"),
+            as_of=swap_as_of,
+            expected_small_value=True,
+        )
+        non_small_swap_result = _subsurface_swap_operations_total(
+            swap_metadata.get("active_operations"),
+            as_of=swap_as_of,
+            expected_small_value=False,
+        )
+        if (
+            all_swap_result is None
+            or small_swap_result is None
+            or non_small_swap_result is None
+        ):
+            return False
+        declared_swap_total = Decimal(str(swap_metadata.get("swap_total")))
+        declared_swap_small = Decimal(
+            str(swap_metadata.get("swap_small_value"))
+        )
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        recomputed_z is None
+        or not _fed_balance_sheet_decimal_equal(
+            metric_by_key["sofr-p99-minus-rate"]["value"],
+            (p99 - sofr) * Decimal("100"),
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            metric_by_key["sofr-p99-minus-iorb"]["value"],
+            (p99 - iorb) * Decimal("100"),
+        )
+        or not _fed_balance_sheet_decimal_equal(z_metric["value"], recomputed_z)
+        or not _fed_balance_sheet_decimal_equal(active_metric["value"], active_days)
+        or all_swap_result[1]
+        != sorted(small_swap_result[1] + non_small_swap_result[1])
+        or not _fed_balance_sheet_decimal_equal(
+            declared_swap_total, all_swap_result[0]
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            declared_swap_small, small_swap_result[0]
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            swap_metric["value"], non_small_swap_result[0]
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            declared_swap_total - declared_swap_small,
+            swap_metric["value"],
+        )
+        or any(
+            metric_by_key[key].get("quality_status")
+            != Observation.Quality.ESTIMATED
+            or (metric_by_key[key].get("metadata") or {}).get("formula")
+            != SUBSURFACE_FORMULAS[key]
+            for key in SUBSURFACE_FORMULAS
+        )
+        or any(item.get("fallback_source") is not None for item in metrics)
+        or any(
+            not chart.get("data")
+            or chart.get("lineage_mode") != "per-point"
+            or chart.get("fallback_sources")
+            for chart in charts
+        )
+    ):
+        return False
+    recent = next(
+        item for item in sections if item["key"] == "recent-subsurface-observations"
+    )
+    operations_section = next(
+        item for item in sections if item["key"] == "recent-srf-operations"
+    )
+    recent_rows = recent.get("rows") or []
+    operation_rows = operations_section.get("rows") or []
+
+    def cells_match(
+        row: dict[str, Any], keys: tuple[str, ...], values: tuple[Any, ...]
+    ) -> bool:
+        cells = row.get("cells_list")
+        return bool(
+            isinstance(cells, list)
+            and len(cells) == len(keys)
+            and [item.get("key") for item in cells if isinstance(item, dict)]
+            == list(keys)
+            and [
+                (item.get("cell") or {}).get("value")
+                for item in cells
+                if isinstance(item, dict)
+            ]
+            == list(values)
+        )
+
+    return bool(
+        len(recent_rows) == 20
+        and operation_rows
+        and all(
+            cells_match(
+                row,
+                ("date", "sofr", "99p", "iorb", "99p-iorb", "volume", "z60"),
+                (
+                    row.get("date"),
+                    row.get("SOFR"),
+                    row.get("99P"),
+                    row.get("IORB"),
+                    row.get("99P−IORB"),
+                    row.get("Volume"),
+                    "—" if row.get("Z60") is None else row.get("Z60"),
+                ),
+            )
+            for row in recent_rows
+        )
+        and all(
+            cells_match(
+                row,
+                ("date", "session", "accepted", "rate", "is-small-value"),
+                (
+                    row.get("date"),
+                    row.get("session"),
+                    row.get("accepted"),
+                    "—" if row.get("rate") is None else row.get("rate"),
+                    "Yes" if row.get("is_small_value") else "No",
+                ),
+            )
+            for row in operation_rows
+        )
+        and operations_section.get("fallback_source") is None
+        and recent.get("fallback_source") is None
+    )
+
+
+def _subsurface_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
+    data = dict(snapshot.data or {})
+    normalized = {
+        item.key: item
+        for item in MetricSnapshot.objects.filter(
+            batch_id=snapshot.batch_id,
+            key__startswith="subsurface-",
+        ).select_related("source", "fallback_source")
+    }
+    expected = {f"subsurface-{key}" for key in SUBSURFACE_REQUIRED_METRIC_KEYS}
+    if set(normalized) != expected:
+        return False
+    for metric in data.get("metrics", []):
+        stored = normalized.get(f"subsurface-{metric['key']}")
+        metadata = metric.get("metadata") or {}
+        if (
+            stored is None
+            or stored.value is None
+            or not _fed_balance_sheet_decimal_equal(stored.value, metric.get("value"))
+            or stored.source.key != metric.get("source_key")
+            or stored.fallback_source_id is not None
+            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
+            or stored.as_of != _parse_payload_datetime(metric.get("as_of"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.quality_status != metric.get("quality_status")
+            or stored.license_scope != str(metric.get("license_scope") or "")[:120]
+            or stored.metadata.get("component_batch_id") != metric.get("batch_id")
+            or stored.metadata.get("formula") != metadata.get("formula")
+            or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
+            or stored.metadata.get("active_operations")
+            != metadata.get("active_operations")
+            or stored.metadata.get("all_active_operations")
+            != metadata.get("all_active_operations")
+            or stored.metadata.get("small_value_active_operations")
+            != metadata.get("small_value_active_operations")
+            or stored.metadata.get("swap_as_of")
+            != metadata.get("swap_as_of")
+            or stored.metadata.get("swap_total")
+            != metadata.get("swap_total")
+            or stored.metadata.get("swap_small_value")
+            != metadata.get("swap_small_value")
+            or set(stored.metadata.get("input_batch_ids") or [])
+            != set(metadata.get("input_batch_ids") or [])
+        ):
+            return False
+    return True
+
+
+def _subsurface_component_runs_from_snapshot(
+    snapshot: DashboardSnapshot,
+) -> dict[str, IngestionRun] | None:
+    references = (snapshot.data or {}).get("component_runs")
+    if not isinstance(references, list):
+        return None
+    by_identity = {
+        str(item.get("component") or ""): item
+        for item in references
+        if isinstance(item, dict)
+    }
+    if set(by_identity) != set(SUBSURFACE_DATASETS):
+        return None
+    selected: dict[str, IngestionRun] = {}
+    for identity, (source_key, dataset) in SUBSURFACE_DATASETS.items():
+        reference = by_identity[identity]
+        run = (
+            IngestionRun.objects.select_related("source")
+            .filter(pk=reference.get("ingestion_run_id"))
+            .first()
+        )
+        if (
+            run is None
+            or run.source.key != source_key
+            or run.dataset != dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or reference.get("kind") != "ingestion_run"
+            or reference.get("source") != source_key
+            or reference.get("dataset") != dataset
+            or reference.get("status") != "valid"
+            or reference.get("batch_id") != str(run.batch_id)
+            or reference.get("row_count") != run.row_count
+            or str(reference.get("refresh_cycle_id") or "")
+            != str((run.metadata or {}).get("refresh_cycle_id") or "")
+            or not _subsurface_artifact_is_valid(identity, run)
+        ):
+            return None
+        selected[identity] = run
+    main_cycles = {
+        str((selected[identity].metadata or {}).get("refresh_cycle_id") or "")
+        for identity in ("sofr", "srf", "swaps")
+    }
+    if (
+        len(main_cycles) != 1
+        or not next(iter(main_cycles), "")
+        or (snapshot.data or {}).get("refresh_cycle_id")
+        != next(iter(main_cycles))
+    ):
+        return None
+    return selected
+
+
+def _subsurface_snapshot_contract_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    selected_runs: dict[str, IngestionRun],
+    allow_natural_expiry: bool = False,
+) -> bool:
+    data = dict(snapshot.data or {})
+    valid_state = bool(
+        snapshot.quality_status
+        in (
+            {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+            if allow_natural_expiry
+            else {Observation.Quality.ESTIMATED}
+        )
+        and "refresh_failure" not in data
+    )
+    if (
+        snapshot.key != "subsurface"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or data.get("demo") is not False
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or not valid_state
+        or set(data.get("component_batches") or [])
+        != {str(run.batch_id) for run in selected_runs.values()}
+        or str(data.get("fingerprint") or "")
+        != _dashboard_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _subsurface_page_contract_is_buildable(data)
+    ):
+        return False
+    prepared, _failures = _subsurface_page_data(
+        selected_runs, allow_expired=allow_natural_expiry
+    )
+    if prepared is None:
+        return False
+    metrics, charts, sections, extra = prepared
+    if (
+        data.get("metrics") != metrics
+        or data.get("charts") != charts
+        or data.get("sections") != sections
+        or data.get("chart_data") != charts[0]["data"]
+        or any(data.get(key) != value for key, value in extra.items())
+    ):
+        return False
+    return _subsurface_normalized_metrics_match(snapshot)
+
+
+def _subsurface_embedded_snapshot_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    require_persisted_failure: bool,
+) -> bool:
+    data = dict(snapshot.data or {})
+    required_sources = {"ny-fed-markets", "federal-reserve", "internal"}
+    public_keys, derived_keys = current_display_source_key_sets(required_sources)
+    if public_keys != required_sources or derived_keys != required_sources:
+        return False
+    scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(
+                source, require_public=True, require_derived=True
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return False
+        scopes[source_key] = licence.scope
+    if require_persisted_failure:
+        valid_state = bool(
+            snapshot.quality_status == Observation.Quality.STALE
+            and _fed_balance_sheet_refresh_failure_is_valid(
+                data.get("refresh_failure")
+            )
+        )
+    else:
+        valid_state = bool(
+            snapshot.quality_status == Observation.Quality.ESTIMATED
+            and "refresh_failure" not in data
+        )
+    selected = _subsurface_component_runs_from_snapshot(snapshot)
+    if (
+        selected is None
+        or snapshot.key != "subsurface"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or not valid_state
+        or data.get("demo") is not False
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or set(data.get("component_batches") or [])
+        != {str(run.batch_id) for run in selected.values()}
+        or str(data.get("fingerprint") or "")
+        != _dashboard_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _subsurface_page_contract_is_buildable(data)
+        or _payload_fallback_source_keys(data)
+        or not _subsurface_normalized_metrics_match(snapshot)
+    ):
+        return False
+
+    expected_batches = {
+        identity: str(run.batch_id) for identity, run in selected.items()
+    }
+
+    def lineage_is_valid(value: Any) -> bool:
+        if isinstance(value, list):
+            return all(lineage_is_valid(item) for item in value)
+        if not isinstance(value, dict):
+            return True
+        source_key = value.get("source_key")
+        batch_id = value.get("batch_id")
+        if source_key in {"ny-fed-markets", "federal-reserve"} and batch_id:
+            matching_identities = [
+                identity
+                for identity, expected_batch in expected_batches.items()
+                if str(batch_id) == expected_batch
+            ]
+            if (
+                len(matching_identities) != 1
+                or SUBSURFACE_DATASETS[matching_identities[0]][0] != source_key
+                or value.get("license_scope") != scopes[source_key]
+                or value.get("fallback_source") is not None
+                or value.get("quality_status") != Observation.Quality.FRESH
+            ):
+                return False
+        return all(lineage_is_valid(item) for item in value.values())
+
+    return lineage_is_valid(data)
+
+
+def _subsurface_has_component_transition(
+    snapshot: DashboardSnapshot,
+    latest_attempts: dict[str, IngestionRun | None] | None = None,
+) -> bool:
+    selected = _subsurface_component_runs_from_snapshot(snapshot)
+    if selected is None:
+        return False
+    attempts = latest_attempts or {
+        identity: _latest_subsurface_attempt(identity)
+        for identity in SUBSURFACE_DATASETS
+    }
+    return bool(
+        set(attempts) == set(SUBSURFACE_DATASETS)
+        and all(attempt is not None for attempt in attempts.values())
+        and any(
+            attempts[identity] is not None
+            and attempts[identity].pk != selected[identity].pk
+            for identity in SUBSURFACE_DATASETS
+        )
+    )
+
+
+def subsurface_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    attempts = {
+        identity: _latest_subsurface_attempt(identity)
+        for identity in SUBSURFACE_DATASETS
+    }
+    successful = {
+        identity: _latest_successful_subsurface_run(identity)
+        for identity in SUBSURFACE_DATASETS
+    }
+    if any(run is None for run in attempts.values()) or any(
+        run is None for run in successful.values()
+    ):
+        return False
+    selected = {
+        identity: run for identity, run in successful.items() if run is not None
+    }
+    if all(
+        attempts[identity].status == IngestionRun.Status.SUCCESS
+        and attempts[identity].row_count > 0
+        and attempts[identity].pk == selected[identity].pk
+        for identity in SUBSURFACE_DATASETS
+    ):
+        deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+        expired = deadline is not None and deadline < timezone.now()
+        if _subsurface_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_natural_expiry=expired,
+        ):
+            return True
+    if _subsurface_embedded_snapshot_is_valid(
+        snapshot, require_persisted_failure=True
+    ):
+        return True
+    return _subsurface_has_component_transition(
+        snapshot, latest_attempts=attempts
+    ) and _subsurface_embedded_snapshot_is_valid(
+        snapshot, require_persisted_failure=False
+    )
+
+
+def select_public_subsurface_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="subsurface",
+                is_published=True,
+                data__contract_version=SUBSURFACE_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if subsurface_snapshot_is_publicly_displayable(candidate)
+        ),
+        None,
+    )
+    if selected is not None:
+        deadline = _parse_payload_datetime((selected.data or {}).get("fresh_until"))
+        if (
+            deadline is not None
+            and deadline < timezone.now()
+            or _subsurface_has_component_transition(selected)
+        ):
+            selected.quality_status = Observation.Quality.STALE
+    return selected
+
+
+def _mark_subsurface_stale(
+    components: list[dict[str, Any]], *, reason: str
+) -> None:
+    latest = (
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="subsurface",
+            is_published=True,
+            data__contract_version=SUBSURFACE_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return
+    data = dict(latest.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason": reason,
+        "components": components,
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+@transaction.atomic
+def _coordinate_subsurface_dashboard(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    source_keys = {"internal", "ny-fed-markets", "federal-reserve"}
+    for source_key in source_keys:
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in=source_keys)
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    selected, states, triggered = _select_subsurface_runs(trigger_runs)
+    if not triggered:
+        return [], set()
+    if selected is None:
+        _mark_subsurface_stale(
+            states,
+            reason=(
+                "Latest SOFR, IORB, SRF and swap attempts do not form one "
+                "successful exact subsurface v1 component set."
+            ),
+        )
+        return [], {"subsurface"}
+    list(
+        IngestionRun.objects.select_for_update()
+        .filter(pk__in=[run.pk for run in selected.values()])
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    previous = (
+        DashboardSnapshot.objects.filter(
+            key="subsurface",
+            is_published=True,
+            data__contract_version=SUBSURFACE_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    expected_batches = {str(run.batch_id) for run in selected.values()}
+    if (
+        previous is not None
+        and set((previous.data or {}).get("component_batches") or [])
+        == expected_batches
+        and "refresh_failure" not in (previous.data or {})
+        and _subsurface_snapshot_contract_is_valid(
+            previous, selected_runs=selected
+        )
+    ):
+        return [], set()
+    prepared, failures = _subsurface_page_data(selected)
+    if prepared is None:
+        _mark_subsurface_stale(
+            failures,
+            reason=(
+                "Subsurface exact batches, metadata, Z60, SRF window, swap "
+                "formula, artifacts or licences failed validation."
+            ),
+        )
+        return [], {"subsurface"}
+    metrics, charts, sections, extra_data = prepared
+    try:
+        with transaction.atomic():
+            published = _publish_dashboard(
+                key="subsurface",
+                title="次表层资金流",
+                summary=(
+                    "SOFR 尾部、成交量 Z60、IORB、非 small-value SRF 与美元"
+                    "互换按四个官方 exact batches 原子发布；透明派生值不是"
+                    " New York Fed 或 Federal Reserve 官方压力指标。"
+                ),
+                metrics=metrics,
+                charts=charts,
+                sections=sections,
+                extra_data=extra_data,
+                required_metric_keys=SUBSURFACE_REQUIRED_METRIC_KEYS,
+                batch_id=uuid.uuid4(),
+            )
+            latest = (
+                DashboardSnapshot.objects.filter(
+                    key="subsurface",
+                    is_published=True,
+                    data__contract_version=SUBSURFACE_CONTRACT_VERSION,
+                )
+                .exclude(source__key="demo-market")
+                .order_by("-created_at", "-id")
+                .first()
+            )
+            if (
+                latest is None
+                or not _subsurface_runs_still_latest(selected)
+                or not _subsurface_snapshot_contract_is_valid(
+                    latest, selected_runs=selected
+                )
+            ):
+                raise ValueError("subsurface v1 publication postcondition failed")
+    except (ArithmeticError, IndexError, KeyError, StopIteration, TypeError, ValueError):
+        _mark_subsurface_stale(
+            [
+                _subsurface_failure(
+                    "publication",
+                    "publication postcondition or latest-attempt check failed",
+                )
+            ],
+            reason=(
+                "Subsurface v1 publication postcondition failed; retained the "
+                "previous fully audited snapshot."
+            ),
+        )
+        return [], {"subsurface"}
+    return ([published] if published is not None else []), set()
+
+
 def _liquidity_run_identity(run: IngestionRun) -> str | None:
     for identity, (source_key, dataset) in LIQUIDITY_DATASETS.items():
         if run.source.key == source_key and run.dataset == dataset:
@@ -12404,6 +16957,140 @@ def _store_h8_observations(result, source, run) -> int:
     return _store_board_archive_observations(result, source, run)
 
 
+def _guard_fed_balance_sheet_component_persistence(
+    result: Any,
+    source: Source,
+    run: IngestionRun,
+) -> None:
+    """Serialize and reject superseded ON RRP/TGA exact-batch writers."""
+
+    specifications = {
+        "repo:reverse-repo-fixed-results": (
+            "ny-fed-markets",
+            {"ONRRP"},
+            {
+                "ONRRP",
+                "ONRRP-RATE",
+                "ONRRP-PARTICIPANTS",
+                "ONRRP-BANK",
+                "ONRRP-GSE",
+                "ONRRP-MMF",
+                "ONRRP-PD",
+            },
+        ),
+        "daily-treasury-statement:tga": (
+            "treasury-fiscal-data",
+            {"TGA"},
+            {"TGA"},
+        ),
+    }
+    specification = specifications.get(str(result.dataset))
+    if specification is None:
+        raise ValueError("unsupported fed-balance-sheet guarded dataset")
+    expected_source, required_series, allowed_series = specification
+    if (
+        source.key != expected_source
+        or run.source_id != source.pk
+        or run.dataset != result.dataset
+    ):
+        raise ValueError(
+            "fed-balance-sheet component persistence source/run identity mismatch"
+        )
+
+    # The source row is the cross-dataset insertion fence on PostgreSQL; the
+    # latest attempt row supplies a deterministic SQLite-testable guard.
+    Source.objects.select_for_update().get(pk=source.pk)
+    if (
+        _effective_source_license(source, lock=True, require_storage=True)
+        is None
+    ):
+        raise ValueError(
+            f"{run.dataset} lacks a current historical-storage licence"
+        )
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError(
+            f"superseded {run.dataset} ingestion run cannot persist observations"
+        )
+
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > datetime.now(UTC) + timedelta(minutes=5):
+        raise ValueError("fed-balance-sheet component fetched_at is future-dated")
+    seen: set[tuple[str, date]] = set()
+    observed_series: set[str] = set()
+    today_et = timezone.now().astimezone(
+        ZoneInfo("America/New_York")
+    ).date()
+    for record in result.records:
+        if record.get("value") is None:
+            continue
+        try:
+            series_key = str(record.get("series_id") or "").upper()
+            raw_period = record.get("date")
+            if isinstance(raw_period, datetime):
+                raise ValueError("datetime is not a canonical business date")
+            if isinstance(raw_period, date):
+                period = raw_period
+            elif isinstance(raw_period, str):
+                period = date.fromisoformat(raw_period)
+                if raw_period != period.isoformat():
+                    raise ValueError("date is not canonical YYYY-MM-DD")
+            else:
+                raise ValueError("date is not canonical YYYY-MM-DD")
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "fed-balance-sheet component exact batch contains a malformed row"
+            ) from exc
+        identity = (series_key, period)
+        if (
+            not series_key
+            or series_key not in allowed_series
+            or not value.is_finite()
+            or value < 0
+            or identity in seen
+            or period > today_et
+        ):
+            raise ValueError(
+                "fed-balance-sheet component exact batch has an unknown series, "
+                "negative value, duplicate, invalid, or future business date"
+            )
+        seen.add(identity)
+        observed_series.add(series_key)
+    if not required_series <= observed_series:
+        raise ValueError(
+            "fed-balance-sheet component exact batch lacks its required series"
+        )
+
+
+def _store_fed_balance_sheet_component_observations(
+    result: Any,
+    source: Source,
+    run: IngestionRun,
+) -> int:
+    """Persist only a still-latest ON RRP or TGA attempt, with post-check."""
+
+    _guard_fed_balance_sheet_component_persistence(result, source, run)
+    row_count = store_series_observations(result, source, run)
+    _guard_fed_balance_sheet_component_persistence(result, source, run)
+    exact_count = Observation.objects.filter(
+        source=source, batch_id=run.batch_id
+    ).count()
+    if row_count <= 0 or exact_count != row_count:
+        raise ValueError(
+            "fed-balance-sheet component persistence did not retain one complete "
+            "exact batch"
+        )
+    return row_count
+
+
 def _guard_daily_rate_persistence(
     result: Any,
     source: Source,
@@ -12505,6 +17192,125 @@ def _store_ny_fed_reference_rate_observations(result, source, run) -> int:
     return store_series_observations(result, source, run)
 
 
+def _guard_subsurface_ny_fed_persistence(result, source, run) -> str:
+    """Reject malformed or superseded NY Fed subsurface exact-batch writes."""
+
+    identity_by_dataset = {
+        dataset: identity
+        for identity, (source_key, dataset) in SUBSURFACE_DATASETS.items()
+        if source_key == "ny-fed-markets"
+    }
+    identity = identity_by_dataset.get(str(result.dataset))
+    if (
+        identity is None
+        or source.key != "ny-fed-markets"
+        or run.source_id != source.pk
+        or run.dataset != result.dataset
+    ):
+        raise ValueError("subsurface NY Fed persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("subsurface NY Fed source lacks storage licence")
+    latest = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest is None or latest.pk != run.pk:
+        raise ValueError(
+            f"superseded {run.dataset} ingestion run cannot persist observations"
+        )
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > datetime.now(UTC) + timedelta(minutes=5):
+        raise ValueError("subsurface NY Fed fetched_at is future-dated")
+    today_et = timezone.now().astimezone(ZoneInfo("America/New_York")).date()
+    seen: set[tuple[str, date]] = set()
+    observed: set[str] = set()
+    fixed_allowed = {
+        "sofr": {"SOFR"},
+        "srf": {
+            "SRP",
+            "SRP-TREASURY",
+            "SRP-AGENCY",
+            "SRP-MBS",
+            "SRP-RATE",
+            *(item.upper() for item in SUBSURFACE_REQUIRED_SERIES["srf"]),
+        },
+        "swaps": {
+            "FXSWAP-USD-DRAWDOWN",
+            "FXSWAP-USD-OUTSTANDING",
+            "FXSWAP-USD-OUTSTANDING-SMALL-VALUE",
+            *(item.upper() for item in SUBSURFACE_REQUIRED_SERIES["swaps"]),
+        },
+    }
+    for record in result.records:
+        if record.get("value") is None:
+            continue
+        raw_period = record.get("date")
+        try:
+            if not isinstance(raw_period, str):
+                raise ValueError("date must be canonical text")
+            period = date.fromisoformat(raw_period)
+            if raw_period != period.isoformat():
+                raise ValueError("date must be YYYY-MM-DD")
+            series_key = str(record.get("series_id") or "").upper()
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("subsurface NY Fed exact batch has malformed row") from exc
+        allowed = series_key in fixed_allowed[identity] or (
+            identity == "swaps"
+            and series_key.startswith("FXSWAP-USD-")
+            and series_key.endswith("-OUTSTANDING")
+        )
+        row_identity = (series_key, period)
+        if (
+            not allowed
+            or not value.is_finite()
+            or value < 0
+            or period > today_et
+            or row_identity in seen
+        ):
+            raise ValueError(
+                "subsurface NY Fed exact batch has unknown, negative, future, "
+                "or duplicate row"
+            )
+        seen.add(row_identity)
+        observed.add(series_key.lower())
+    if not SUBSURFACE_REQUIRED_SERIES[identity] <= observed:
+        raise ValueError("subsurface NY Fed exact batch lacks required series")
+    return identity
+
+
+def _store_subsurface_ny_fed_observations(result, source, run) -> int:
+    """Persist exact NY Fed rows and one immutable private response artifact."""
+
+    identity = _guard_subsurface_ny_fed_persistence(result, source, run)
+    if identity == "sofr":
+        row_count = _store_ny_fed_reference_rate_observations(
+            result, source, run
+        )
+    else:
+        row_count = store_series_observations(result, source, run)
+    Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+        fallback_source=None
+    )
+    persist_private_raw_artifact(run=run, result=result)
+    _guard_subsurface_ny_fed_persistence(result, source, run)
+    if (
+        row_count <= 0
+        or Observation.objects.filter(
+            source=source, batch_id=run.batch_id
+        ).count()
+        != row_count
+        or RawArtifact.objects.filter(run=run).count() != 1
+    ):
+        raise ValueError("subsurface NY Fed exact-batch postcondition failed")
+    return row_count
+
+
 def _store_prates_observations(result, source, run) -> int:
     _guard_daily_rate_persistence(
         result,
@@ -12515,7 +17321,11 @@ def _store_prates_observations(result, source, run) -> int:
         expected_series="IORB",
         allow_future_periods=True,
     )
-    return _store_board_archive_observations(result, source, run)
+    row_count = _store_board_archive_observations(result, source, run)
+    Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+        fallback_source=None
+    )
+    return row_count
 
 
 def _store_h10_observations(result, source, run) -> int:
@@ -12715,6 +17525,71 @@ def _payload_batch_ids(value: Any) -> set[str]:
     return set()
 
 
+_DASHBOARD_FINGERPRINT_VOLATILE_KEYS = frozenset(
+    {
+        "batch_id",
+        "batch_ids",
+        "_batch_ids",
+        "input_batch_ids",
+        "component_batch_id",
+        "component_batches",
+        "fetched_at",
+        "fingerprint",
+        "fresh_until",
+        "publication_batch_id",
+        "required_notices",
+        "as_of",
+        "component_snapshots",
+        "component_runs",
+        "component_snapshot_id",
+        "component_snapshot_batch_id",
+        "component_snapshot_fingerprint",
+        "component_publication_batch_id",
+        "component_fingerprint",
+        "component_metric_snapshot_id",
+        "component_metric_snapshot_batch_id",
+        "refresh_cycle_id",
+        # Coordinators add this only after a failed refresh. It must not alter
+        # the immutable content identity of the retained successful payload.
+        "refresh_failure",
+    }
+)
+
+
+def _without_volatile_dashboard_lineage(value: Any) -> Any:
+    """Strip acquisition identities while retaining semantic dashboard data."""
+
+    if isinstance(value, dict):
+        return {
+            item_key: _without_volatile_dashboard_lineage(item_value)
+            for item_key, item_value in value.items()
+            if item_key not in _DASHBOARD_FINGERPRINT_VOLATILE_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_volatile_dashboard_lineage(item) for item in value]
+    return value
+
+
+def _dashboard_content_fingerprint(
+    *, title: str, summary: str, snapshot_data: dict[str, Any]
+) -> str:
+    """Return the stable semantic fingerprint shared by publish and audit."""
+
+    fingerprint_payload = {
+        "title": title,
+        "summary": summary,
+        **snapshot_data,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            _without_volatile_dashboard_lineage(fingerprint_payload),
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
 def _publish_dashboard(
     *,
     key: str,
@@ -12904,57 +17779,11 @@ def _publish_dashboard(
         "publication_batch_id": str(batch_id),
         **normalized_extra_data,
     }
-    fingerprint_payload = {
-        "title": title,
-        "summary": summary,
-        **snapshot_data,
-    }
-
-    def without_volatile_lineage(value: Any) -> Any:
-        """Keep the content fingerprint stable across an unchanged re-fetch."""
-
-        if isinstance(value, dict):
-            return {
-                item_key: without_volatile_lineage(item_value)
-                for item_key, item_value in value.items()
-                if item_key
-                not in {
-                    "batch_id",
-                    "batch_ids",
-                    "_batch_ids",
-                    "input_batch_ids",
-                    "component_batch_id",
-                    "component_batches",
-                    "fetched_at",
-                    "fingerprint",
-                    "fresh_until",
-                    "publication_batch_id",
-                    "required_notices",
-                    "as_of",
-                    "component_snapshots",
-                    "component_runs",
-                    "component_snapshot_id",
-                    "component_snapshot_batch_id",
-                    "component_snapshot_fingerprint",
-                    "component_publication_batch_id",
-                    "component_fingerprint",
-                    "component_metric_snapshot_id",
-                    "component_metric_snapshot_batch_id",
-                    "refresh_cycle_id",
-                }
-            }
-        if isinstance(value, list):
-            return [without_volatile_lineage(item) for item in value]
-        return value
-
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            without_volatile_lineage(fingerprint_payload),
-            sort_keys=True,
-            ensure_ascii=False,
-            default=str,
-        ).encode()
-    ).hexdigest()
+    fingerprint = _dashboard_content_fingerprint(
+        title=title,
+        summary=summary,
+        snapshot_data=snapshot_data,
+    )
     snapshot_data["fingerprint"] = fingerprint
 
     def metric_metadata(item: dict[str, Any]) -> dict[str, Any]:
@@ -12975,6 +17804,18 @@ def _publish_dashboard(
                 "input_value_dates", []
             ),
             "input_lineage": component_metadata.get("input_lineage", []),
+            "active_operations": component_metadata.get("active_operations"),
+            "all_active_operations": component_metadata.get(
+                "all_active_operations"
+            ),
+            "small_value_active_operations": component_metadata.get(
+                "small_value_active_operations"
+            ),
+            "swap_as_of": component_metadata.get("swap_as_of"),
+            "swap_total": component_metadata.get("swap_total"),
+            "swap_small_value": component_metadata.get(
+                "swap_small_value"
+            ),
             "previous_value": component_metadata.get("previous_value"),
             "previous_value_date": component_metadata.get(
                 "previous_value_date"
@@ -13230,7 +18071,6 @@ def publish_official_dashboards(
         if latest_census_release_batch is not None:
             normalized_source_batches["census-release"] = latest_census_release_batch
     hqm_curve = _curve_rows("hqm-par", ("2y", "5y", "10y", "30y"))
-    sofr_market_metrics = _sofr_market_metrics()
     consumer_metrics: list[dict[str, Any]] = []
     consumer_charts: list[dict[str, Any]] = []
     employment_metrics: list[dict[str, Any]] = []
@@ -13509,26 +18349,6 @@ def publish_official_dashboards(
             ),
         },
         {
-            "key": "fed-balance-sheet",
-            "title": "美联储资产负债表",
-            "summary": "六个核心序列直接解析 Federal Reserve H.4.1 DDP；周三观察、周四发布，保留每次 ZIP 哈希。",
-            "metrics": _existing(
-                _metric("WALCL", "总资产", scale=Decimal("0.000001"), suffix=" USD tn"),
-                _metric("WSHOTSL", "美债持有", scale=Decimal("0.000001"), suffix=" USD tn"),
-                _metric("WSHOMCB", "MBS 持有", scale=Decimal("0.000001"), suffix=" USD tn"),
-                _metric("WRBWFRBL", "准备金", scale=Decimal("0.000001"), suffix=" USD tn"),
-            ),
-            "chart_data": _history_rows(
-                {
-                    "WALCL": "总资产",
-                    "WSHOTSL": "美债",
-                    "WSHOMCB": "MBS",
-                    "WRBWFRBL": "准备金",
-                },
-                limit=104,
-            ),
-        },
-        {
             "key": "operations",
             "title": "公开市场操作",
             "summary": "ON RRP 和常备回购按操作日聚合，常备回购合并早午两场；SOMA 为周三国内证券持仓，不等于 H.4.1 总资产。",
@@ -13706,19 +18526,6 @@ def publish_official_dashboards(
             "chart_data": _history_rows({"FXSWAP-USD-OUTSTANDING": "在途互换"}, limit=120),
         },
         {
-            "key": "subsurface",
-            "title": "次表层资金流",
-            "summary": "SOFR 尾分位、成交量与常备回购取纽约联储底层数据，IORB 取 Federal Reserve PRATES；早午两场按日合并，小额技术测试不解读为压力。",
-            "metrics": _existing(
-                *sofr_market_metrics,
-                _metric("IORB", "IORB", suffix="%", aligned_with=("SOFR",)),
-                _derived_metric("sofr-iorb", "SOFR−IORB", "SOFR", "IORB", basis_points=True),
-                _metric("SRP", "常备回购", decimals=0, suffix=" USD mn"),
-                _metric("SRP-RATE", "常备回购利率", suffix="%"),
-            ),
-            "chart_data": _sofr_market_history(),
-        },
-        {
             "key": "economy",
             "title": "经济数据",
             "summary": (
@@ -13859,17 +18666,29 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                 (
                     "sofr",
                     {"limit": 800},
-                    _store_ny_fed_reference_rate_observations,
+                    _store_subsurface_ny_fed_observations,
                 ),
                 (
                     "effr",
                     {"limit": 800},
                     _store_ny_fed_reference_rate_observations,
                 ),
-                ("reverse_repo_results", {"limit": 120}),
-                ("standing_repo_results", {"limit": 240}),
+                (
+                    "reverse_repo_results",
+                    {"limit": 120},
+                    _store_fed_balance_sheet_component_observations,
+                ),
+                (
+                    "standing_repo_results",
+                    {"limit": 240},
+                    _store_subsurface_ny_fed_observations,
+                ),
                 ("soma_summary", {"limit": 260}),
-                ("usd_fx_swaps", {"limit": 500}),
+                (
+                    "usd_fx_swaps",
+                    {"limit": 500},
+                    _store_subsurface_ny_fed_observations,
+                ),
             ),
         ),
         (
@@ -13895,7 +18714,11 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
         (
             FiscalDataProvider(),
             (
-                ("tga", {"page_size": 400}),
+                (
+                    "tga",
+                    {"page_size": 400},
+                    _store_fed_balance_sheet_component_observations,
+                ),
                 ("treasury_auctions", {"page_size": 1000}, store_treasury_auctions),
             ),
         ),
@@ -14067,6 +18890,16 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     )
     dashboards.extend(liquidity_dashboards)
     stale_dashboard_keys |= stale_liquidity_keys
+    fed_balance_dashboards, stale_fed_balance_keys = (
+        _coordinate_fed_balance_sheet_dashboard(runs)
+    )
+    dashboards.extend(fed_balance_dashboards)
+    stale_dashboard_keys |= stale_fed_balance_keys
+    subsurface_dashboards, stale_subsurface_keys = (
+        _coordinate_subsurface_dashboard(runs)
+    )
+    dashboards.extend(subsurface_dashboards)
+    stale_dashboard_keys |= stale_subsurface_keys
     auction_dashboards, stale_auction_keys = _coordinate_auction_dashboard(
         runs
     )
@@ -14186,10 +19019,8 @@ def refresh_h41_data() -> dict[str, Any]:
         "reserves_refresh_component": "h41",
     }
     run.save(update_fields=["metadata", "updated_at"])
-    dashboards = (
-        publish_official_dashboards(keys=H41_PUBLICATION_KEYS)
-        if _has_publishable_run([run])
-        else []
+    dashboards, stale_fed_balance_keys = (
+        _coordinate_fed_balance_sheet_dashboard([run])
     )
     reserves_dashboards, stale_reserves_keys = (
         _coordinate_reserves_dashboard([run])
@@ -14212,7 +19043,9 @@ def refresh_h41_data() -> dict[str, Any]:
         ],
         "dashboard_keys": [dashboard.key for dashboard in dashboards],
         "stale_dashboard_keys": sorted(
-            stale_reserves_keys | stale_liquidity_keys
+            stale_fed_balance_keys
+            | stale_reserves_keys
+            | stale_liquidity_keys
         ),
     }
 
@@ -14285,6 +19118,10 @@ def refresh_prates_data() -> dict[str, Any]:
         _coordinate_reserves_rate_spreads_dashboard([run])
     )
     dashboards.extend(rate_spread_dashboards)
+    subsurface_dashboards, stale_subsurface_keys = (
+        _coordinate_subsurface_dashboard([run])
+    )
+    dashboards.extend(subsurface_dashboards)
     return {
         "runs": [
             {
@@ -14301,6 +19138,7 @@ def refresh_prates_data() -> dict[str, Any]:
             stale_fed_funds_keys
             | stale_liquidity_keys
             | stale_rate_spread_keys
+            | stale_subsurface_keys
         ),
     }
 

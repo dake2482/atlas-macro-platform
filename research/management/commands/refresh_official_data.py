@@ -21,4 +21,14 @@ class Command(BaseCommand):
             raise CommandError(
                 f"{len(incomplete)} official source refreshes were incomplete; dashboards retained"
             )
+        if "fed-balance-sheet" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but the required fed-balance-sheet "
+                "v1 atomic publication failed"
+            )
+        if "subsurface" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but the required subsurface v1 "
+                "atomic publication failed"
+            )
         self.stdout.write(self.style.SUCCESS("Official source refresh completed"))

@@ -280,7 +280,7 @@ DATA_REQUIREMENTS = [
         "priority": 1,
     },
     {
-        "key": "fed-balance-sheet",
+        "key": "fed-h41-balance-sheet-inputs",
         "page_key": "fed-balance-sheet",
         "metric_name": "美联储总资产、美债、MBS 与准备金",
         "status": LIVE,
@@ -289,6 +289,25 @@ DATA_REQUIREMENTS = [
         "reason": (
             "已流式解析 Federal Reserve H.4.1 DDP 固定 ZIP，保留 Board "
             "series ID、观察状态、原始文件 SHA-256 与每周修订。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "fed-balance-sheet-public-contract",
+        "page_key": "fed-balance-sheet",
+        "metric_name": "资产负债表五指标、历史图与净流动性透明代理",
+        "status": PROXY,
+        "source_name": (
+            "Federal Reserve H.4.1, New York Fed Markets API, "
+            "U.S. Treasury FiscalData and Atlas Macro"
+        ),
+        "source_url": "https://www.federalreserve.gov/releases/h41/",
+        "reason": (
+            "fed-balance-sheet v1 只使用同一 H.4.1 精确批次的 WALCL、"
+            "WSHOTSL、WSHOMCB、WRBWFRBL，以及同一刷新周期的最新 ON RRP "
+            "和 TGA 精确批次；六序列仅在共同非未来周三发布且不做前值填充。"
+            "净流动性按 WALCL − ON RRP − TGA 透明计算，是 Atlas Macro "
+            "代理而非 Federal Reserve 官方指标或 LPI。"
         ),
         "priority": 1,
     },
@@ -1238,13 +1257,93 @@ DATA_REQUIREMENTS = [
         "priority": 1,
     },
     {
-        "key": "sofr-distribution-volume",
+        "key": "subsurface-sofr-official-input",
         "page_key": "subsurface",
-        "metric_name": "SOFR 分位、成交量和尾部融资压力",
+        "metric_name": "SOFR、99P 与成交量官方输入",
         "status": LIVE,
         "source_name": "Federal Reserve Bank of New York Markets API",
         "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
-        "reason": "已发布 SOFR 99P、99P−SOFR、99P−IORB、成交量和历史图，并合并现行常备回购每日两场操作。",
+        "reason": "reference-rate:sofr exact batch 保留原始 JSON 指纹、有效日、99P 与 volumeInBillions。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-iorb-official-input",
+        "page_key": "subsurface",
+        "metric_name": "IORB 官方输入",
+        "status": LIVE,
+        "source_name": "Federal Reserve PRATES DDP",
+        "source_url": "https://www.federalreserve.gov/datadownload/Choose.aspx?rel=PRATES",
+        "reason": "prates:iorb 使用最新成功且最新 attempt 的 ZIP exact batch，并保留 archive hash。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-srf-official-input",
+        "page_key": "subsurface",
+        "metric_name": "Standing Repo 操作与抵押品分项",
+        "status": LIVE,
+        "source_name": "Federal Reserve Bank of New York Standing Repo Results",
+        "source_url": "https://www.newyorkfed.org/markets/repo-agreement-ops-faq.html",
+        "reason": "正常操作与 small-value 技术测试按显式序列和逐场 metadata 分离。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-swaps-official-input",
+        "page_key": "subsurface",
+        "metric_name": "美元央行互换操作",
+        "status": LIVE,
+        "source_name": "Federal Reserve Bank of New York USD Liquidity Swaps",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "保留 settlement、maturity、amount、技术测试标记与 immutable JSON artifact。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-sofr-tail-proxy",
+        "page_key": "subsurface",
+        "metric_name": "SOFR 99P 尾差透明代理",
+        "status": LIVE,
+        "source_name": "Atlas Macro transparent calculation",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "仅计算 100×(99P−SOFR) 与 100×(99P−IORB)，不生成阈值标签。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-volume-z60-proxy",
+        "page_key": "subsurface",
+        "metric_name": "SOFR 成交量 Z60 透明代理",
+        "status": LIVE,
+        "source_name": "Atlas Macro transparent calculation",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "每点使用同一 SOFR exact batch 的 60 个官方观察日和总体标准差。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-srf-swap-proxies",
+        "page_key": "subsurface",
+        "metric_name": "SRF 30D 激活与非测试互换在途代理",
+        "status": LIVE,
+        "source_name": "Atlas Macro transparent calculation over NY Fed operations",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "small-value 技术测试不计入激活天数或非测试在途余额。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-opaque-composite-score",
+        "page_key": "subsurface",
+        "metric_name": "不透明综合资金压力分与状态阈值",
+        "status": NEEDS_SOURCE,
+        "source_name": "Reviewed independent methodology required",
+        "source_url": "https://www.newyorkfed.org/markets/reference-rates/sofr",
+        "reason": "原站综合分与正常/尾部温和阈值不可复算，不反推、不发布。",
+        "priority": 1,
+    },
+    {
+        "key": "subsurface-commercial-repo-microdata",
+        "page_key": "subsurface",
+        "metric_name": "交易商级 repo、haircut、specials 与完整双边/sponsored 市场",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "DTCC / BNY / Bloomberg / LSEG",
+        "product": "Licensed repo microstructure and external-display rights",
+        "reason": "官方免费数据不覆盖交易商账簿、实时 haircut、specials 与完整市场分层。",
         "priority": 1,
     },
     {

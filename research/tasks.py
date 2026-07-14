@@ -74,7 +74,18 @@ def _skip(source: str, dataset: str, reason: str) -> IngestionRun:
 def refresh_official_sources() -> dict[str, Any]:
     """Refresh direct, public-display-safe official sources and dashboards."""
 
-    return refresh_official_data()
+    summary = refresh_official_data()
+    if "fed-balance-sheet" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but the required fed-balance-sheet v1 "
+            "atomic publication failed"
+        )
+    if "subsurface" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but the required subsurface v1 "
+            "atomic publication failed"
+        )
+    return summary
 
 
 @shared_task(name="research.tasks.refresh_h41_sources")
@@ -86,6 +97,11 @@ def refresh_h41_sources() -> dict[str, Any]:
         raise RuntimeError(
             "H.4.1 ingestion completed but the required reserves v1 atomic "
             "publication failed"
+        )
+    if "fed-balance-sheet" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.4.1 ingestion completed but the required fed-balance-sheet v1 "
+            "atomic publication failed"
         )
     return summary
 
@@ -107,7 +123,13 @@ def refresh_h8_sources() -> dict[str, Any]:
 def refresh_prates_sources() -> dict[str, Any]:
     """Refresh daily IORB directly from the Federal Reserve PRATES package."""
 
-    return refresh_prates_data()
+    summary = refresh_prates_data()
+    if "subsurface" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "PRATES ingestion completed but the required subsurface v1 "
+            "atomic publication failed"
+        )
+    return summary
 
 
 @shared_task(name="research.tasks.refresh_h10_sources")

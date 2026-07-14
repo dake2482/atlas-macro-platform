@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import uuid
 from datetime import UTC, date, datetime
@@ -511,9 +512,7 @@ def test_other_policy_pages_align_direct_cards_and_history(monkeypatch):
         "research.official_data.timezone.now", lambda: FIXED_NOW
     )
 
-    dashboards = publish_official_dashboards(
-        keys={"transmission-chain", "subsurface"}
-    )
+    dashboards = publish_official_dashboards(keys={"transmission-chain"})
     pages = {item.key: item.data for item in dashboards}
 
     metrics = {
@@ -525,11 +524,6 @@ def test_other_policy_pages_align_direct_cards_and_history(monkeypatch):
     transmission_rows = pages["transmission-chain"]["charts"][0]["data"]
     assert max(row["date"] for row in transmission_rows) == "2026-07-09"
     assert all({"SOFR", "EFFR", "IORB"} <= set(row) for row in transmission_rows)
-    subsurface = {
-        item["key"]: item for item in pages["subsurface"]["metrics"]
-    }
-    assert subsurface["iorb"]["value_date"].startswith("2026-07-09")
-    assert subsurface["sofr-iorb"]["display_value"] == "-12bp"
 
 
 @pytest.mark.django_db
@@ -754,6 +748,10 @@ def test_refresh_prates_entrypoint_coordinates_fed_funds(monkeypatch):
         "research.official_data._coordinate_liquidity_dashboard",
         lambda runs: ([], set()),
     )
+    monkeypatch.setattr(
+        "research.official_data._coordinate_subsurface_dashboard",
+        lambda runs: ([], set()),
+    )
 
     result = refresh_prates_data()
 
@@ -781,10 +779,17 @@ def test_refresh_official_entrypoint_coordinates_fed_funds(monkeypatch):
     class FakeNYFedProvider:
         def sofr(self, *, limit):
             assert limit == 800
+            raw = b'{"fixture":"sofr"}'
             return ProviderResult(
                 provider="ny-fed-markets",
                 dataset="reference-rate:sofr",
                 records=_market_records("SOFR", history_months=40),
+                raw_bytes=raw,
+                metadata={
+                    "content_type": "application/json",
+                    "byte_length": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                },
             )
 
         def effr(self, *, limit):

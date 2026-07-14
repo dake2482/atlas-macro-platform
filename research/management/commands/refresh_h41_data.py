@@ -31,4 +31,9 @@ class Command(BaseCommand):
             raise CommandError(
                 "H.4.1 ingestion succeeded but reserves v1 atomic publication failed"
             )
+        if "fed-balance-sheet" in summary.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "H.4.1 ingestion succeeded but fed-balance-sheet v1 atomic "
+                "publication failed"
+            )
         self.stdout.write(self.style.SUCCESS("H.4.1 refresh completed"))

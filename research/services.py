@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import tempfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -1107,6 +1112,36 @@ SERIES_CATALOG = {
     "SRP-AGENCY": ("Standing Repo Agency Collateral", "USD millions", "daily"),
     "SRP-MBS": ("Standing Repo MBS Collateral", "USD millions", "daily"),
     "SRP-RATE": ("Standing Repo Offering Rate", "%", "daily"),
+    "SRP-NON-SMALL-VALUE-TOTAL": (
+        "Standing Repo Non-Small-Value Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
+    "SRP-SMALL-VALUE-TOTAL": (
+        "Standing Repo Small-Value Exercise Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
+    "SRP-NON-SMALL-VALUE-TREASURY": (
+        "Standing Repo Non-Small-Value Treasury Collateral",
+        "USD millions",
+        "daily",
+    ),
+    "SRP-NON-SMALL-VALUE-AGENCY": (
+        "Standing Repo Non-Small-Value Agency Collateral",
+        "USD millions",
+        "daily",
+    ),
+    "SRP-NON-SMALL-VALUE-MBS": (
+        "Standing Repo Non-Small-Value MBS Collateral",
+        "USD millions",
+        "daily",
+    ),
+    "SRP-NON-SMALL-VALUE-RATE": (
+        "Standing Repo Non-Small-Value Offering Rate",
+        "%",
+        "daily",
+    ),
     "SOMA-TOTAL": ("SOMA Domestic Securities Total", "USD millions", "weekly"),
     "SOMA-BILLS": ("SOMA Treasury Bills", "USD millions", "weekly"),
     "SOMA-NOTES-BONDS": ("SOMA Treasury Notes and Bonds", "USD millions", "weekly"),
@@ -1121,8 +1156,23 @@ SERIES_CATALOG = {
     "SOMA-CMBS": ("SOMA Agency CMBS", "USD millions", "weekly"),
     "SOMA-AGENCIES": ("SOMA Agency Debt", "USD millions", "weekly"),
     "FXSWAP-USD-DRAWDOWN": ("USD Liquidity Swap Drawdowns", "USD millions", "daily"),
+    "FXSWAP-USD-DRAWDOWN-NON-SMALL-VALUE": (
+        "USD Liquidity Swap Non-Small-Value Drawdowns",
+        "USD millions",
+        "daily",
+    ),
+    "FXSWAP-USD-DRAWDOWN-SMALL-VALUE": (
+        "USD Liquidity Swap Small-Value Drawdowns",
+        "USD millions",
+        "daily",
+    ),
     "FXSWAP-USD-OUTSTANDING": (
         "USD Liquidity Swaps Outstanding",
+        "USD millions",
+        "daily",
+    ),
+    "FXSWAP-USD-OUTSTANDING-NON-SMALL-VALUE": (
+        "USD Liquidity Swaps Non-Small-Value Outstanding",
         "USD millions",
         "daily",
     ),
@@ -1697,6 +1747,85 @@ def store_raw_artifact(
         content_type=content_type,
         size_bytes=len(content),
     )
+
+
+def persist_private_raw_artifact(
+    *,
+    run: IngestionRun,
+    result: ProviderResult,
+    namespace: str | None = None,
+) -> RawArtifact:
+    """Persist exact provider bytes under a private content-addressed URI.
+
+    The file is published with an atomic hard-link from a fully flushed
+    temporary file.  Existing content is byte-checked before reuse, so even a
+    theoretical digest collision cannot silently replace retained evidence.
+    A database failure deliberately leaves the immutable bytes for a later,
+    separately locked garbage-collection pass.
+    """
+
+    if not isinstance(result.raw_bytes, (bytes, bytearray)) or not result.raw_bytes:
+        raise ValueError("raw artifact requires non-empty exact response bytes")
+    payload = bytes(result.raw_bytes)
+    digest = hashlib.sha256(payload).hexdigest()
+    metadata = result.metadata
+
+    if "byte_length" in metadata:
+        try:
+            declared_length = int(metadata["byte_length"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("provider byte_length metadata is invalid") from exc
+        if declared_length != len(payload):
+            raise ValueError("provider byte_length does not match raw response bytes")
+    if "sha256" in metadata and str(metadata["sha256"]).lower() != digest:
+        raise ValueError("provider sha256 does not match raw response bytes")
+
+    artifact_namespace = str(namespace or result.provider or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", artifact_namespace):
+        raise ValueError("raw artifact namespace is invalid")
+    content_type = str(metadata.get("content_type") or "application/octet-stream")
+    if len(content_type) > RawArtifact._meta.get_field("content_type").max_length:
+        raise ValueError("raw artifact content_type is too long")
+
+    root = Path(
+        getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts")
+    )
+    target = root / digest[:2] / f"{digest}.bin"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if target.exists():
+        if target.read_bytes() != payload:
+            raise ValueError("existing content-addressed artifact bytes do not match digest")
+    else:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{digest}.", dir=target.parent
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary_name, target)
+            except FileExistsError:
+                if target.read_bytes() != payload:
+                    raise ValueError(
+                        "existing content-addressed artifact bytes do not match digest"
+                    )
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
+
+    with transaction.atomic():
+        return RawArtifact.objects.create(
+            run=run,
+            uri=(
+                f"private://{artifact_namespace}/{digest[:2]}/{digest}.bin"
+            ),
+            sha256=digest,
+            content_type=content_type,
+            size_bytes=len(payload),
+        )
 
 
 def latest_observation(

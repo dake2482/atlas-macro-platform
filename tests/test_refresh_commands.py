@@ -7,6 +7,8 @@ import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
+from research.tasks import refresh_official_sources, refresh_prates_sources
+
 
 @pytest.mark.parametrize(
     ("command_name", "target", "summary", "message"),
@@ -274,3 +276,129 @@ def test_refresh_h41_command_fails_when_atomic_reserves_publication_is_stale():
             call_command(
                 "refresh_h41_data", stdout=StringIO(), stderr=StringIO()
             )
+
+
+def test_refresh_h41_command_fails_when_atomic_balance_sheet_publication_is_stale():
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "h41",
+                "status": "success",
+                "row_count": 1234,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": ["reserves"],
+        "stale_dashboard_keys": ["fed-balance-sheet"],
+    }
+    with patch(
+        "research.management.commands.refresh_h41_data.refresh_h41_data",
+        return_value=summary,
+    ):
+        with pytest.raises(
+            CommandError, match="fed-balance-sheet v1 atomic publication failed"
+        ):
+            call_command(
+                "refresh_h41_data", stdout=StringIO(), stderr=StringIO()
+            )
+
+
+def test_main_official_command_and_task_fail_when_balance_sheet_is_stale(
+    monkeypatch,
+):
+    summary = {
+        "runs": [
+            {
+                "source": "treasury-fiscal-data",
+                "dataset": "daily-treasury-statement:tga",
+                "status": "success",
+                "row_count": 20,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["fed-balance-sheet"],
+    }
+    with patch(
+        "research.management.commands.refresh_official_data.refresh_official_data",
+        return_value=summary,
+    ):
+        with pytest.raises(
+            CommandError, match="fed-balance-sheet v1 atomic publication failed"
+        ):
+            call_command(
+                "refresh_official_data", stdout=StringIO(), stderr=StringIO()
+            )
+
+    monkeypatch.setattr("research.tasks.refresh_official_data", lambda: summary)
+    with pytest.raises(
+        RuntimeError, match="fed-balance-sheet v1 atomic publication failed"
+    ):
+        refresh_official_sources.run()
+
+
+def test_main_official_command_and_task_fail_when_subsurface_is_stale(
+    monkeypatch,
+):
+    summary = {
+        "runs": [
+            {
+                "source": "ny-fed-markets",
+                "dataset": "reference-rate:sofr",
+                "status": "success",
+                "row_count": 65,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["subsurface"],
+    }
+    with patch(
+        "research.management.commands.refresh_official_data.refresh_official_data",
+        return_value=summary,
+    ):
+        with pytest.raises(
+            CommandError, match="subsurface v1 atomic publication failed"
+        ):
+            call_command(
+                "refresh_official_data", stdout=StringIO(), stderr=StringIO()
+            )
+
+    monkeypatch.setattr("research.tasks.refresh_official_data", lambda: summary)
+    with pytest.raises(
+        RuntimeError, match="subsurface v1 atomic publication failed"
+    ):
+        refresh_official_sources.run()
+
+
+def test_prates_command_and_task_fail_when_subsurface_is_stale(monkeypatch):
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "prates:iorb",
+                "status": "success",
+                "row_count": 65,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["subsurface"],
+    }
+    with patch(
+        "research.management.commands.refresh_prates_data.refresh_prates_data",
+        return_value=summary,
+    ):
+        with pytest.raises(
+            CommandError, match="subsurface v1 atomic publication failed"
+        ):
+            call_command(
+                "refresh_prates_data", stdout=StringIO(), stderr=StringIO()
+            )
+
+    monkeypatch.setattr("research.tasks.refresh_prates_data", lambda: summary)
+    with pytest.raises(
+        RuntimeError, match="subsurface v1 atomic publication failed"
+    ):
+        refresh_prates_sources.run()

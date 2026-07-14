@@ -24,4 +24,9 @@ class Command(BaseCommand):
         )
         if run["status"] != "success":
             raise CommandError(run["error"] or "PRATES refresh incomplete; dashboards retained")
+        if "subsurface" in summary.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "PRATES ingestion completed but the required subsurface v1 "
+                "atomic publication failed"
+            )
         self.stdout.write(self.style.SUCCESS("PRATES IORB refresh completed"))

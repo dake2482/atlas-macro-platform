@@ -105,6 +105,45 @@ class HTTPProvider:
         except (httpx.HTTPError, ValueError) as exc:
             return None, ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
 
+    def _get_json_with_raw(
+        self,
+        dataset: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[Any | None, bytes | None, dict[str, Any], ProviderResult | None]:
+        """Decode JSON while retaining the exact HTTP response bytes.
+
+        Raw retention is deliberately opt-in so existing providers keep their
+        current memory and persistence behavior.  The returned metadata binds
+        the decoded payload to the exact response that was validated.
+        """
+
+        try:
+            response = self.client.get(path, params=params, headers=headers)
+            response.raise_for_status()
+            raw_bytes = bytes(response.content)
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return (
+                None,
+                None,
+                {},
+                ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}"),
+            )
+        return (
+            payload,
+            raw_bytes,
+            {
+                "endpoint": str(response.url),
+                "content_type": response.headers.get("content-type", ""),
+                "byte_length": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            },
+            None,
+        )
+
     def _post_json(
         self,
         dataset: str,
@@ -278,6 +317,7 @@ class NYFedMarketsProvider(HTTPProvider):
             "term",
             "releaseTime",
             "closeTime",
+            "isSmallValue",
             "note",
             "lastUpdated",
             "totalAmtSubmitted",
@@ -298,19 +338,33 @@ class NYFedMarketsProvider(HTTPProvider):
         dataset: str,
         records: list[dict[str, Any]],
         endpoint: str,
+        raw_bytes: bytes | None = None,
+        response_metadata: Mapping[str, Any] | None = None,
         **metadata: Any,
     ) -> ProviderResult:
         return ProviderResult(
             provider=self.key,
             dataset=dataset,
             records=records,
+            raw_bytes=raw_bytes,
             metadata={
                 "attribution": self.attribution,
                 "terms_url": self.terms_url,
                 "endpoint": endpoint,
+                **dict(response_metadata or {}),
                 **metadata,
             },
         )
+
+    @staticmethod
+    def _is_small_value_operation(item: Mapping[str, Any]) -> bool:
+        """Identify technical exercises without classifying regular operations."""
+
+        explicit = str(item.get("isSmallValue") or "").strip().upper()
+        if explicit in {"1", "TRUE", "Y", "YES"}:
+            return True
+        note = re.sub(r"[-_]+", " ", str(item.get("note") or "").lower())
+        return "small value" in note and ("exercise" in note or "test" in note)
 
     def reference_rate(self, rate_type: str, *, limit: int = 120) -> ProviderResult:
         rate_type = rate_type.upper()
@@ -320,7 +374,7 @@ class NYFedMarketsProvider(HTTPProvider):
         if group is None:
             return ProviderResult.failure(self.key, dataset, f"unsupported rate: {rate_type}")
         endpoint = f"/api/rates/{group}/{rate_type.lower()}/last/{limit}.json"
-        payload, failure = self._get_json(
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
             dataset,
             endpoint,
         )
@@ -375,10 +429,11 @@ class NYFedMarketsProvider(HTTPProvider):
             provider=self.key,
             dataset=dataset,
             records=records,
+            raw_bytes=raw_bytes,
             metadata={
                 "attribution": self.attribution,
                 "terms_url": self.terms_url,
-                "endpoint": endpoint,
+                **response_metadata,
             },
         )
 
@@ -522,7 +577,9 @@ class NYFedMarketsProvider(HTTPProvider):
         limit = max(1, min(int(limit), 10000))
         dataset = "repo:standing-repo-full-allotment-results"
         endpoint = f"/api/rp/repo/allotment/results/last/{limit}.json"
-        payload, failure = self._get_json(dataset, endpoint)
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
+            dataset, endpoint
+        )
         if failure:
             return failure
         operations = (payload or {}).get("repo", {}).get("operations", [])
@@ -540,19 +597,31 @@ class NYFedMarketsProvider(HTTPProvider):
             "Agency": "SRP-AGENCY",
             "Mortgage-Backed": "SRP-MBS",
         }
+        non_small_value_security_series = {
+            "Treasury": "SRP-NON-SMALL-VALUE-TREASURY",
+            "Agency": "SRP-NON-SMALL-VALUE-AGENCY",
+            "Mortgage-Backed": "SRP-NON-SMALL-VALUE-MBS",
+        }
         records: list[dict[str, Any]] = []
         for operation_date, daily_operations in by_date.items():
+            small_value_operations = [
+                item for item in daily_operations if self._is_small_value_operation(item)
+            ]
+            non_small_value_operations = [
+                item for item in daily_operations if not self._is_small_value_operation(item)
+            ]
             total = sum(
                 (self._usd_millions(item.get("totalAmtAccepted")) or Decimal("0"))
                 for item in daily_operations
             )
             source_operations = [self._operation_metadata(item) for item in daily_operations]
-            note_text = " ".join(str(item.get("note") or "") for item in daily_operations)
             metadata = {
                 "unit": "USD millions",
                 "operation_count": len(daily_operations),
                 "operations": source_operations,
-                "has_small_value_exercise": "small value exercise" in note_text.lower(),
+                "has_small_value_exercise": bool(small_value_operations),
+                "non_small_value_operation_count": len(non_small_value_operations),
+                "small_value_operation_count": len(small_value_operations),
             }
             records.append(
                 {
@@ -563,7 +632,53 @@ class NYFedMarketsProvider(HTTPProvider):
                 }
             )
 
+            non_small_value_total = sum(
+                (self._usd_millions(item.get("totalAmtAccepted")) or Decimal("0"))
+                for item in non_small_value_operations
+            )
+            small_value_total = sum(
+                (self._usd_millions(item.get("totalAmtAccepted")) or Decimal("0"))
+                for item in small_value_operations
+            )
+            non_small_value_metadata = {
+                **metadata,
+                "operation_count": len(non_small_value_operations),
+                "operations": [
+                    self._operation_metadata(item) for item in non_small_value_operations
+                ],
+                "small_value_excluded": True,
+                "classification": "non-small-value",
+            }
+            small_value_metadata = {
+                **metadata,
+                "operation_count": len(small_value_operations),
+                "operations": [
+                    self._operation_metadata(item) for item in small_value_operations
+                ],
+                "small_value_only": True,
+                "classification": "small-value-technical-exercise",
+            }
+            records.extend(
+                [
+                    {
+                        "series_id": "SRP-NON-SMALL-VALUE-TOTAL",
+                        "date": operation_date,
+                        "value": non_small_value_total,
+                        "metadata": non_small_value_metadata,
+                    },
+                    {
+                        "series_id": "SRP-SMALL-VALUE-TOTAL",
+                        "date": operation_date,
+                        "value": small_value_total,
+                        "metadata": small_value_metadata,
+                    },
+                ]
+            )
+
             collateral_totals = {name: Decimal("0") for name in security_series}
+            non_small_value_collateral_totals = {
+                name: Decimal("0") for name in non_small_value_security_series
+            }
             rates: list[Decimal] = []
             for item in daily_operations:
                 for detail in item.get("details") or []:
@@ -581,6 +696,23 @@ class NYFedMarketsProvider(HTTPProvider):
                     )
                     if rate is not None:
                         rates.append(rate)
+            non_small_value_rates: list[Decimal] = []
+            for item in non_small_value_operations:
+                for detail in item.get("details") or []:
+                    if not isinstance(detail, Mapping):
+                        continue
+                    security_type = str(detail.get("securityType") or "")
+                    if security_type in non_small_value_collateral_totals:
+                        non_small_value_collateral_totals[
+                            security_type
+                        ] += self._usd_millions(detail.get("amtAccepted")) or Decimal("0")
+                    rate = _decimal_or_none(
+                        detail.get("percentOfferingRate")
+                        if detail.get("percentOfferingRate") is not None
+                        else detail.get("minimumBidRate")
+                    )
+                    if rate is not None:
+                        non_small_value_rates.append(rate)
             for security_type, series_id in security_series.items():
                 records.append(
                     {
@@ -588,6 +720,18 @@ class NYFedMarketsProvider(HTTPProvider):
                         "date": operation_date,
                         "value": collateral_totals[security_type],
                         "metadata": {**metadata, "security_type": security_type},
+                    }
+                )
+            for security_type, series_id in non_small_value_security_series.items():
+                records.append(
+                    {
+                        "series_id": series_id,
+                        "date": operation_date,
+                        "value": non_small_value_collateral_totals[security_type],
+                        "metadata": {
+                            **non_small_value_metadata,
+                            "security_type": security_type,
+                        },
                     }
                 )
             if rates:
@@ -603,12 +747,32 @@ class NYFedMarketsProvider(HTTPProvider):
                         },
                     }
                 )
+            if non_small_value_rates:
+                records.append(
+                    {
+                        "series_id": "SRP-NON-SMALL-VALUE-RATE",
+                        "date": operation_date,
+                        "value": non_small_value_rates[0],
+                        "metadata": {
+                            **non_small_value_metadata,
+                            "unit": "%",
+                            "reported_rates": [
+                                str(rate) for rate in sorted(set(non_small_value_rates))
+                            ],
+                        },
+                    }
+                )
         return self._desk_result(
             dataset=dataset,
             records=records,
             endpoint=endpoint,
+            raw_bytes=raw_bytes,
+            response_metadata=response_metadata,
             amount_unit="USD millions",
             aggregation="sum of all operation windows by operationDate",
+            non_small_value_classification=(
+                "explicit affirmative isSmallValue or note containing small-value exercise/test"
+            ),
         )
 
     def soma_summary(self, *, limit: int | None = None) -> ProviderResult:
@@ -680,7 +844,9 @@ class NYFedMarketsProvider(HTTPProvider):
             except ValueError as exc:
                 return ProviderResult.failure(self.key, dataset, f"invalid as_of date: {exc}")
 
-        payload, failure = self._get_json(dataset, endpoint)
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
+            dataset, endpoint
+        )
         if failure:
             return failure
         operations = (payload or {}).get("fxSwaps", {}).get("operations", [])
@@ -709,7 +875,7 @@ class NYFedMarketsProvider(HTTPProvider):
                     "counterparty_code": self._counterparty_code(counterparty),
                     "settlement_date": settlement_date,
                     "maturity_date": maturity_date,
-                    "is_small_value": str(item.get("isSmallValue") or "").upper() == "Y",
+                    "is_small_value": self._is_small_value_operation(item),
                     "source": dict(item),
                 }
             )
@@ -719,6 +885,12 @@ class NYFedMarketsProvider(HTTPProvider):
         for item in parsed:
             by_settlement.setdefault(item["settlement_date"], []).append(item)
         for settlement_date, daily_operations in by_settlement.items():
+            non_small_value_operations = [
+                item for item in daily_operations if not item["is_small_value"]
+            ]
+            small_value_operations = [
+                item for item in daily_operations if item["is_small_value"]
+            ]
             records.append(
                 {
                     "series_id": "FXSWAP-USD-DRAWDOWN",
@@ -729,6 +901,40 @@ class NYFedMarketsProvider(HTTPProvider):
                         "operations": [item["source"] for item in daily_operations],
                     },
                 }
+            )
+            records.extend(
+                [
+                    {
+                        "series_id": "FXSWAP-USD-DRAWDOWN-NON-SMALL-VALUE",
+                        "date": settlement_date.isoformat(),
+                        "value": sum(
+                            (item["amount"] for item in non_small_value_operations),
+                            Decimal("0"),
+                        ),
+                        "metadata": {
+                            "unit": "USD millions",
+                            "operations": [
+                                item["source"] for item in non_small_value_operations
+                            ],
+                            "small_value_excluded": True,
+                            "classification": "non-small-value",
+                        },
+                    },
+                    {
+                        "series_id": "FXSWAP-USD-DRAWDOWN-SMALL-VALUE",
+                        "date": settlement_date.isoformat(),
+                        "value": sum(
+                            (item["amount"] for item in small_value_operations),
+                            Decimal("0"),
+                        ),
+                        "metadata": {
+                            "unit": "USD millions",
+                            "operations": [item["source"] for item in small_value_operations],
+                            "small_value_only": True,
+                            "classification": "small-value-technical-exercise",
+                        },
+                    },
+                ]
             )
 
         active = [
@@ -750,12 +956,29 @@ class NYFedMarketsProvider(HTTPProvider):
             }
         )
         small_value = [item for item in active if item["is_small_value"]]
+        non_small_value = [item for item in active if not item["is_small_value"]]
+        records.append(
+            {
+                "series_id": "FXSWAP-USD-OUTSTANDING-NON-SMALL-VALUE",
+                "date": as_of_date.isoformat(),
+                "value": sum((item["amount"] for item in non_small_value), Decimal("0")),
+                "metadata": {
+                    **common_metadata,
+                    "active_operations": [item["source"] for item in non_small_value],
+                    "small_value_excluded": True,
+                },
+            }
+        )
         records.append(
             {
                 "series_id": "FXSWAP-USD-OUTSTANDING-SMALL-VALUE",
                 "date": as_of_date.isoformat(),
                 "value": sum((item["amount"] for item in small_value), Decimal("0")),
-                "metadata": {**common_metadata, "small_value_only": True},
+                "metadata": {
+                    **common_metadata,
+                    "active_operations": [item["source"] for item in small_value],
+                    "small_value_only": True,
+                },
             }
         )
         by_counterparty: dict[str, list[dict[str, Any]]] = {}
@@ -779,6 +1002,8 @@ class NYFedMarketsProvider(HTTPProvider):
             dataset=dataset,
             records=records,
             endpoint=endpoint,
+            raw_bytes=raw_bytes,
+            response_metadata=response_metadata,
             amount_unit="USD millions",
             outstanding_as_of=as_of_date.isoformat(),
         )

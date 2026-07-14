@@ -9,7 +9,7 @@ import pytest
 from django.db import transaction
 
 from research.fed_h41 import H41_TARGET_SERIES, FederalReserveH41Provider
-from research.models import Observation, RawArtifact
+from research.models import DashboardSnapshot, Observation, RawArtifact
 from research.official_data import _store_h41_observations, publish_official_dashboards
 from research.services import begin_ingestion, record_provider_result
 from research.tasks import refresh_h41_sources
@@ -305,6 +305,20 @@ def test_h41_task_raises_when_required_reserves_publication_is_stale(monkeypatch
         refresh_h41_sources.run()
 
 
+def test_h41_task_raises_when_required_balance_sheet_publication_is_stale(
+    monkeypatch,
+):
+    summary = {
+        "runs": [{"source": "federal-reserve", "dataset": "h41"}],
+        "dashboard_keys": ["reserves"],
+        "stale_dashboard_keys": ["fed-balance-sheet"],
+    }
+    monkeypatch.setattr("research.tasks.refresh_h41_data", lambda: summary)
+
+    with pytest.raises(RuntimeError, match="required fed-balance-sheet v1"):
+        refresh_h41_sources.run()
+
+
 @pytest.mark.django_db
 def test_h41_superseded_run_cannot_clobber_newer_persisted_batch():
     old_result = FederalReserveH41Provider(
@@ -430,7 +444,7 @@ def test_h41_persistence_rejects_stalled_reserves_when_walcl_is_current():
 
 
 @pytest.mark.django_db
-def test_h41_ingestion_persists_fingerprint_and_publishes_balance_sheet():
+def test_h41_ingestion_persists_fingerprint_but_generic_publisher_cannot_bypass():
     provider = FederalReserveH41Provider(client=_client(_archive(_fixture_xml())))
     result = provider.h41()
 
@@ -449,7 +463,5 @@ def test_h41_ingestion_persists_fingerprint_and_publishes_balance_sheet():
         "2026-07-09T12:16:12+00:00"
     )
     assert observation.metadata["release_freshness_days"] == 8
-    balance_sheet = next(item for item in dashboards if item.key == "fed-balance-sheet")
-    metrics = {item["key"]: item for item in balance_sheet.data["metrics"]}
-    assert metrics["walcl"]["display_value"] == "6.74 USD tn"
-    assert metrics["wrbwfrbl"]["source_key"] == "federal-reserve"
+    assert all(item.key != "fed-balance-sheet" for item in dashboards)
+    assert not DashboardSnapshot.objects.filter(key="fed-balance-sheet").exists()

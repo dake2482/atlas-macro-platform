@@ -51,8 +51,10 @@ from .models import (
     Thesis,
 )
 from .official_data import (
+    select_public_fed_balance_sheet_snapshot,
     select_public_reserves_rate_spreads_snapshot,
     select_public_reserves_snapshot,
+    select_public_subsurface_snapshot,
 )
 from .page_registry import get_page_config
 from .public_ai_contract import is_pending_ai_company_contract_slug
@@ -1046,6 +1048,32 @@ def dashboard_page(request, page_key: str):
         snapshot = select_public_supply_chain_demand_snapshot(snapshot_candidates[:50])
         if snapshot is not None:
             snapshot_source_keys = {"sec"}
+    elif snapshot_key == "fed-balance-sheet":
+        for candidate in snapshot_candidates[:50]:
+            candidate_failure = (candidate.data or {}).get("refresh_failure")
+            if blocked_refresh_failure is None and isinstance(
+                candidate_failure, dict
+            ):
+                blocked_refresh_failure = candidate_failure
+        snapshot = select_public_fed_balance_sheet_snapshot(
+            snapshot_candidates[:50]
+        )
+        if snapshot is not None:
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "subsurface":
+        for candidate in snapshot_candidates[:50]:
+            candidate_failure = (candidate.data or {}).get("refresh_failure")
+            if blocked_refresh_failure is None and isinstance(
+                candidate_failure, dict
+            ):
+                blocked_refresh_failure = candidate_failure
+        snapshot = select_public_subsurface_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
     elif snapshot_key == "reserves":
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")

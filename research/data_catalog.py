@@ -1157,11 +1157,72 @@ DATA_REQUIREMENTS = [
     {
         "key": "fed-reserve-balances",
         "page_key": "reserves",
-        "metric_name": "准备金余额、占银行资产比例与充裕度",
+        "metric_name": "H.4.1 准备金余额",
         "status": LIVE,
         "source_name": "Federal Reserve H.4.1 Data Download Program",
-        "source_url": "https://www.federalreserve.gov/datadownload/Choose.aspx?rel=H41",
-        "reason": "已直接规范化 H.4.1 Board series RESH4R_N.WW；银行资产占比及充裕度阈值仍待单独方法。",
+        "source_url": "https://www.federalreserve.gov/releases/h41/",
+        "reason": (
+            "已直接流式规范化 Board series RESH4R_N.WW / "
+            "WRBWFRBL，保留观察状态、精确批次和 ZIP SHA-256。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "fed-h8-commercial-bank-assets",
+        "page_key": "reserves",
+        "metric_name": "H.8 美国商业银行总资产",
+        "status": LIVE,
+        "source_name": "Federal Reserve H.8 Data Download Program",
+        "source_url": "https://www.federalreserve.gov/releases/h8/current/default.htm",
+        "reason": (
+            "已直接流式规范化季调 Board series B1151NCBA，"
+            "保留单位、状态、原始值、精确批次和 ZIP SHA-256。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "reserves-coverage-proxy",
+        "page_key": "reserves",
+        "metric_name": "准备金 / 商业银行资产覆盖近似与 8 周统计",
+        "status": LIVE,
+        "source_name": "Federal Reserve H.4.1 and H.8",
+        "source_url": "https://www.federalreserve.gov/releases/h8/current/default.htm",
+        "reason": (
+            "只在 WRBWFRBL 与 B1151NCBA 的最新非未来共同周三"
+            "发布，双 exact batch 可复算。分子与分母机构宇宙"
+            "不同，因此只是 coverage proxy，不是 Fed 官方指标。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "reserves-like-for-like-adequacy-method",
+        "page_key": "reserves",
+        "metric_name": "严格同口径的准备金充裕度/稀缺阈值方法",
+        "status": NEEDS_SOURCE,
+        "source_name": "Reviewed Federal Reserve H.4.1/H.8 methodology and like-for-like inputs",
+        "source_url": "https://www.federalreserve.gov/releases/h41/",
+        "reason": (
+            "当前 coverage proxy 的分子覆盖所有存款机构，分母仅覆盖"
+            "美国商业银行，不得用作监管资本、LCR 或严格同口径"
+            "结论；阈值与方法未经独立审核前保持未接入。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "reserves-sofr-tbill-spreads",
+        "page_key": "reserves",
+        "metric_name": "SOFR、3M Treasury、SOFR−3M 与 SOFR−IORB 历史",
+        "status": NEEDS_SOURCE,
+        "source_name": (
+            "NY Fed SOFR + Federal Reserve PRATES IORB + "
+            "U.S. Treasury 3M par yield"
+        ),
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": (
+            "上游官方源已知，但尚未纳入 reserves v1 双源原子合同；"
+            "下一批需绑定各自 exact batches、共同日期与完整 lineage，"
+            "未完成前不标记 LIVE。"
+        ),
         "priority": 1,
     },
     {

@@ -48,6 +48,23 @@ from django.core.management.base import CommandError
             "upstream archive unavailable",
         ),
         (
+            "refresh_h8_data",
+            "research.management.commands.refresh_h8_data.refresh_h8_data",
+            {
+                "runs": [
+                    {
+                        "source": "federal-reserve",
+                        "dataset": "h8",
+                        "status": "failed",
+                        "row_count": 0,
+                        "error": "H.8 archive unavailable",
+                    }
+                ],
+                "dashboard_keys": [],
+            },
+            "H.8 archive unavailable",
+        ),
+        (
             "refresh_prates_data",
             "research.management.commands.refresh_prates_data.refresh_prates_data",
             {
@@ -180,3 +197,80 @@ def test_refresh_commands_raise_command_error_for_real_failures(
 def test_optional_credential_partial_refreshes_keep_zero_exit_code(command_name, target, summary):
     with patch(target, return_value=summary):
         call_command(command_name, stdout=StringIO(), stderr=StringIO())
+
+
+def test_refresh_h8_command_reports_source_dataset_rows_and_dashboard_keys():
+    output = StringIO()
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "h8",
+                "status": "success",
+                "row_count": 1234,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": ["reserves"],
+        "stale_dashboard_keys": [],
+    }
+    with patch(
+        "research.management.commands.refresh_h8_data.refresh_h8_data",
+        return_value=summary,
+    ):
+        call_command("refresh_h8_data", stdout=output, stderr=StringIO())
+
+    rendered = output.getvalue()
+    assert "federal-reserve" in rendered
+    assert "'dataset': 'h8'" in rendered
+    assert "'row_count': 1234" in rendered
+    assert "'dashboard_keys': ['reserves']" in rendered
+    assert "H.8 refresh completed" in rendered
+
+
+def test_refresh_h8_command_fails_when_atomic_reserves_publication_is_stale():
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "h8",
+                "status": "success",
+                "row_count": 1234,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["reserves"],
+    }
+    with patch(
+        "research.management.commands.refresh_h8_data.refresh_h8_data",
+        return_value=summary,
+    ):
+        with pytest.raises(CommandError, match="atomic publication failed"):
+            call_command(
+                "refresh_h8_data", stdout=StringIO(), stderr=StringIO()
+            )
+
+
+def test_refresh_h41_command_fails_when_atomic_reserves_publication_is_stale():
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "h41",
+                "status": "success",
+                "row_count": 1234,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": ["fed-balance-sheet"],
+        "stale_dashboard_keys": ["reserves"],
+    }
+    with patch(
+        "research.management.commands.refresh_h41_data.refresh_h41_data",
+        return_value=summary,
+    ):
+        with pytest.raises(CommandError, match="atomic publication failed"):
+            call_command(
+                "refresh_h41_data", stdout=StringIO(), stderr=StringIO()
+            )

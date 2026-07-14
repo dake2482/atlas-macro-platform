@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from django.core.management.base import BaseCommand, CommandError
 
-from research.official_data import refresh_h41_data
+from research.official_data import refresh_h8_data
 
 
 class Command(BaseCommand):
-    help = "Refresh the Federal Reserve H.4.1 balance-sheet package and dashboards."
+    help = "Refresh Federal Reserve H.8 commercial-bank assets and reserves v1."
 
     def handle(self, *args, **options):
-        summary = refresh_h41_data()
+        summary = refresh_h8_data()
         run = summary["runs"][0]
         self.stdout.write(
             str(
@@ -26,9 +26,11 @@ class Command(BaseCommand):
             )
         )
         if run["status"] != "success":
-            raise CommandError(run["error"] or "H.4.1 refresh incomplete; dashboards retained")
+            raise CommandError(
+                run["error"] or "H.8 refresh incomplete; reserves v1 retained"
+            )
         if "reserves" in summary.get("stale_dashboard_keys", []):
             raise CommandError(
-                "H.4.1 ingestion succeeded but reserves v1 atomic publication failed"
+                "H.8 ingestion succeeded but reserves v1 atomic publication failed"
             )
-        self.stdout.write(self.style.SUCCESS("H.4.1 refresh completed"))
+        self.stdout.write(self.style.SUCCESS("H.8 refresh completed"))

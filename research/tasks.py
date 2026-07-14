@@ -19,6 +19,7 @@ from .models import (
 )
 from .official_data import (
     refresh_credit_official_data,
+    refresh_h8_data,
     refresh_h10_data,
     refresh_h41_data,
     refresh_macro_official_data,
@@ -80,7 +81,26 @@ def refresh_official_sources() -> dict[str, Any]:
 def refresh_h41_sources() -> dict[str, Any]:
     """Refresh the weekly Federal Reserve H.4.1 DDP archive."""
 
-    return refresh_h41_data()
+    summary = refresh_h41_data()
+    if "reserves" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.4.1 ingestion completed but the required reserves v1 atomic "
+            "publication failed"
+        )
+    return summary
+
+
+@shared_task(name="research.tasks.refresh_h8_sources")
+def refresh_h8_sources() -> dict[str, Any]:
+    """Refresh weekly Federal Reserve H.8 commercial-bank assets."""
+
+    summary = refresh_h8_data()
+    if "reserves" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.8 ingestion completed but the required reserves v1 atomic "
+            "publication failed"
+        )
+    return summary
 
 
 @shared_task(name="research.tasks.refresh_prates_sources")

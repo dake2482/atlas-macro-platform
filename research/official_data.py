@@ -25,8 +25,20 @@ from django.utils import timezone
 from .calculations import yield_spread
 from .consumer_credit import FederalReserveG19Provider, NYFedHouseholdDebtProvider
 from .credit_official import FederalReserveSLOOSProvider, TreasuryHQMProvider
+from .fed_h8 import (
+    H8_RELEASE_FRESHNESS_DAYS,
+    H8_RELEASE_FUTURE_TOLERANCE,
+    FederalReserveH8Provider,
+    validate_h8_release_time,
+)
 from .fed_h10 import FederalReserveH10Provider
-from .fed_h41 import FederalReserveH41Provider
+from .fed_h41 import (
+    H41_MAX_RELEASE_LAG_DAYS,
+    H41_RELEASE_FRESHNESS_DAYS,
+    H41_RELEASE_FUTURE_TOLERANCE,
+    FederalReserveH41Provider,
+    validate_h41_release_time,
+)
 from .fed_prates import FederalReservePRATESProvider
 from .labor_official import (
     CONTINUED_4WK,
@@ -188,7 +200,7 @@ YIELD_CURVE_REQUIRED_METRIC_KEYS = frozenset(
 REAL_RATES_REQUIRED_METRIC_KEYS = frozenset(
     {"tips-5y", "tips-10y", "5y-bei", "10y-bei"}
 )
-H41_PUBLICATION_KEYS = frozenset({"fed-balance-sheet", "reserves"})
+H41_PUBLICATION_KEYS = frozenset({"fed-balance-sheet"})
 PRATES_PUBLICATION_KEYS = frozenset(
     {"transmission-chain", "subsurface"}
 )
@@ -262,6 +274,37 @@ LIQUIDITY_REQUIRED_METRIC_KEYS = frozenset(
         "tga",
         *LIQUIDITY_FED_FUNDS_METRIC_KEYS,
     }
+)
+RESERVES_CONTRACT_VERSION = 1
+RESERVES_DATASETS = {
+    "h41": ("federal-reserve", "h41"),
+    "h8": ("federal-reserve", "h8"),
+}
+RESERVES_SERIES = {
+    "h41": "wrbwfrbl",
+    "h8": "h8-b1151ncba",
+}
+RESERVES_REQUIRED_METRIC_KEYS = frozenset(
+    {
+        "reserve-balances",
+        "commercial-bank-assets",
+        "reserve-commercial-bank-assets-ratio",
+        "reserve-ratio-8w-change",
+        "reserve-ratio-8w-zscore",
+    }
+)
+RESERVES_REQUIRED_CHART_KEYS = frozenset(
+    {"reserves-assets-history", "reserve-ratio-history"}
+)
+RESERVES_HISTORY_POINTS = 260
+RESERVES_ZSCORE_MAX_SAMPLES = 156
+RESERVES_ZSCORE_MIN_SAMPLES = 52
+RESERVES_CHANGE_LAG = timedelta(weeks=8)
+RESERVES_CHANGE_FORMULA = "ratio(t) - ratio(t-56 calendar days)"
+RESERVES_CHANGE_SAMPLE_WINDOW = "exact 56 calendar days"
+RESERVES_ZSCORE_SAMPLE_WINDOW = (
+    "Recent three-year window: minimum 52 and maximum 156 strict "
+    "56-calendar-day change samples."
 )
 ECONOMY_CONTRACT_VERSION = 1
 ECONOMY_COMPONENTS = {
@@ -1993,6 +2036,23 @@ def _lineage_chart(
             if item.strip()
         }
 
+    def lineage_license_scopes(value: Any) -> set[str]:
+        if isinstance(value, dict):
+            scopes = (
+                {str(value["license_scope"])}
+                if value.get("license_scope")
+                else set()
+            )
+            for nested in value.values():
+                scopes.update(lineage_license_scopes(nested))
+            return scopes
+        if isinstance(value, list):
+            scopes: set[str] = set()
+            for nested in value:
+                scopes.update(lineage_license_scopes(nested))
+            return scopes
+        return set()
+
     rendered_rows = chart_rows
     if compact_point_lineage:
         rendered_rows = []
@@ -2048,6 +2108,16 @@ def _lineage_chart(
                 for item in latest_lineages
                 for batch_id in lineage_batch_ids(item)
             }
+        ),
+        "license_scopes": sorted(
+            {
+                scope
+                for item in latest_lineages
+                for scope in lineage_license_scopes(item)
+            }
+        ),
+        "fallback_sources": sorted(
+            _payload_fallback_source_keys(latest_lineages)
         ),
         "frequency": frequency,
         "time_axis": "date",
@@ -4619,6 +4689,1743 @@ def _coordinate_economy_dashboard() -> tuple[
             ),
         )
         return [], {"economy"}
+    return dashboards, set()
+
+
+def _reserves_run_identity(run: IngestionRun) -> str | None:
+    for identity, (source_key, dataset) in RESERVES_DATASETS.items():
+        if run.source.key == source_key and run.dataset == dataset:
+            return identity
+    return None
+
+
+def _latest_reserves_attempt(identity: str) -> IngestionRun | None:
+    source_key, dataset = RESERVES_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(source__key=source_key, dataset=dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _reserves_run_state(
+    identity: str,
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    source_key, dataset = RESERVES_DATASETS[identity]
+    resolved_reason = reason
+    if not resolved_reason and run is not None:
+        resolved_reason = (
+            run.error
+            or str((run.metadata or {}).get("quality_reason") or "")
+            or (
+                "latest exact dataset attempt is complete"
+                if run.status == IngestionRun.Status.SUCCESS and run.row_count > 0
+                else "latest exact dataset attempt is incomplete"
+            )
+        )
+    return {
+        "component": identity,
+        "kind": "ingestion_run",
+        "source": source_key,
+        "dataset": dataset,
+        "status": status or (run.status if run else "missing"),
+        "reason": (
+            resolved_reason or "required exact dataset attempt is missing"
+        )[:320],
+        "ingestion_run_id": run.pk if run else None,
+        "batch_id": str(run.batch_id) if run else None,
+        "row_count": run.row_count if run else 0,
+        "refresh_id": (
+            str((run.metadata or {}).get("reserves_refresh_id") or "")
+            if run
+            else ""
+        ),
+        "completed_at": (
+            run.completed_at.isoformat() if run and run.completed_at else None
+        ),
+    }
+
+
+def _select_reserves_runs(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
+    relevant: dict[str, list[IngestionRun]] = {
+        identity: [] for identity in RESERVES_DATASETS
+    }
+    for run in trigger_runs:
+        identity = _reserves_run_identity(run)
+        if identity:
+            relevant[identity].append(run)
+    if not any(relevant.values()):
+        return None, [], False
+
+    selected = {
+        identity: _latest_reserves_attempt(identity)
+        for identity in RESERVES_DATASETS
+    }
+    states = [
+        _reserves_run_state(identity, selected[identity])
+        for identity in RESERVES_DATASETS
+    ]
+    for identity, trigger_group in relevant.items():
+        if not trigger_group:
+            continue
+        latest = selected[identity]
+        if len(trigger_group) != 1:
+            return (
+                None,
+                [
+                    _reserves_run_state(
+                        identity,
+                        latest,
+                        status="duplicate-trigger",
+                        reason="refresh supplied duplicate runs for one exact dataset",
+                    )
+                ],
+                True,
+            )
+        if latest is None or trigger_group[0].pk != latest.pk:
+            # A delayed worker may replay a once-valid trigger after a newer exact
+            # dataset attempt has already established the authoritative state. The
+            # replay is not a new refresh failure and must not rewrite the snapshot.
+            return None, [], False
+    if any(
+        run is None
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in selected.values()
+    ):
+        return None, states, True
+    return (
+        {identity: run for identity, run in selected.items() if run is not None},
+        states,
+        True,
+    )
+
+
+def _reserves_failure(
+    component: str,
+    reason: str,
+    *,
+    status: str = "invalid",
+    snapshot: DashboardSnapshot | None = None,
+) -> dict[str, Any]:
+    return {
+        "component": component,
+        "kind": "dashboard_snapshot" if snapshot else "contract",
+        "status": status,
+        "reason": reason[:320],
+        "snapshot_id": snapshot.pk if snapshot else None,
+        "publication_batch_id": str(snapshot.batch_id) if snapshot else None,
+    }
+
+
+def _reserves_unit_multiplier(observation: Observation) -> Decimal | None:
+    raw_multiplier = (observation.metadata or {}).get("unit_multiplier")
+    if raw_multiplier in (None, ""):
+        raw_multiplier = (
+            "1000000"
+            if observation.series.key == RESERVES_SERIES["h41"]
+            else "1000000"
+        )
+    try:
+        multiplier = Decimal(str(raw_multiplier))
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    return multiplier if multiplier.is_finite() and multiplier > 0 else None
+
+
+def _reserves_value_usd_tn(observation: Observation) -> Decimal | None:
+    multiplier = _reserves_unit_multiplier(observation)
+    if multiplier is None:
+        return None
+    value = observation.value * multiplier / Decimal("1000000000000")
+    return value if value.is_finite() else None
+
+
+def _reserves_release_deadline(
+    observation: Observation,
+    *,
+    identity: str,
+    enforce_release_lag: bool = True,
+) -> datetime | None:
+    metadata = observation.metadata or {}
+    if identity == "h41":
+        freshness_days = H41_RELEASE_FRESHNESS_DAYS
+        future_tolerance = H41_RELEASE_FUTURE_TOLERANCE
+    elif identity == "h8":
+        freshness_days = H8_RELEASE_FRESHNESS_DAYS
+        future_tolerance = H8_RELEASE_FUTURE_TOLERANCE
+    else:
+        return None
+    if metadata.get("release_freshness_days") != freshness_days:
+        return None
+    released_at = _parse_payload_datetime(metadata.get("source_release_time"))
+    if (
+        released_at is None
+        or released_at.date() < observation.value_date.date()
+        or released_at > observation.fetched_at + future_tolerance
+    ):
+        return None
+    if (
+        identity == "h41"
+        and enforce_release_lag
+        and (released_at.date() - observation.value_date.date()).days
+        > H41_MAX_RELEASE_LAG_DAYS
+    ):
+        return None
+    return released_at + timedelta(days=freshness_days)
+
+
+def _reserves_input_lineage(
+    observation: Observation,
+    *,
+    dataset: str,
+    page_fresh_until: datetime,
+) -> dict[str, Any]:
+    value_usd_tn = _reserves_value_usd_tn(observation)
+    multiplier = _reserves_unit_multiplier(observation)
+    source_status = (observation.metadata or {}).get("h41_status")
+    source_status_label = (observation.metadata or {}).get("h41_status_label")
+    if observation.series.key == RESERVES_SERIES["h8"]:
+        source_status = (observation.metadata or {}).get("h8_status")
+        source_status_label = (observation.metadata or {}).get("h8_status_label")
+    return {
+        "series_key": observation.series.key,
+        "source_series_id": str(
+            (observation.metadata or {}).get("board_series_id") or ""
+        ),
+        "dataset": dataset,
+        "value": str(observation.value),
+        "raw_value": str(
+            (observation.metadata or {}).get("raw_value")
+            or observation.value
+        ),
+        "value_usd_tn": str(value_usd_tn) if value_usd_tn is not None else None,
+        "unit_multiplier": str(multiplier) if multiplier is not None else None,
+        "source_status": source_status,
+        "source_status_label": source_status_label,
+        "source_key": observation.source.key,
+        "source_name": observation.source.name,
+        "source_keys": sorted(_observation_source_keys(observation)),
+        "license_scope": observation.source.license_scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "observation_period_fresh_until": _fresh_until(observation).isoformat(),
+        "source_release_time": (observation.metadata or {}).get(
+            "source_release_time"
+        ),
+        "release_freshness_days": (observation.metadata or {}).get(
+            "release_freshness_days"
+        ),
+        "batch_id": str(observation.batch_id),
+        "quality_status": observation.quality_status,
+        "fallback_source": (
+            observation.fallback_source.key
+            if observation.fallback_source_id
+            else None
+        ),
+    }
+
+
+def _reserves_ratio_from_lineage(lineage: Iterable[dict[str, Any]]) -> Decimal | None:
+    values: dict[str, Decimal] = {}
+    try:
+        for item in lineage:
+            if not isinstance(item, dict):
+                return None
+            key = str(item.get("series_key") or "").lower()
+            if key in values or item.get("value_usd_tn") is None:
+                return None
+            value = Decimal(str(item["value_usd_tn"]))
+            if not value.is_finite():
+                return None
+            values[key] = value
+    except (ArithmeticError, TypeError, ValueError):
+        return None
+    if set(values) != set(RESERVES_SERIES.values()):
+        return None
+    assets = values[RESERVES_SERIES["h8"]]
+    if assets <= 0:
+        return None
+    return Decimal("100") * values[RESERVES_SERIES["h41"]] / assets
+
+
+def _reserves_internal_lineage(
+    *,
+    series_key: str,
+    value: Decimal,
+    value_date: date,
+    current_inputs: list[dict[str, Any]],
+    page_fresh_until: datetime,
+    formula: str,
+    previous_inputs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    all_inputs = [*current_inputs, *(previous_inputs or [])]
+    batch_ids = sorted({str(item["batch_id"]) for item in all_inputs})
+    source_keys = sorted(
+        {
+            "internal",
+            *(
+                source_key
+                for item in all_inputs
+                for source_key in item.get("source_keys", [])
+            ),
+        }
+    )
+    internal = ensure_source("internal")
+    return {
+        "series_key": series_key,
+        "value": str(value),
+        "source_key": "internal",
+        "source_name": internal.name,
+        "source_keys": source_keys,
+        "license_scope": internal.license_scope,
+        "value_date": datetime.combine(value_date, time.min, tzinfo=UTC).isoformat(),
+        "as_of": min(
+            _parse_payload_datetime(item.get("as_of"))
+            for item in current_inputs
+            if _parse_payload_datetime(item.get("as_of")) is not None
+        ).isoformat(),
+        "fetched_at": max(
+            _parse_payload_datetime(item.get("fetched_at"))
+            for item in current_inputs
+            if _parse_payload_datetime(item.get("fetched_at")) is not None
+        ).isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "batch_id": ",".join(batch_ids),
+        "input_batch_ids": batch_ids,
+        "input_lineage": current_inputs,
+        "previous_input_lineage": previous_inputs or [],
+        "formula": formula,
+        "quality_status": Observation.Quality.ESTIMATED,
+        "fallback_source": None,
+    }
+
+
+def _reserves_direct_metric(
+    *,
+    key: str,
+    label: str,
+    dataset: str,
+    current: Observation,
+    previous: Observation,
+    page_fresh_until: datetime,
+) -> dict[str, Any]:
+    current_value = _reserves_value_usd_tn(current)
+    previous_value = _reserves_value_usd_tn(previous)
+    if current_value is None or previous_value is None:
+        raise ValueError("reserve direct value has no valid USD normalization")
+    current_lineage = _reserves_input_lineage(
+        current, dataset=dataset, page_fresh_until=page_fresh_until
+    )
+    previous_lineage = _reserves_input_lineage(
+        previous, dataset=dataset, page_fresh_until=page_fresh_until
+    )
+    return {
+        "key": key,
+        "label": label,
+        "value": float(current_value),
+        "display_value": f"{current_value:,.3f} USD tn",
+        "change": float(current_value - previous_value),
+        "change_unit": " USD tn",
+        "unit": " USD tn",
+        "quality_status": Observation.Quality.FRESH,
+        "source": current.source.name,
+        "source_key": current.source.key,
+        "source_keys": [current.source.key],
+        "fallback_source": None,
+        "license_scope": current.source.license_scope,
+        "as_of": current.as_of.isoformat(),
+        "value_date": current.value_date.isoformat(),
+        "fetched_at": current.fetched_at.isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "batch_id": str(current.batch_id),
+        "metadata": {
+            "common_effective_date": current.value_date.date().isoformat(),
+            "input_series": [current.series.key],
+            "input_batch_ids": [str(current.batch_id)],
+            "input_value_dates": [current.value_date.isoformat()],
+            "input_lineage": [current_lineage],
+            "previous_value": float(previous_value),
+            "previous_value_date": previous.value_date.isoformat(),
+            "previous_input_lineage": [previous_lineage],
+            "calculation_owner": "Federal Reserve Board direct observation",
+            "normalization": "source value * UNIT_MULT / 1e12 USD",
+        },
+    }
+
+
+def _reserves_derived_metric(
+    *,
+    key: str,
+    label: str,
+    value: Decimal,
+    unit: str,
+    current_date: date,
+    current_inputs: list[dict[str, Any]],
+    page_fresh_until: datetime,
+    formula: str,
+    previous_inputs: list[dict[str, Any]] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    all_inputs = [*current_inputs, *(previous_inputs or [])]
+    batch_ids = sorted({str(item["batch_id"]) for item in all_inputs})
+    source_keys = sorted(
+        {
+            "internal",
+            *(
+                source_key
+                for item in all_inputs
+                for source_key in item.get("source_keys", [])
+            ),
+        }
+    )
+    current_date_value = datetime.combine(current_date, time.min, tzinfo=UTC)
+    return {
+        "key": key,
+        "label": label,
+        "value": float(value),
+        "display_value": (
+            f"{value:,.3f}%" if unit == "%" else f"{value:,.3f} {unit}"
+        ),
+        "change": None,
+        "change_unit": unit,
+        "unit": unit,
+        "quality_status": Observation.Quality.ESTIMATED,
+        "source": "Atlas Macro 透明计算（Federal Reserve 双官方源输入）",
+        "source_key": "internal",
+        "source_keys": source_keys,
+        "license_scope": ensure_source("internal").license_scope,
+        "fallback_source": None,
+        "as_of": min(
+            _parse_payload_datetime(item.get("as_of"))
+            for item in current_inputs
+            if _parse_payload_datetime(item.get("as_of")) is not None
+        ).isoformat(),
+        "value_date": current_date_value.isoformat(),
+        "fetched_at": max(
+            _parse_payload_datetime(item.get("fetched_at"))
+            for item in current_inputs
+            if _parse_payload_datetime(item.get("fetched_at")) is not None
+        ).isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "batch_id": ",".join(batch_ids),
+        "metadata": {
+            "common_effective_date": current_date.isoformat(),
+            "formula": formula,
+            "calculation_owner": "Atlas Macro",
+            "input_series": sorted({str(item["series_key"]) for item in all_inputs}),
+            "input_batch_ids": batch_ids,
+            "input_value_dates": sorted(
+                {str(item["value_date"]) for item in all_inputs}
+            ),
+            "input_lineage": current_inputs,
+            "previous_input_lineage": previous_inputs or [],
+            "coverage_proxy": (
+                "Reserve balances of all depository institutions divided by "
+                "total assets of U.S. commercial banks; coverage universes differ"
+            ),
+            "normalization": "both inputs converted to USD trillions before division",
+            **(extra_metadata or {}),
+        },
+    }
+
+
+def _reserves_observation_maps(
+    selected_runs: dict[str, IngestionRun],
+) -> tuple[dict[str, dict[date, Observation]] | None, list[dict[str, Any]]]:
+    maps: dict[str, dict[date, Observation]] = {}
+    failures: list[dict[str, Any]] = []
+    for identity, series_key in RESERVES_SERIES.items():
+        source_key, _dataset = RESERVES_DATASETS[identity]
+        batch_id = selected_runs[identity].batch_id
+        by_date: dict[date, Observation] = {}
+        observations = _real_observations(
+            series_key, source_key=source_key, batch_id=batch_id
+        ).order_by("value_date", "fetched_at", "id")
+        for observation in observations:
+            period = observation.value_date.date()
+            if period in by_date:
+                failures.append(
+                    _reserves_failure(
+                        identity,
+                        f"duplicate exact-batch observation for {period.isoformat()}",
+                        status="duplicate",
+                    )
+                )
+                continue
+            by_date[period] = observation
+        if not by_date:
+            failures.append(
+                _reserves_failure(
+                    identity,
+                    "required exact-batch series is missing or its licence is not public",
+                    status="missing-or-unlicensed",
+                )
+            )
+        maps[identity] = by_date
+    return (None, failures) if failures else (maps, [])
+
+
+def _reserves_page_data(
+    selected_runs: dict[str, IngestionRun],
+) -> tuple[
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None,
+    list[dict[str, Any]],
+]:
+    observations, failures = _reserves_observation_maps(selected_runs)
+    if observations is None:
+        return None, failures
+    now = timezone.now()
+    today_et = now.astimezone(ZoneInfo("America/New_York")).date()
+    expected_batches = {
+        identity: str(selected_runs[identity].batch_id)
+        for identity in RESERVES_DATASETS
+    }
+    for identity, run in selected_runs.items():
+        run_fetched_at = _parse_payload_datetime(
+            (run.metadata or {}).get("fetched_at")
+        )
+        verifiable_run_times = [run.started_at, run.completed_at, run_fetched_at]
+        if run_fetched_at is None or any(
+            candidate is not None and candidate > now
+            for candidate in verifiable_run_times
+        ):
+            return None, [
+                _reserves_failure(
+                    identity,
+                    "exact-dataset run contains a missing or future retrieval timestamp",
+                    status="future-timestamp",
+                )
+            ]
+    component_deadlines: dict[str, datetime] = {}
+    for identity, by_date in observations.items():
+        if any(
+            period > today_et or observation.fetched_at > now
+            for period, observation in by_date.items()
+        ):
+            return None, [
+                _reserves_failure(
+                    identity,
+                    "exact-batch numeric observation has a future period or retrieval timestamp",
+                    status="future-timestamp",
+                )
+            ]
+        if not by_date:
+            return None, [
+                _reserves_failure(
+                    identity,
+                    "exact-batch series has no non-future observation",
+                    status="missing",
+                )
+            ]
+        latest = by_date[max(by_date)]
+        deadline = _reserves_release_deadline(
+            latest,
+            identity=identity,
+        )
+        if (
+            deadline is None
+            or latest.source.key != RESERVES_DATASETS[identity][0]
+            or str(latest.batch_id) != expected_batches[identity]
+            or latest.fallback_source_id
+            or latest.quality_status != Observation.Quality.FRESH
+            or deadline < now
+        ):
+            return None, [
+                _reserves_failure(
+                    identity,
+                    "latest exact-batch input is stale, fallback, mixed-batch or invalid",
+                    status=Observation.Quality.STALE,
+                )
+            ]
+        component_deadlines[identity] = deadline
+    public_sources, derived_sources = current_display_source_key_sets(
+        {"federal-reserve", "internal"}
+    )
+    if (
+        public_sources != {"federal-reserve", "internal"}
+        or derived_sources != public_sources
+    ):
+        return None, [
+            _reserves_failure(
+                "licence",
+                "required public and derived-display licences are not currently valid",
+                status="unlicensed",
+            )
+        ]
+
+    common_dates = sorted(
+        {
+            period
+            for period in set(observations["h41"]) & set(observations["h8"])
+            if period <= today_et and period.weekday() == 2
+        }
+    )
+    if len(common_dates) < 2:
+        return None, [
+            _reserves_failure(
+                "history",
+                "insufficient common Wednesday history for direct weekly comparisons",
+                status="insufficient-sample",
+            )
+        ]
+    current_date = common_dates[-1]
+    common_date_deadlines = {
+        identity: _reserves_release_deadline(
+            by_date[current_date],
+            identity=identity,
+            enforce_release_lag=False,
+        )
+        for identity, by_date in observations.items()
+    }
+    if any(
+        deadline is None or deadline < now
+        for deadline in common_date_deadlines.values()
+    ):
+        return None, [
+            _reserves_failure(
+                "common-date",
+                "latest common Wednesday contains an expired component",
+                status=Observation.Quality.STALE,
+            )
+        ]
+    page_fresh_until = min(
+        deadline
+        for deadline in common_date_deadlines.values()
+        if deadline is not None
+    )
+    displayed_dates = common_dates[-RESERVES_HISTORY_POINTS:]
+    for period in displayed_dates:
+        for identity, by_date in observations.items():
+            item = by_date[period]
+            historical_deadline = _reserves_release_deadline(
+                item,
+                identity=identity,
+                enforce_release_lag=False,
+            )
+            if (
+                item.source.key != RESERVES_DATASETS[identity][0]
+                or str(item.batch_id) != expected_batches[identity]
+                or item.fallback_source_id
+                or item.quality_status != Observation.Quality.FRESH
+                or _reserves_value_usd_tn(item) is None
+                or historical_deadline is None
+                or (
+                    (item.metadata or {}).get(
+                        "h41_status" if identity == "h41" else "h8_status"
+                    )
+                    not in {None, "", "A"}
+                )
+            ):
+                return None, [
+                    _reserves_failure(
+                        identity,
+                        f"displayed input {period.isoformat()} failed lineage or quality checks",
+                        status=Observation.Quality.STALE,
+                    )
+                ]
+
+    direct_lineage: dict[date, list[dict[str, Any]]] = {}
+    ratios: dict[date, Decimal] = {}
+    for period in common_dates:
+        inputs = [
+            _reserves_input_lineage(
+                observations[identity][period],
+                dataset=RESERVES_DATASETS[identity][1],
+                page_fresh_until=page_fresh_until,
+            )
+            for identity in ("h41", "h8")
+        ]
+        ratio = _reserves_ratio_from_lineage(inputs)
+        if ratio is None:
+            return None, [
+                _reserves_failure(
+                    "ratio", f"ratio is not calculable for {period.isoformat()}"
+                )
+            ]
+        direct_lineage[period] = inputs
+        ratios[period] = ratio
+
+    changes: list[dict[str, Any]] = []
+    for period in common_dates:
+        lagged_period = period - RESERVES_CHANGE_LAG
+        if lagged_period not in ratios:
+            continue
+        change = ratios[period] - ratios[lagged_period]
+        changes.append(
+            {
+                "value_date": period.isoformat(),
+                "lagged_value_date": lagged_period.isoformat(),
+                "value": str(change),
+                "current_input_lineage": direct_lineage[period],
+                "previous_input_lineage": direct_lineage[lagged_period],
+            }
+        )
+    previous_date = common_dates[-2]
+    lagged_date = current_date - RESERVES_CHANGE_LAG
+    if lagged_date not in ratios:
+        return None, [
+            _reserves_failure(
+                "8w-change",
+                "current common Wednesday has no exact 56-calendar-day input pair",
+                status="missing",
+            )
+        ]
+    sample_floor = current_date - relativedelta(years=3)
+    sample = [
+        item
+        for item in changes
+        if date.fromisoformat(str(item["value_date"])) >= sample_floor
+    ][-RESERVES_ZSCORE_MAX_SAMPLES:]
+    if len(sample) < RESERVES_ZSCORE_MIN_SAMPLES:
+        return None, [
+            _reserves_failure(
+                "zscore",
+                "fewer than 52 usable 8-week changes fall inside the recent three-year window",
+                status="insufficient-sample",
+            )
+        ]
+    sample_values = [Decimal(str(item["value"])) for item in sample]
+    population_mean = sum(sample_values, Decimal("0")) / Decimal(len(sample_values))
+    variance = sum(
+        ((value - population_mean) ** 2 for value in sample_values),
+        Decimal("0"),
+    ) / Decimal(len(sample_values))
+    population_std = variance.sqrt()
+    if population_std == 0:
+        return None, [
+            _reserves_failure(
+                "zscore",
+                "population standard deviation is zero",
+                status="zero-variance",
+            )
+        ]
+    current_change = ratios[current_date] - ratios[lagged_date]
+    zscore = (current_change - population_mean) / population_std
+    current_inputs = direct_lineage[current_date]
+    lagged_inputs = direct_lineage[lagged_date]
+
+    try:
+        metrics = [
+            _reserves_direct_metric(
+                key="reserve-balances",
+                label="准备金余额",
+                dataset="h41",
+                current=observations["h41"][current_date],
+                previous=observations["h41"][previous_date],
+                page_fresh_until=page_fresh_until,
+            ),
+            _reserves_direct_metric(
+                key="commercial-bank-assets",
+                label="美国商业银行总资产",
+                dataset="h8",
+                current=observations["h8"][current_date],
+                previous=observations["h8"][previous_date],
+                page_fresh_until=page_fresh_until,
+            ),
+            _reserves_derived_metric(
+                key="reserve-commercial-bank-assets-ratio",
+                label="准备金 / 商业银行资产覆盖近似",
+                value=ratios[current_date],
+                unit="%",
+                current_date=current_date,
+                current_inputs=current_inputs,
+                page_fresh_until=page_fresh_until,
+                formula="100 * WRBWFRBL / H8-B1151NCBA",
+            ),
+            _reserves_derived_metric(
+                key="reserve-ratio-8w-change",
+                label="覆盖近似 8 周变化",
+                value=current_change,
+                unit="pp",
+                current_date=current_date,
+                current_inputs=current_inputs,
+                previous_inputs=lagged_inputs,
+                page_fresh_until=page_fresh_until,
+                formula=RESERVES_CHANGE_FORMULA,
+                extra_metadata={
+                    "previous_value": float(ratios[lagged_date]),
+                    "previous_value_date": datetime.combine(
+                        lagged_date, time.min, tzinfo=UTC
+                    ).isoformat(),
+                    "sample_window": RESERVES_CHANGE_SAMPLE_WINDOW,
+                    "lag_calendar_days": RESERVES_CHANGE_LAG.days,
+                },
+            ),
+            _reserves_derived_metric(
+                key="reserve-ratio-8w-zscore",
+                label="覆盖近似 8 周变化 Z-score",
+                value=zscore,
+                unit="z",
+                current_date=current_date,
+                current_inputs=current_inputs,
+                previous_inputs=lagged_inputs,
+                page_fresh_until=page_fresh_until,
+                formula=(
+                    "(current_8w_change_pp - population_mean_pp) "
+                    "/ population_std_pp"
+                ),
+                extra_metadata={
+                    "sample_window": RESERVES_ZSCORE_SAMPLE_WINDOW,
+                    "lag_calendar_days": RESERVES_CHANGE_LAG.days,
+                    "minimum_sample_count": RESERVES_ZSCORE_MIN_SAMPLES,
+                    "maximum_sample_count": RESERVES_ZSCORE_MAX_SAMPLES,
+                    "sample_count": len(sample),
+                    "population_mean": str(population_mean),
+                    "population_std": str(population_std),
+                    "population_standard_deviation": True,
+                    "sample_changes": sample,
+                    "current_8w_change": str(current_change),
+                },
+            ),
+        ]
+    except ValueError as exc:
+        return None, [_reserves_failure("metrics", str(exc))]
+
+    level_rows: list[dict[str, Any]] = []
+    ratio_rows: list[dict[str, Any]] = []
+    for period in displayed_dates:
+        reserve_lineage, asset_lineage = direct_lineage[period]
+        level_rows.append(
+            {
+                "date": period.isoformat(),
+                "Reserve balances": float(
+                    _reserves_value_usd_tn(observations["h41"][period])
+                ),
+                "Commercial bank assets": float(
+                    _reserves_value_usd_tn(observations["h8"][period])
+                ),
+                "_source_keys": ["federal-reserve"],
+                "_lineage": {
+                    "Reserve balances": reserve_lineage,
+                    "Commercial bank assets": asset_lineage,
+                },
+            }
+        )
+        row: dict[str, Any] = {
+            "date": period.isoformat(),
+            "Coverage proxy ratio": float(ratios[period]),
+            "_source_keys": ["federal-reserve", "internal"],
+            "_lineage": {
+                "Coverage proxy ratio": _reserves_internal_lineage(
+                    series_key="reserve-commercial-bank-assets-ratio",
+                    value=ratios[period],
+                    value_date=period,
+                    current_inputs=direct_lineage[period],
+                    page_fresh_until=page_fresh_until,
+                    formula="100 * WRBWFRBL / H8-B1151NCBA",
+                )
+            },
+        }
+        lag = period - RESERVES_CHANGE_LAG
+        if lag in ratios:
+            change = ratios[period] - ratios[lag]
+            row["8-week change"] = float(change)
+            row["_lineage"]["8-week change"] = _reserves_internal_lineage(
+                series_key="reserve-ratio-8w-change",
+                value=change,
+                value_date=period,
+                current_inputs=direct_lineage[period],
+                previous_inputs=direct_lineage[lag],
+                page_fresh_until=page_fresh_until,
+                formula=RESERVES_CHANGE_FORMULA,
+            )
+        ratio_rows.append(row)
+
+    level_chart = _lineage_chart(
+        key="reserves-assets-history",
+        title="准备金与商业银行资产",
+        description=(
+            "两个官方周度序列只在共同周三对齐，统一换算为 USD tn。"
+        ),
+        rows=level_rows,
+        fields=("Reserve balances", "Commercial bank assets"),
+        tab="levels",
+        frequency="weekly",
+        include_internal=False,
+    )
+    ratio_chart = _lineage_chart(
+        key="reserve-ratio-history",
+        title="覆盖近似比率与 8 周变化",
+        description=(
+            "准备金余额（所有存款机构）/美国商业银行总资产的"
+            "覆盖近似；不是 Fed 官方指标或监管结论。"
+        ),
+        rows=ratio_rows,
+        fields=("Coverage proxy ratio", "8-week change"),
+        tab="ratio",
+        frequency="weekly",
+    )
+    if level_chart is None or ratio_chart is None:
+        return None, [_reserves_failure("charts", "required charts are not buildable")]
+
+    component_runs = [
+        _reserves_run_state(identity, selected_runs[identity], status="valid")
+        for identity in RESERVES_DATASETS
+    ]
+    sections = [
+        {
+            "key": "coverage-proxy-method",
+            "title": "覆盖近似口径",
+            "body": (
+                "分子是 H.4.1 所有存款机构在联储的准备金余额，"
+                "分母是 H.8 美国商业银行总资产。两者覆盖宇宙不同，"
+                "该比率不是监管资本、LCR、严格同口径的准备金"
+                "评估，也不是 Federal Reserve 官方指标。"
+            ),
+            "full_width": True,
+        },
+        {
+            "key": "publication-rule",
+            "title": "双源原子发布",
+            "body": (
+                "H.4.1 或 H.8 任一失败、过期、回退、混批、回退源或"
+                "许可失效时，保留上一个完整 v1 快照并显式标记 stale。"
+            ),
+            "full_width": True,
+        },
+    ]
+    extra_data = {
+        "contract_version": RESERVES_CONTRACT_VERSION,
+        "common_effective_date": current_date.isoformat(),
+        "component_runs": component_runs,
+        "input_datasets": [
+            {
+                "component": identity,
+                "source_key": RESERVES_DATASETS[identity][0],
+                "dataset": RESERVES_DATASETS[identity][1],
+                "batch_id": expected_batches[identity],
+                "series_key": RESERVES_SERIES[identity],
+            }
+            for identity in ("h41", "h8")
+        ],
+        "coverage_proxy_disclaimer": (
+            "Different coverage universes; not regulatory capital, LCR, a like-for-like "
+            "reserve assessment, or a Federal Reserve official indicator."
+        ),
+    }
+    prepared = (metrics, [level_chart, ratio_chart], sections, extra_data)
+    if not _reserves_page_contract_is_buildable(
+        metrics, [level_chart, ratio_chart], extra_data
+    ):
+        return None, [
+            _reserves_failure(
+                "reserves", "prepared page failed the reserves v1 contract validator"
+            )
+        ]
+    return prepared, []
+
+
+def _reserves_page_contract_is_buildable(
+    metrics: list[dict[str, Any]],
+    charts: list[dict[str, Any]],
+    extra_data: dict[str, Any],
+) -> bool:
+    """Validate every public reserves v1 value and its exact-batch lineage."""
+
+    if extra_data.get("contract_version") != RESERVES_CONTRACT_VERSION:
+        return False
+    metric_by_key = {
+        str(item.get("key") or ""): item
+        for item in metrics
+        if isinstance(item, dict)
+    }
+    chart_by_key = {
+        str(item.get("key") or ""): item
+        for item in charts
+        if isinstance(item, dict)
+    }
+    if set(metric_by_key) != set(RESERVES_REQUIRED_METRIC_KEYS):
+        return False
+    if set(chart_by_key) != set(RESERVES_REQUIRED_CHART_KEYS):
+        return False
+    input_datasets = extra_data.get("input_datasets")
+    if not isinstance(input_datasets, list) or len(input_datasets) != 2:
+        return False
+    inputs_by_component = {
+        str(item.get("component") or ""): item
+        for item in input_datasets
+        if isinstance(item, dict)
+    }
+    if set(inputs_by_component) != set(RESERVES_DATASETS):
+        return False
+    expected_batches = {
+        str(item.get("batch_id") or "") for item in input_datasets
+    }
+    if "" in expected_batches or len(expected_batches) != 2:
+        return False
+    for identity, item in inputs_by_component.items():
+        if (
+            item.get("source_key") != RESERVES_DATASETS[identity][0]
+            or item.get("dataset") != RESERVES_DATASETS[identity][1]
+            or item.get("series_key") != RESERVES_SERIES[identity]
+        ):
+            return False
+    component_runs = extra_data.get("component_runs")
+    if not isinstance(component_runs, list) or len(component_runs) != 2:
+        return False
+    if {
+        (str(item.get("component") or ""), str(item.get("batch_id") or ""))
+        for item in component_runs
+        if isinstance(item, dict)
+    } != {
+        (identity, str(inputs_by_component[identity]["batch_id"]))
+        for identity in RESERVES_DATASETS
+    }:
+        return False
+    if any(
+        item.get("status") != "valid"
+        or item.get("row_count", 0) <= 0
+        or not item.get("ingestion_run_id")
+        for item in component_runs
+    ):
+        return False
+    common_date = str(extra_data.get("common_effective_date") or "")
+    try:
+        parsed_common_date = date.fromisoformat(common_date)
+    except ValueError:
+        return False
+    validation_now = timezone.now()
+    if (
+        parsed_common_date.weekday() != 2
+        or parsed_common_date
+        > validation_now.astimezone(ZoneInfo("America/New_York")).date()
+    ):
+        return False
+
+    def decimal_value(raw: Any) -> Decimal | None:
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return value if value.is_finite() else None
+
+    def same(left: Any, right: Any) -> bool:
+        left_value = decimal_value(left)
+        right_value = decimal_value(right)
+        return bool(
+            left_value is not None
+            and right_value is not None
+            and abs(left_value - right_value) <= Decimal("0.00000001")
+        )
+
+    def safe_direct_lineage(
+        item: Any,
+        *,
+        expected_series: str | None = None,
+        expected_date: str | None = None,
+    ) -> bool:
+        if not isinstance(item, dict):
+            return False
+        series_key = str(item.get("series_key") or "").lower()
+        batch_id = str(item.get("batch_id") or "")
+        component = next(
+            (
+                identity
+                for identity, candidate in RESERVES_SERIES.items()
+                if candidate == series_key
+            ),
+            None,
+        )
+        if component is None:
+            return False
+        if expected_series is not None and series_key != expected_series:
+            return False
+        if expected_date is not None and str(item.get("value_date") or "")[:10] != expected_date:
+            return False
+        fetched_at = _parse_payload_datetime(item.get("fetched_at"))
+        value_date = _parse_payload_datetime(item.get("value_date"))
+        source_release_time = _parse_payload_datetime(
+            item.get("source_release_time")
+        )
+        observation_deadline = _parse_payload_datetime(
+            item.get("observation_period_fresh_until")
+        )
+        freshness_days = (
+            H41_RELEASE_FRESHNESS_DAYS
+            if component == "h41"
+            else H8_RELEASE_FRESHNESS_DAYS
+        )
+        future_tolerance = (
+            H41_RELEASE_FUTURE_TOLERANCE
+            if component == "h41"
+            else H8_RELEASE_FUTURE_TOLERANCE
+        )
+        return bool(
+            item.get("source_key") == "federal-reserve"
+            and batch_id == str(inputs_by_component[component]["batch_id"])
+            and item.get("dataset") == RESERVES_DATASETS[component][1]
+            and item.get("license_scope")
+            and item.get("value_date")
+            and _parse_payload_datetime(item.get("as_of")) is not None
+            and fetched_at is not None
+            and fetched_at <= validation_now
+            and value_date is not None
+            and source_release_time is not None
+            and source_release_time.date() >= value_date.date()
+            and source_release_time <= fetched_at + future_tolerance
+            and item.get("release_freshness_days") == freshness_days
+            and observation_deadline
+            == source_release_time + timedelta(days=freshness_days)
+            and _parse_payload_datetime(item.get("fresh_until")) is not None
+            and item.get("quality_status") == Observation.Quality.FRESH
+            and item.get("fallback_source") is None
+            and item.get("source_status") in {None, "", "A"}
+            and decimal_value(item.get("value")) is not None
+            and decimal_value(item.get("value_usd_tn")) is not None
+            and decimal_value(item.get("unit_multiplier")) == Decimal("1000000")
+        )
+
+    def safe_pair(lineage: Any, *, expected_date: str | None = None) -> bool:
+        if not isinstance(lineage, list) or len(lineage) != 2:
+            return False
+        by_series = {
+            str(item.get("series_key") or "").lower(): item
+            for item in lineage
+            if isinstance(item, dict)
+        }
+        return set(by_series) == set(RESERVES_SERIES.values()) and all(
+            safe_direct_lineage(
+                by_series[series_key],
+                expected_series=series_key,
+                expected_date=expected_date,
+            )
+            for series_key in RESERVES_SERIES.values()
+        )
+
+    def pair_date(lineage: Any) -> date | None:
+        if not safe_pair(lineage):
+            return None
+        raw_dates = {
+            str(item.get("value_date") or "")[:10]
+            for item in lineage
+            if isinstance(item, dict)
+        }
+        if len(raw_dates) != 1:
+            return None
+        try:
+            return date.fromisoformat(raw_dates.pop())
+        except ValueError:
+            return None
+
+    for metric in metrics:
+        metric_fetched_at = _parse_payload_datetime(metric.get("fetched_at"))
+        if (
+            metric.get("value") is None
+            or not metric.get("value_date")
+            or str(metric["value_date"])[:10] != common_date
+            or metric_fetched_at is None
+            or metric_fetched_at > validation_now
+            or not metric.get("fresh_until")
+            or metric.get("fallback_source") is not None
+            or not metric.get("license_scope")
+            or not _payload_batch_ids(metric)
+        ):
+            return False
+    direct_specs = {
+        "reserve-balances": RESERVES_SERIES["h41"],
+        "commercial-bank-assets": RESERVES_SERIES["h8"],
+    }
+    for metric_key, series_key in direct_specs.items():
+        metric = metric_by_key[metric_key]
+        metadata = metric.get("metadata") or {}
+        lineage = metadata.get("input_lineage")
+        previous_lineage = metadata.get("previous_input_lineage")
+        if (
+            metric.get("source_key") != "federal-reserve"
+            or metric.get("quality_status") != Observation.Quality.FRESH
+            or not isinstance(lineage, list)
+            or len(lineage) != 1
+            or not safe_direct_lineage(
+                lineage[0], expected_series=series_key, expected_date=common_date
+            )
+            or not same(metric.get("value"), lineage[0].get("value_usd_tn"))
+            or not isinstance(previous_lineage, list)
+            or len(previous_lineage) != 1
+            or not safe_direct_lineage(
+                previous_lineage[0], expected_series=series_key
+            )
+            or str(metadata.get("previous_value_date") or "")
+            != str(previous_lineage[0].get("value_date") or "")
+            or not same(
+                metadata.get("previous_value"),
+                previous_lineage[0].get("value_usd_tn"),
+            )
+            or not same(
+                metric.get("change"),
+                Decimal(str(lineage[0]["value_usd_tn"]))
+                - Decimal(str(previous_lineage[0]["value_usd_tn"])),
+            )
+            or set(metadata.get("input_batch_ids") or [])
+            != {str(lineage[0]["batch_id"])}
+        ):
+            return False
+
+    ratio_metric = metric_by_key["reserve-commercial-bank-assets-ratio"]
+    ratio_metadata = ratio_metric.get("metadata") or {}
+    ratio_inputs = ratio_metadata.get("input_lineage")
+    recomputed_ratio = (
+        _reserves_ratio_from_lineage(ratio_inputs)
+        if isinstance(ratio_inputs, list)
+        else None
+    )
+    if (
+        ratio_metric.get("source_key") != "internal"
+        or ratio_metric.get("quality_status") != Observation.Quality.ESTIMATED
+        or ratio_metadata.get("formula") != "100 * WRBWFRBL / H8-B1151NCBA"
+        or not safe_pair(ratio_inputs, expected_date=common_date)
+        or recomputed_ratio is None
+        or not same(ratio_metric.get("value"), recomputed_ratio)
+    ):
+        return False
+
+    change_metric = metric_by_key["reserve-ratio-8w-change"]
+    change_metadata = change_metric.get("metadata") or {}
+    change_current = change_metadata.get("input_lineage")
+    change_previous = change_metadata.get("previous_input_lineage")
+    current_ratio = (
+        _reserves_ratio_from_lineage(change_current)
+        if isinstance(change_current, list)
+        else None
+    )
+    previous_ratio = (
+        _reserves_ratio_from_lineage(change_previous)
+        if isinstance(change_previous, list)
+        else None
+    )
+    expected_lagged_date = parsed_common_date - RESERVES_CHANGE_LAG
+    if (
+        change_metric.get("source_key") != "internal"
+        or change_metadata.get("formula") != RESERVES_CHANGE_FORMULA
+        or change_metadata.get("sample_window")
+        != RESERVES_CHANGE_SAMPLE_WINDOW
+        or change_metadata.get("lag_calendar_days")
+        != RESERVES_CHANGE_LAG.days
+        or not safe_pair(change_current, expected_date=common_date)
+        or not safe_pair(
+            change_previous, expected_date=expected_lagged_date.isoformat()
+        )
+        or pair_date(change_current) != parsed_common_date
+        or pair_date(change_previous) != expected_lagged_date
+        or str(change_metadata.get("previous_value_date") or "")[:10]
+        != expected_lagged_date.isoformat()
+        or current_ratio is None
+        or previous_ratio is None
+        or not same(change_metric.get("value"), current_ratio - previous_ratio)
+    ):
+        return False
+
+    zscore_metric = metric_by_key["reserve-ratio-8w-zscore"]
+    zscore_metadata = zscore_metric.get("metadata") or {}
+    sample = zscore_metadata.get("sample_changes")
+    zscore_current = zscore_metadata.get("input_lineage")
+    zscore_previous = zscore_metadata.get("previous_input_lineage")
+    if (
+        zscore_metric.get("source_key") != "internal"
+        or zscore_metadata.get("formula")
+        != "(current_8w_change_pp - population_mean_pp) / population_std_pp"
+        or zscore_metadata.get("population_standard_deviation") is not True
+        or zscore_metadata.get("sample_window")
+        != RESERVES_ZSCORE_SAMPLE_WINDOW
+        or zscore_metadata.get("lag_calendar_days")
+        != RESERVES_CHANGE_LAG.days
+        or zscore_metadata.get("minimum_sample_count")
+        != RESERVES_ZSCORE_MIN_SAMPLES
+        or zscore_metadata.get("maximum_sample_count")
+        != RESERVES_ZSCORE_MAX_SAMPLES
+        or not safe_pair(zscore_current, expected_date=common_date)
+        or not safe_pair(
+            zscore_previous, expected_date=expected_lagged_date.isoformat()
+        )
+        or pair_date(zscore_current) != parsed_common_date
+        or pair_date(zscore_previous) != expected_lagged_date
+        or not isinstance(sample, list)
+        or not RESERVES_ZSCORE_MIN_SAMPLES
+        <= len(sample)
+        <= RESERVES_ZSCORE_MAX_SAMPLES
+        or zscore_metadata.get("sample_count") != len(sample)
+    ):
+        return False
+    sample_values: list[Decimal] = []
+    sample_dates: list[date] = []
+    sample_floor = parsed_common_date - relativedelta(years=3)
+    for item in sample:
+        if not isinstance(item, dict):
+            return False
+        item_date = str(item.get("value_date") or "")
+        lagged_date = str(item.get("lagged_value_date") or "")
+        try:
+            parsed_item_date = date.fromisoformat(item_date)
+            parsed_lagged_date = date.fromisoformat(lagged_date)
+        except ValueError:
+            return False
+        if (
+            not sample_floor <= parsed_item_date <= parsed_common_date
+            or parsed_item_date - parsed_lagged_date != RESERVES_CHANGE_LAG
+        ):
+            return False
+        item_current = item.get("current_input_lineage")
+        item_previous = item.get("previous_input_lineage")
+        if (
+            not safe_pair(item_current, expected_date=item_date)
+            or not safe_pair(item_previous, expected_date=lagged_date)
+        ):
+            return False
+        item_current_ratio = _reserves_ratio_from_lineage(item_current)
+        item_previous_ratio = _reserves_ratio_from_lineage(item_previous)
+        if item_current_ratio is None or item_previous_ratio is None:
+            return False
+        item_value = item_current_ratio - item_previous_ratio
+        if not same(item.get("value"), item_value):
+            return False
+        sample_values.append(item_value)
+        sample_dates.append(parsed_item_date)
+    if (
+        sample_dates != sorted(sample_dates)
+        or len(sample_dates) != len(set(sample_dates))
+        or sample_dates[-1] != parsed_common_date
+        or not same(sample_values[-1], change_metric.get("value"))
+    ):
+        return False
+    population_mean = sum(sample_values, Decimal("0")) / Decimal(len(sample_values))
+    variance = sum(
+        ((value - population_mean) ** 2 for value in sample_values), Decimal("0")
+    ) / Decimal(len(sample_values))
+    population_std = variance.sqrt()
+    if (
+        population_std == 0
+        or not same(zscore_metadata.get("population_mean"), population_mean)
+        or not same(zscore_metadata.get("population_std"), population_std)
+    ):
+        return False
+    zscore = (Decimal(str(change_metric["value"])) - population_mean) / population_std
+    if not same(zscore_metric.get("value"), zscore):
+        return False
+
+    for chart_key, chart in chart_by_key.items():
+        chart_fetched_at = _parse_payload_datetime(chart.get("fetched_at"))
+        if (
+            chart.get("time_axis") != "date"
+            or chart.get("frequency") != "weekly"
+            or set(chart.get("batch_ids") or []) != expected_batches
+            or not chart.get("as_of")
+            or chart_fetched_at is None
+            or chart_fetched_at > validation_now
+            or not chart.get("fresh_until")
+            or not chart.get("quality_status")
+            or not chart.get("license_scopes")
+            or chart.get("fallback_sources") != []
+            or not isinstance(chart.get("data"), list)
+            or not chart["data"]
+        ):
+            return False
+        expected_sources = (
+            {"federal-reserve"}
+            if chart_key == "reserves-assets-history"
+            else {"federal-reserve", "internal"}
+        )
+        if set(chart.get("source_keys") or []) != expected_sources:
+            return False
+        if max(str(row.get("date") or "") for row in chart["data"]) != common_date:
+            return False
+
+    level_rows = chart_by_key["reserves-assets-history"]["data"]
+    for row in level_rows:
+        row_date = str(row.get("date") or "")
+        lineage = row.get("_lineage") or {}
+        expected_fields = {
+            "Reserve balances": RESERVES_SERIES["h41"],
+            "Commercial bank assets": RESERVES_SERIES["h8"],
+        }
+        if set(lineage) != set(expected_fields):
+            return False
+        for field, series_key in expected_fields.items():
+            if (
+                field not in row
+                or not safe_direct_lineage(
+                    lineage[field],
+                    expected_series=series_key,
+                    expected_date=row_date,
+                )
+                or not same(row[field], lineage[field].get("value_usd_tn"))
+            ):
+                return False
+
+    ratio_rows = chart_by_key["reserve-ratio-history"]["data"]
+    ratio_row_dates = [str(row.get("date") or "") for row in ratio_rows]
+    if (
+        ratio_row_dates != sorted(ratio_row_dates)
+        or len(ratio_row_dates) != len(set(ratio_row_dates))
+    ):
+        return False
+    for row in ratio_rows:
+        row_date = str(row.get("date") or "")
+        lineage = row.get("_lineage") or {}
+        ratio_lineage = lineage.get("Coverage proxy ratio") or {}
+        ratio_value = _reserves_ratio_from_lineage(
+            ratio_lineage.get("input_lineage") or []
+        )
+        if (
+            "Coverage proxy ratio" not in row
+            or ratio_lineage.get("source_key") != "internal"
+            or ratio_lineage.get("formula")
+            != "100 * WRBWFRBL / H8-B1151NCBA"
+            or not safe_pair(
+                ratio_lineage.get("input_lineage"), expected_date=row_date
+            )
+            or ratio_value is None
+            or not same(row["Coverage proxy ratio"], ratio_value)
+        ):
+            return False
+        if "8-week change" in row:
+            change_lineage = lineage.get("8-week change") or {}
+            change_current_inputs = change_lineage.get("input_lineage")
+            change_previous_inputs = change_lineage.get("previous_input_lineage")
+            change_current_ratio = _reserves_ratio_from_lineage(
+                change_current_inputs or []
+            )
+            change_previous_ratio = _reserves_ratio_from_lineage(
+                change_previous_inputs or []
+            )
+            current_lineage_date = pair_date(change_current_inputs)
+            lagged_lineage_date = pair_date(change_previous_inputs)
+            try:
+                parsed_row_date = date.fromisoformat(row_date)
+            except ValueError:
+                return False
+            if (
+                change_lineage.get("formula") != RESERVES_CHANGE_FORMULA
+                or not safe_pair(change_current_inputs, expected_date=row_date)
+                or current_lineage_date != parsed_row_date
+                or lagged_lineage_date
+                != parsed_row_date - RESERVES_CHANGE_LAG
+                or change_current_ratio is None
+                or change_previous_ratio is None
+                or not same(
+                    row["8-week change"],
+                    change_current_ratio - change_previous_ratio,
+                )
+            ):
+                return False
+    return True
+
+
+def _latest_reserves_snapshot() -> DashboardSnapshot | None:
+    return (
+        DashboardSnapshot.objects.filter(
+            key="reserves",
+            is_published=True,
+            data__contract_version=RESERVES_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+
+
+def reserves_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    """Guard the public route without rejecting a retained stale v1 snapshot."""
+
+    data = dict(snapshot.data or {})
+    component_batches = {
+        str(item) for item in data.get("component_batches", []) if item
+    }
+    if (
+        snapshot.key != "reserves"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or snapshot.source.key == "demo-market"
+        or data.get("demo") is True
+        or data.get("contract_version") != RESERVES_CONTRACT_VERSION
+        or str(data.get("publication_batch_id") or "")
+        != str(snapshot.batch_id)
+        or len(component_batches) != 2
+        or set(data.get("source_keys") or [])
+        != {"federal-reserve", "internal"}
+        or not _reserves_page_contract_is_buildable(
+            list(data.get("metrics") or []),
+            list(data.get("charts") or []),
+            data,
+        )
+    ):
+        return False
+    input_batches = {
+        str(item.get("batch_id") or "")
+        for item in data.get("input_datasets", [])
+        if isinstance(item, dict)
+    }
+    if input_batches != component_batches:
+        return False
+    public_sources, derived_sources = current_display_source_key_sets(
+        {"federal-reserve", "internal"}
+    )
+    return (
+        public_sources == {"federal-reserve", "internal"}
+        and derived_sources == public_sources
+    )
+
+
+def select_public_reserves_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    """Select the newest structurally complete, currently licensed v1 snapshot."""
+
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(key="reserves", is_published=True)
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if reserves_snapshot_is_publicly_displayable(candidate)
+        ),
+        None,
+    )
+
+
+def _reserves_snapshot_effective_date(snapshot: DashboardSnapshot) -> date:
+    try:
+        return date.fromisoformat(
+            str((snapshot.data or {}).get("common_effective_date") or "")
+        )
+    except ValueError:
+        return snapshot.as_of.date()
+
+
+def _mark_reserves_stale(
+    components: list[dict[str, Any]], *, reason: str
+) -> None:
+    latest = (
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="reserves",
+            is_published=True,
+            data__contract_version=RESERVES_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return
+    summary = "；".join(
+        (
+            f"{item.get('component') or 'unknown'}"
+            f"[{item.get('status') or 'invalid'}] "
+            f"{item.get('reason') or 'unknown failure'}"
+        )
+        for item in components
+    )
+    data = dict(latest.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason": f"{reason} 失败组件：{summary}" if summary else reason,
+        "components": components,
+        "sources": [
+            {
+                **item,
+                "error": str(item.get("reason") or ""),
+            }
+            for item in components
+        ],
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+def _reserves_snapshot_contract_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    selected_runs: dict[str, IngestionRun],
+) -> bool:
+    data = dict(snapshot.data or {})
+    expected_batches = {
+        str(selected_runs[identity].batch_id) for identity in RESERVES_DATASETS
+    }
+    if (
+        snapshot.key != "reserves"
+        or snapshot.source.key != "internal"
+        or not snapshot.is_published
+        or snapshot.quality_status
+        in {Observation.Quality.ERROR, Observation.Quality.STALE}
+        or data.get("contract_version") != RESERVES_CONTRACT_VERSION
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or set(data.get("component_batches") or []) != expected_batches
+        or set(data.get("source_keys") or [])
+        != {"federal-reserve", "internal"}
+        or data.get("refresh_failure")
+        or not _reserves_page_contract_is_buildable(
+            list(data.get("metrics") or []),
+            list(data.get("charts") or []),
+            data,
+        )
+    ):
+        return False
+    fresh_until = _parse_payload_datetime(data.get("fresh_until"))
+    if fresh_until is None or fresh_until < timezone.now():
+        return False
+    allowed, derived = current_display_source_key_sets(
+        {"federal-reserve", "internal"}
+    )
+    if allowed != {"federal-reserve", "internal"} or derived != allowed:
+        return False
+    normalized = {
+        item.key: item
+        for item in MetricSnapshot.objects.filter(
+            batch_id=snapshot.batch_id,
+            key__startswith="reserves-",
+        ).select_related("source", "fallback_source")
+    }
+    payload_metrics = {
+        str(item.get("key") or ""): item
+        for item in data.get("metrics", [])
+        if isinstance(item, dict)
+    }
+    if set(normalized) != {
+        f"reserves-{metric_key}" for metric_key in RESERVES_REQUIRED_METRIC_KEYS
+    }:
+        return False
+    for metric_key, metric in payload_metrics.items():
+        stored = normalized.get(f"reserves-{metric_key}")
+        metadata = metric.get("metadata") or {}
+        if (
+            stored is None
+            or stored.value is None
+            or stored.value.quantize(Decimal("0.00000001"))
+            != Decimal(str(metric["value"])).quantize(Decimal("0.00000001"))
+            or stored.source.key != metric.get("source_key")
+            or stored.fallback_source_id is not None
+            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.quality_status != metric.get("quality_status")
+            or not stored.license_scope
+            or stored.metadata.get("input_lineage")
+            != metadata.get("input_lineage")
+            or stored.metadata.get("previous_input_lineage")
+            != metadata.get("previous_input_lineage", [])
+            or stored.metadata.get("formula") != metadata.get("formula")
+            or set(stored.metadata.get("input_batch_ids") or [])
+            != set(metadata.get("input_batch_ids") or [])
+        ):
+            return False
+        if metric_key == "reserve-ratio-8w-zscore" and (
+            stored.metadata.get("sample_count") != metadata.get("sample_count")
+            or stored.metadata.get("population_mean")
+            != metadata.get("population_mean")
+            or stored.metadata.get("population_std")
+            != metadata.get("population_std")
+            or stored.metadata.get("sample_changes")
+            != metadata.get("sample_changes")
+        ):
+            return False
+    return True
+
+
+@transaction.atomic
+def _coordinate_reserves_dashboard(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    for source_key in ("federal-reserve", "internal"):
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in={"federal-reserve", "internal"})
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    selected, states, triggered = _select_reserves_runs(trigger_runs)
+    if not triggered:
+        return [], set()
+    if selected is None:
+        _mark_reserves_stale(
+            states,
+            reason=(
+                "最近一次 H.4.1 或 H.8 精确数据集未成功完成，"
+                "或触发批次不是该数据集的最新 attempt；继续保留上一版。"
+            ),
+        )
+        return [], {"reserves"}
+    prepared, failures = _reserves_page_data(selected)
+    if prepared is None:
+        _mark_reserves_stale(
+            failures,
+            reason=(
+                "H.4.1 与 H.8 未形成同日、同批、无回退且许可有效的"
+                "完整 reserves v1 组合；继续保留上一版。"
+            ),
+        )
+        return [], {"reserves"}
+    candidate_date = date.fromisoformat(prepared[3]["common_effective_date"])
+    previous_snapshot = _latest_reserves_snapshot()
+    if (
+        previous_snapshot is not None
+        and candidate_date < _reserves_snapshot_effective_date(previous_snapshot)
+    ):
+        _mark_reserves_stale(
+            [
+                _reserves_failure(
+                    "common-date",
+                    "candidate common Wednesday is older than the published v1 snapshot",
+                    status=Observation.Quality.STALE,
+                    snapshot=previous_snapshot,
+                )
+            ],
+            reason="候选共同周三发生回退；拒绝发布并保留上一版。",
+        )
+        return [], {"reserves"}
+    try:
+        with transaction.atomic():
+            dashboards = publish_official_dashboards(
+                keys={"reserves"}, prepared_reserves_data=prepared
+            )
+            latest = _latest_reserves_snapshot()
+            if latest is None or not _reserves_snapshot_contract_is_valid(
+                latest, selected_runs=selected
+            ):
+                raise ValueError("reserves publication postcondition failed")
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ):
+        _mark_reserves_stale(
+            [
+                _reserves_failure(
+                    "reserves",
+                    "publication postcondition failed",
+                    snapshot=previous_snapshot,
+                )
+            ],
+            reason=(
+                "reserves v1 发布后置条件未满足；新写入已回滚，"
+                "继续保留上一版完整快照。"
+            ),
+        )
+        return [], {"reserves"}
     return dashboards, set()
 
 
@@ -8489,6 +10296,149 @@ def _store_board_archive_observations(result, source, run) -> int:
     return row_count
 
 
+def _prepare_board_release_metadata(result, *, dataset: str) -> None:
+    """Validate and stamp release-aware freshness only for H.4.1 and H.8."""
+
+    if dataset == "h41":
+        freshness_days = H41_RELEASE_FRESHNESS_DAYS
+    elif dataset == "h8":
+        freshness_days = H8_RELEASE_FRESHNESS_DAYS
+    else:
+        raise ValueError("release-aware Board metadata is limited to H.4.1 and H.8")
+    result_metadata = dict(result.metadata or {})
+    raw_release_time = result_metadata.get(
+        "source_release_time"
+    ) or result_metadata.get("prepared_at")
+    if dataset == "h41":
+        observation_dates_by_series: dict[str, list[str]] = {}
+        raw_requested_series = result_metadata.get("requested_series")
+        if isinstance(raw_requested_series, (list, tuple)):
+            for raw_series_id in raw_requested_series:
+                series_id = str(raw_series_id or "").strip()
+                if series_id:
+                    observation_dates_by_series.setdefault(series_id, [])
+        for record in result.records:
+            metadata = dict(record.get("metadata") or {})
+            series_id = str(
+                record.get("source_series_id")
+                or metadata.get("board_series_id")
+                or record.get("series_id")
+                or ""
+            ).strip()
+            if not series_id:
+                continue
+            dates = observation_dates_by_series.setdefault(series_id, [])
+            if (
+                record.get("value") is not None
+                and record.get("status") in {None, "", "A"}
+            ):
+                dates.append(str(record.get("date") or ""))
+        source_release_time = validate_h41_release_time(
+            raw_release_time,
+            fetched_at=result.fetched_at,
+            observation_dates_by_series=observation_dates_by_series,
+        )
+    else:
+        source_release_time = validate_h8_release_time(
+            raw_release_time,
+            fetched_at=result.fetched_at,
+            observation_dates=(
+                str(record.get("date") or "")
+                for record in result.records
+                if record.get("value") is not None
+                and record.get("status") in {None, "", "A"}
+            ),
+        )
+    canonical_release_time = source_release_time.isoformat()
+    result.metadata = {
+        **result_metadata,
+        "source_release_time": canonical_release_time,
+        "release_freshness_days": freshness_days,
+    }
+    for record in result.records:
+        metadata = dict(record.get("metadata") or {})
+        metadata.update(
+            {
+                "source_release_time": canonical_release_time,
+                "release_freshness_days": freshness_days,
+            }
+        )
+        record["metadata"] = metadata
+
+
+def _guard_latest_board_archive_persistence(result, source, run) -> None:
+    """Prevent delayed H.4.1/H.8 attempts or older releases from clobbering rows."""
+
+    Source.objects.select_for_update().get(pk=source.pk)
+    latest_attempt = (
+        IngestionRun.objects.filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError(
+            f"superseded {run.dataset} ingestion run cannot persist observations"
+        )
+    candidate_release_time = _parse_payload_datetime(
+        (result.metadata or {}).get("source_release_time")
+    )
+    if candidate_release_time is None:
+        raise ValueError(f"{run.dataset} candidate release time is invalid")
+
+    release_watermarks: list[datetime] = []
+
+    def append_watermark(raw_value: Any, *, context: str) -> None:
+        if raw_value is None or raw_value == "":
+            return
+        parsed = _parse_payload_datetime(raw_value)
+        if parsed is None:
+            raise ValueError(
+                f"{run.dataset} has invalid nonempty {context} release watermark"
+            )
+        release_watermarks.append(parsed)
+
+    prior_runs = (
+        IngestionRun.objects.filter(source=source, dataset=run.dataset)
+        .exclude(pk=run.pk)
+        .order_by("-started_at", "-id")
+    )
+    for previous in prior_runs:
+        append_watermark(
+            (previous.metadata or {}).get("source_release_time"),
+            context=f"run {previous.pk}",
+        )
+
+    incoming_series_keys = {
+        str(record.get("series_id") or "").lower()
+        for record in result.records
+        if record.get("series_id")
+    }
+    existing_observation_metadata = Observation.objects.filter(
+        source=source,
+        series__key__in=incoming_series_keys,
+    ).values_list("metadata", flat=True)
+    for metadata in existing_observation_metadata.iterator(chunk_size=2000):
+        append_watermark(
+            (metadata or {}).get("source_release_time"),
+            context="observation",
+        )
+
+    if release_watermarks and candidate_release_time < max(release_watermarks):
+        raise ValueError(
+            f"{run.dataset} source release time regressed behind the durable "
+            "release watermark"
+        )
+
+    run.metadata = {
+        **dict(run.metadata or {}),
+        "source_release_time": candidate_release_time.isoformat(),
+        "release_freshness_days": (result.metadata or {}).get(
+            "release_freshness_days"
+        ),
+    }
+    run.save(update_fields=["metadata", "updated_at"])
+
+
 def _store_series_with_artifacts(result, source, run) -> int:
     """Persist normalized series and immutable response fingerprints."""
 
@@ -8643,6 +10593,32 @@ def _store_treasury_curve_observations(result, source, run) -> int:
 def _store_h41_observations(result, source, run) -> int:
     """Backward-compatible H.4.1 persistence entry point used by tests/jobs."""
 
+    _prepare_board_release_metadata(result, dataset="h41")
+    _guard_latest_board_archive_persistence(result, source, run)
+    return _store_board_archive_observations(result, source, run)
+
+
+def _store_h8_observations(result, source, run) -> int:
+    """Persist H.8 history with its official weekly USD-million definition."""
+
+    if (
+        source.key != "federal-reserve"
+        or result.dataset != "h8"
+        or run.dataset != "h8"
+    ):
+        raise ValueError("H.8 persistence source/run identity mismatch")
+    _prepare_board_release_metadata(result, dataset="h8")
+    _guard_latest_board_archive_persistence(result, source, run)
+    SeriesDefinition.objects.get_or_create(
+        key="h8-b1151ncba",
+        defaults={
+            "name": "Total assets, all commercial banks, seasonally adjusted",
+            "unit": "USD millions",
+            "source": source,
+            "frequency": "weekly",
+            "description": "Imported directly from Federal Reserve Board H.8.",
+        },
+    )
     return _store_board_archive_observations(result, source, run)
 
 
@@ -9045,6 +11021,7 @@ def _publish_dashboard(
                     "required_notices",
                     "as_of",
                     "component_snapshots",
+                    "component_runs",
                     "component_snapshot_id",
                     "component_snapshot_batch_id",
                     "component_snapshot_fingerprint",
@@ -9105,6 +11082,28 @@ def _publish_dashboard(
             "prates_status": component_metadata.get("prates_status"),
             "calculation_owner": component_metadata.get(
                 "calculation_owner"
+            ),
+            "normalization": component_metadata.get("normalization"),
+            "coverage_proxy": component_metadata.get("coverage_proxy"),
+            "sample_window": component_metadata.get("sample_window"),
+            "lag_calendar_days": component_metadata.get(
+                "lag_calendar_days"
+            ),
+            "minimum_sample_count": component_metadata.get(
+                "minimum_sample_count"
+            ),
+            "maximum_sample_count": component_metadata.get(
+                "maximum_sample_count"
+            ),
+            "sample_count": component_metadata.get("sample_count"),
+            "population_mean": component_metadata.get("population_mean"),
+            "population_std": component_metadata.get("population_std"),
+            "population_standard_deviation": component_metadata.get(
+                "population_standard_deviation"
+            ),
+            "sample_changes": component_metadata.get("sample_changes", []),
+            "current_8w_change": component_metadata.get(
+                "current_8w_change"
             ),
             "component_page_key": component_metadata.get(
                 "component_page_key"
@@ -9254,6 +11253,13 @@ def publish_official_dashboards(
         dict[str, Any],
     ]
     | None = None,
+    prepared_reserves_data: tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None = None,
     prepared_treasury_curve_data: dict[
         str,
         tuple[
@@ -9316,6 +11322,10 @@ def publish_official_dashboards(
     liquidity_charts: list[dict[str, Any]] = []
     liquidity_sections: list[dict[str, Any]] = []
     liquidity_extra_data: dict[str, Any] = {}
+    reserves_metrics: list[dict[str, Any]] = []
+    reserves_charts: list[dict[str, Any]] = []
+    reserves_sections: list[dict[str, Any]] = []
+    reserves_extra_data: dict[str, Any] = {}
     retail_source_key = "census-release"
     retail_batch = normalized_source_batches.get(retail_source_key)
     gdp_vintage_chart: dict[str, Any] | None = None
@@ -9514,6 +11524,16 @@ def publish_official_dashboards(
             liquidity_sections,
             liquidity_extra_data,
         ) = prepared_liquidity_data
+    if (
+        (selected_keys is None or "reserves" in selected_keys)
+        and prepared_reserves_data is not None
+    ):
+        (
+            reserves_metrics,
+            reserves_charts,
+            reserves_sections,
+            reserves_extra_data,
+        ) = prepared_reserves_data
     dashboards: list[DashboardSnapshot] = []
     definitions = [
         {
@@ -9725,11 +11745,17 @@ def publish_official_dashboards(
         {
             "key": "reserves",
             "title": "银行准备金",
-            "summary": "准备金余额直接来自 Federal Reserve H.4.1；银行资产占比与充裕度阈值在分母及方法完成前保持空缺。",
-            "metrics": _existing(
-                _metric("WRBWFRBL", "准备金", scale=Decimal("0.000001"), suffix=" USD tn")
+            "summary": (
+                "Federal Reserve H.4.1 准备金余额与 H.8 美国商业银行"
+                "总资产只在最新非未来共同周三原子发布。比率是"
+                "覆盖近似，不是监管资本、LCR、严格同口径评估或"
+                "Federal Reserve 官方指标。"
             ),
-            "chart_data": _history_rows({"WRBWFRBL": "准备金"}, limit=156),
+            "metrics": reserves_metrics,
+            "charts": reserves_charts,
+            "sections": reserves_sections,
+            "extra_data": reserves_extra_data,
+            "required_metric_keys": RESERVES_REQUIRED_METRIC_KEYS,
         },
         {
             "key": "global-dollar",
@@ -10192,17 +12218,33 @@ def refresh_treasury_curve_data(
 def refresh_h41_data() -> dict[str, Any]:
     """Refresh the large weekly H.4.1 package separately from frequent jobs."""
 
+    refresh_id = str(uuid.uuid4())
     provider = FederalReserveH41Provider()
     try:
         result = provider.h41()
+        result.metadata = {
+            **result.metadata,
+            "reserves_refresh_id": refresh_id,
+            "reserves_refresh_component": "h41",
+        }
         run = record_provider_result(result, persist=_store_h41_observations)
     finally:
         provider.close()
+    run.metadata = {
+        **dict(run.metadata or {}),
+        "reserves_refresh_id": refresh_id,
+        "reserves_refresh_component": "h41",
+    }
+    run.save(update_fields=["metadata", "updated_at"])
     dashboards = (
         publish_official_dashboards(keys=H41_PUBLICATION_KEYS)
         if _has_publishable_run([run])
         else []
     )
+    reserves_dashboards, stale_reserves_keys = (
+        _coordinate_reserves_dashboard([run])
+    )
+    dashboards.extend(reserves_dashboards)
     liquidity_dashboards, stale_liquidity_keys = (
         _coordinate_liquidity_dashboard([run])
     )
@@ -10219,7 +12261,47 @@ def refresh_h41_data() -> dict[str, Any]:
             }
         ],
         "dashboard_keys": [dashboard.key for dashboard in dashboards],
-        "stale_dashboard_keys": sorted(stale_liquidity_keys),
+        "stale_dashboard_keys": sorted(
+            stale_reserves_keys | stale_liquidity_keys
+        ),
+    }
+
+
+def refresh_h8_data() -> dict[str, Any]:
+    """Refresh Board H.8 and atomically coordinate the reserves v1 page."""
+
+    refresh_id = str(uuid.uuid4())
+    provider = FederalReserveH8Provider()
+    try:
+        result = provider.h8()
+        result.metadata = {
+            **result.metadata,
+            "reserves_refresh_id": refresh_id,
+            "reserves_refresh_component": "h8",
+        }
+        run = record_provider_result(result, persist=_store_h8_observations)
+    finally:
+        provider.close()
+    run.metadata = {
+        **dict(run.metadata or {}),
+        "reserves_refresh_id": refresh_id,
+        "reserves_refresh_component": "h8",
+    }
+    run.save(update_fields=["metadata", "updated_at"])
+    dashboards, stale_keys = _coordinate_reserves_dashboard([run])
+    return {
+        "runs": [
+            {
+                "source": run.source.key,
+                "dataset": run.dataset,
+                "status": run.status,
+                "row_count": run.row_count,
+                "error": run.error,
+                "metadata": run.metadata,
+            }
+        ],
+        "dashboard_keys": [dashboard.key for dashboard in dashboards],
+        "stale_dashboard_keys": sorted(stale_keys),
     }
 
 

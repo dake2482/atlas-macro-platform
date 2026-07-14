@@ -134,6 +134,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "research.tasks.refresh_h41_sources",
         "schedule": crontab(day_of_week="fri", hour=6, minute=0),
     },
+    "refresh-h8-weekly": {
+        "task": "research.tasks.refresh_h8_sources",
+        "schedule": crontab(day_of_week="sat", hour=6, minute=20),
+    },
     "refresh-prates-daily": {
         "task": "research.tasks.refresh_prates_sources",
         "schedule": crontab(hour=6, minute=20),

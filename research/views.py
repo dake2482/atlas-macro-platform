@@ -49,6 +49,7 @@ from .models import (
     SupplyChainNode,
     Thesis,
 )
+from .official_data import select_public_reserves_snapshot
 from .page_registry import get_page_config
 from .public_ai_contract import is_pending_ai_company_contract_slug
 from .sec_company_facts import (
@@ -913,6 +914,16 @@ def dashboard_page(request, page_key: str):
         snapshot = select_public_supply_chain_demand_snapshot(snapshot_candidates[:50])
         if snapshot is not None:
             snapshot_source_keys = {"sec"}
+    elif snapshot_key == "reserves":
+        for candidate in snapshot_candidates[:50]:
+            candidate_failure = (candidate.data or {}).get("refresh_failure")
+            if blocked_refresh_failure is None and isinstance(
+                candidate_failure, dict
+            ):
+                blocked_refresh_failure = candidate_failure
+        snapshot = select_public_reserves_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            snapshot_source_keys = {"federal-reserve", "internal"}
     else:
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")

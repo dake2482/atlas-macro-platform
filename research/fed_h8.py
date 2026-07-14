@@ -1,9 +1,8 @@
-"""Direct Federal Reserve Board H.4.1 balance-sheet data provider.
+"""Direct Federal Reserve Board H.8 commercial-bank data provider.
 
-The Board's fixed ``FRB_H41.zip`` endpoint is the source of truth here.  The
-archive contains a roughly 125 MB SDMX XML member, so the response is spooled
-to a temporary file and parsed observation-by-observation.  Neither the ZIP
-payload nor the expanded XML document is materialized as one large ``bytes``
+The Board Data Download Program ZIP is the source of truth.  H.8 history is
+downloaded into a temporary file and parsed observation-by-observation so the
+compressed archive and expanded XML are never materialized as one in-memory
 object.
 """
 
@@ -24,68 +23,36 @@ import httpx
 
 from .providers import HTTPProvider, ProviderResult
 
-H41_ZIP_URL = "https://www.federalreserve.gov/datadownload/Output.aspx?rel=H41&filetype=zip"
-H41_DATA_MEMBER = "H41_data.xml"
-
-# ``series_id`` intentionally uses the familiar application/FRED-compatible
-# identifier already used by Atlas Macro.  ``source_series_id`` and metadata
-# always retain the authoritative Board DDP identifier, so the source is never
-# represented as FRED data.
-H41_TARGET_SERIES: dict[str, dict[str, str]] = {
-    "RESPPMA_N.WW": {
-        "series_id": "WALCL",
-        "name": "Federal Reserve total assets",
-        "fred_series_id": "WALCL",
-    },
-    "RESPPALGUO_N.WW": {
-        "series_id": "WSHOTSL",
-        "name": "U.S. Treasury securities held outright",
-        "fred_series_id": "WSHOTSL",
-    },
-    "RESPPALGASMO_N.WW": {
-        "series_id": "WSHOMCB",
-        "name": "Mortgage-backed securities held outright",
-        "fred_series_id": "WSHOMCB",
-    },
-    "RESH4R_N.WW": {
-        "series_id": "WRBWFRBL",
-        "name": "Reserve balances with Federal Reserve Banks",
-        "fred_series_id": "WRBWFRBL",
-    },
-    "RESPPLLDT_N.WW": {
-        "series_id": "WDTGAL",
-        "name": "U.S. Treasury General Account",
-        "fred_series_id": "WDTGAL",
-    },
-    "RESH4SCS_N.WW": {
-        "series_id": "SWPT",
-        "name": "Central bank liquidity swaps",
-        "fred_series_id": "SWPT",
-    },
+H8_ZIP_URL = "https://www.federalreserve.gov/datadownload/Output.aspx?rel=H8&filetype=zip"
+H8_DATA_MEMBER = "H8_data.xml"
+H8_TARGET_SERIES: dict[str, dict[str, str]] = {
+    "B1151NCBA": {
+        "series_id": "H8-B1151NCBA",
+        "name": "Total assets, all commercial banks, seasonally adjusted",
+    }
 }
-
-H41_OBSERVATION_STATUSES = {
+H8_OBSERVATION_STATUSES = {
     "A": "Normal",
-    "NC": "Not calculable",
     "NA": "Not available",
+    "NC": "Not calculable",
     "ND": "No data",
 }
-H41_COMMON_DIMENSIONS = {
-    "FREQ": "19",
-    "CURRENCY": "USD",
-    "UNIT": "Currency",
-    "UNIT_MULT": "1000000",
+H8_REQUIRED_DIMENSIONS = {
+    "B1151NCBA": {
+        "BG": "CB",
+        "CATEGORY": "A",
+        "CURRENCY": "USD",
+        "FREQ": "19",
+        "H8_UNITS": "LEVEL",
+        "ITEM": "1151",
+        "SA": "SA",
+        "UNIT": "Currency",
+        "UNIT_MULT": "1000000",
+    }
 }
-H41_RESERVES_DIMENSIONS = {
-    "SERIESTYPE": "L",
-    "CATEGORY": "LIABCAP",
-    "SUBCATEGORY": "OFDRB",
-    "COMPONENT": "RBFRB",
-    "DISTRIBUTION": "TOT",
-}
-H41_RELEASE_FRESHNESS_DAYS = 8
-H41_RELEASE_FUTURE_TOLERANCE = timedelta(minutes=5)
-H41_MAX_RELEASE_LAG_DAYS = 7
+H8_RELEASE_FRESHNESS_DAYS = 8
+H8_RELEASE_FUTURE_TOLERANCE = timedelta(minutes=5)
+H8_MAX_RELEASE_LAG_DAYS = 12
 
 
 def _local_name(tag: str) -> str:
@@ -93,11 +60,9 @@ def _local_name(tag: str) -> str:
 
 
 def _decimal_or_none(raw_value: str | None, status: str) -> Decimal | None:
-    """Treat OBS_STATUS as authoritative, including numeric sentinels."""
+    """Treat the Board status as authoritative, including numeric sentinels."""
 
-    if status != "A":
-        return None
-    if raw_value is None or raw_value.strip().upper() in {"", ".", "NA", "NC", "ND"}:
+    if status != "A" or raw_value is None:
         return None
     try:
         value = Decimal(raw_value)
@@ -106,22 +71,22 @@ def _decimal_or_none(raw_value: str | None, status: str) -> Decimal | None:
     return value if value.is_finite() else None
 
 
-def validate_h41_release_time(
+def validate_h8_release_time(
     raw_prepared_at: Any,
     *,
     fetched_at: datetime,
-    observation_dates_by_series: Mapping[str, Iterable[str]],
+    observation_dates: Iterable[str],
 ) -> datetime:
-    """Validate the release against each requested series' latest valid A row."""
+    """Validate the official archive release time against fetch and A rows."""
 
     if not raw_prepared_at:
-        raise ValueError("H.4.1 XML Prepared timestamp is missing")
+        raise ValueError("H.8 XML Prepared timestamp is missing")
     try:
         prepared_at = datetime.fromisoformat(
             str(raw_prepared_at).strip().replace("Z", "+00:00")
         )
     except (TypeError, ValueError) as exc:
-        raise ValueError("H.4.1 XML Prepared timestamp is invalid") from exc
+        raise ValueError("H.8 XML Prepared timestamp is invalid") from exc
     if prepared_at.tzinfo is None:
         prepared_at = prepared_at.replace(tzinfo=UTC)
     else:
@@ -131,57 +96,45 @@ def validate_h41_release_time(
         normalized_fetched_at = normalized_fetched_at.replace(tzinfo=UTC)
     else:
         normalized_fetched_at = normalized_fetched_at.astimezone(UTC)
-    if prepared_at > normalized_fetched_at + H41_RELEASE_FUTURE_TOLERANCE:
-        raise ValueError("H.4.1 XML Prepared timestamp is in the future")
-    if not observation_dates_by_series:
-        raise ValueError("H.4.1 has no requested series to validate")
-    for raw_series_id, observation_dates in observation_dates_by_series.items():
-        series_id = str(raw_series_id or "").strip()
-        if not series_id:
-            raise ValueError("H.4.1 requested series identifier is missing")
-        try:
-            parsed_observation_dates = [
-                date.fromisoformat(str(value)[:10]) for value in observation_dates
-            ]
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"H.4.1 latest A observation date is invalid for {series_id}"
-            ) from exc
-        if not parsed_observation_dates:
-            raise ValueError(
-                f"H.4.1 requested series {series_id} has no valid A observations"
-            )
+    if prepared_at > normalized_fetched_at + H8_RELEASE_FUTURE_TOLERANCE:
+        raise ValueError("H.8 XML Prepared timestamp is in the future")
+    try:
+        parsed_observation_dates = [
+            date.fromisoformat(value[:10]) for value in observation_dates
+        ]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("H.8 latest A observation date is invalid") from exc
+    if parsed_observation_dates:
         latest_observation = max(parsed_observation_dates)
         release_lag_days = (prepared_at.date() - latest_observation).days
         if release_lag_days < 0:
             raise ValueError(
-                "H.4.1 XML Prepared timestamp predates the latest A observation "
-                f"for {series_id}"
+                "H.8 XML Prepared timestamp predates its latest A observation"
             )
-        if release_lag_days > H41_MAX_RELEASE_LAG_DAYS:
+        if release_lag_days > H8_MAX_RELEASE_LAG_DAYS:
             raise ValueError(
-                f"H.4.1 latest A observation for {series_id} is too old for "
-                f"the Prepared release: {release_lag_days} days"
+                "H.8 latest A observation is too old for the Prepared release: "
+                f"{release_lag_days} days"
             )
     return prepared_at
 
 
-class FederalReserveH41Provider(HTTPProvider):
-    """Fetch six core H.4.1 balance-sheet series directly from the Board."""
+class FederalReserveH8Provider(HTTPProvider):
+    """Fetch the authoritative weekly all-commercial-bank asset series."""
 
     key = "federal-reserve"
     base_url = "https://www.federalreserve.gov"
     archive_path = "/datadownload/Output.aspx"
-    archive_params = {"rel": "H41", "filetype": "zip"}
+    archive_params = {"rel": "H8", "filetype": "zip"}
 
     def __init__(
         self,
         *,
         client: httpx.Client | None = None,
-        timeout: float = 120.0,
-        max_archive_bytes: int = 64 * 1024 * 1024,
-        max_xml_bytes: int = 512 * 1024 * 1024,
-        max_download_seconds: float = 300.0,
+        timeout: float = 90.0,
+        max_archive_bytes: int = 32 * 1024 * 1024,
+        max_xml_bytes: int = 192 * 1024 * 1024,
+        max_download_seconds: float = 180.0,
     ) -> None:
         self.max_archive_bytes = max_archive_bytes
         self.max_xml_bytes = max_xml_bytes
@@ -191,63 +144,52 @@ class FederalReserveH41Provider(HTTPProvider):
             timeout=timeout,
             headers={
                 "Accept": "application/zip, application/x-zip-compressed",
-                "User-Agent": "AtlasMacro/0.1 H41 data downloader",
+                "User-Agent": "AtlasMacro/0.1 H8 data downloader",
             },
         )
 
-    def h41(self, *, series_ids: Iterable[str] | None = None) -> ProviderResult:
-        """Download and normalize the requested subset of the six target series."""
-
-        dataset = "h41"
-        requested_source = H41_TARGET_SERIES if series_ids is None else series_ids
+    def h8(self, *, series_ids: Iterable[str] | None = None) -> ProviderResult:
+        dataset = "h8"
+        requested_source = H8_TARGET_SERIES if series_ids is None else series_ids
         requested = tuple(dict.fromkeys(requested_source))
-        unsupported = sorted(set(requested) - H41_TARGET_SERIES.keys())
+        unsupported = sorted(set(requested) - H8_TARGET_SERIES.keys())
         if unsupported:
             return ProviderResult.failure(
                 self.key,
                 dataset,
-                f"unsupported H.4.1 series: {', '.join(unsupported)}",
+                f"unsupported H.8 series: {', '.join(unsupported)}",
             )
         if not requested:
-            return ProviderResult.failure(self.key, dataset, "no H.4.1 series requested")
+            return ProviderResult.failure(self.key, dataset, "no H.8 series requested")
 
         try:
             with tempfile.TemporaryFile(mode="w+b") as archive_file:
                 archive_size, archive_sha256 = self._download_archive(archive_file)
                 archive_file.seek(0)
-                records, parse_metadata = self._parse_archive(archive_file, requested)
+                records, metadata = self._parse_archive(archive_file, requested)
             fetched_at = datetime.now(UTC)
-            observation_dates_by_series: dict[str, list[str]] = {
-                series_id: [] for series_id in requested
-            }
-            for record in records:
-                source_series_id = str(record.get("source_series_id") or "")
-                if (
-                    source_series_id in observation_dates_by_series
-                    and record.get("status") == "A"
-                    and record.get("value") is not None
-                ):
-                    observation_dates_by_series[source_series_id].append(
-                        str(record.get("date") or "")
-                    )
-            source_release_time = validate_h41_release_time(
-                parse_metadata.get("prepared_at"),
+            source_release_time = validate_h8_release_time(
+                metadata.get("prepared_at"),
                 fetched_at=fetched_at,
-                observation_dates_by_series=observation_dates_by_series,
+                observation_dates=(
+                    str(record.get("date") or "")
+                    for record in records
+                    if record.get("status") == "A" and record.get("value") is not None
+                ),
             )
             for record in records:
                 record_metadata = dict(record.get("metadata") or {})
                 record_metadata.update(
                     {
                         "source_release_time": source_release_time.isoformat(),
-                        "release_freshness_days": H41_RELEASE_FRESHNESS_DAYS,
+                        "release_freshness_days": H8_RELEASE_FRESHNESS_DAYS,
                     }
                 )
                 record["metadata"] = record_metadata
-            parse_metadata.update(
+            metadata.update(
                 {
                     "source_release_time": source_release_time.isoformat(),
-                    "release_freshness_days": H41_RELEASE_FRESHNESS_DAYS,
+                    "release_freshness_days": H8_RELEASE_FRESHNESS_DAYS,
                 }
             )
         except (
@@ -261,7 +203,7 @@ class FederalReserveH41Provider(HTTPProvider):
                 provider=self.key,
                 dataset=dataset,
                 error=f"{type(exc).__name__}: {exc}"[:2000],
-                metadata={"source_url": H41_ZIP_URL},
+                metadata={"source_url": H8_ZIP_URL},
             )
 
         return ProviderResult(
@@ -270,11 +212,10 @@ class FederalReserveH41Provider(HTTPProvider):
             records=records,
             fetched_at=fetched_at,
             metadata={
-                "source_url": H41_ZIP_URL,
-                "archive_member": parse_metadata.pop("archive_member"),
+                "source_url": H8_ZIP_URL,
                 "archive_size": archive_size,
                 "archive_sha256": archive_sha256,
-                **parse_metadata,
+                **metadata,
             },
         )
 
@@ -283,23 +224,15 @@ class FederalReserveH41Provider(HTTPProvider):
         archive_size = 0
         started_at = time.monotonic()
         with self.client.stream(
-            "GET",
-            self.archive_path,
-            params=self.archive_params,
+            "GET", self.archive_path, params=self.archive_params
         ) as response:
             response.raise_for_status()
             for chunk in response.iter_bytes(chunk_size=64 * 1024):
                 if time.monotonic() - started_at > self.max_download_seconds:
-                    raise OSError(
-                        "H.4.1 ZIP exceeded configured total download time "
-                        f"({self.max_download_seconds:g} seconds)"
-                    )
+                    raise OSError("H.8 ZIP exceeded configured total download time")
                 archive_size += len(chunk)
                 if archive_size > self.max_archive_bytes:
-                    raise OSError(
-                        "H.4.1 ZIP exceeded configured compressed-size limit "
-                        f"({self.max_archive_bytes} bytes)"
-                    )
+                    raise OSError("H.8 ZIP exceeded configured compressed-size limit")
                 destination.write(chunk)
                 digest.update(chunk)
         return archive_size, digest.hexdigest()
@@ -315,16 +248,13 @@ class FederalReserveH41Provider(HTTPProvider):
         status_counts: Counter[str] = Counter()
         series_counts: Counter[str] = Counter()
         seen_observations: set[tuple[str, date]] = set()
-        missing_observations = 0
         prepared_at = ""
+        missing_observations = 0
 
         with zipfile.ZipFile(archive_file) as archive:
             member = self._data_member(archive)
             if member.file_size > self.max_xml_bytes:
-                raise OSError(
-                    "H.4.1 XML exceeded configured expanded-size limit "
-                    f"({self.max_xml_bytes} bytes)"
-                )
+                raise OSError("H.8 XML exceeded configured expanded-size limit")
             with archive.open(member) as xml_stream:
                 active: dict[str, Any] | None = None
                 for event, element in ElementTree.iterparse(
@@ -338,7 +268,7 @@ class FederalReserveH41Provider(HTTPProvider):
                             series_counts[board_series_id] += 1
                             if series_counts[board_series_id] > 1:
                                 raise ValueError(
-                                    "H.4.1 requested Board series must appear exactly "
+                                    "H.8 requested Board series must appear exactly "
                                     f"once: {board_series_id}"
                                 )
                             attributes = dict(element.attrib)
@@ -355,7 +285,6 @@ class FederalReserveH41Provider(HTTPProvider):
                         continue
                     if event != "end":
                         continue
-
                     if name == "Prepared" and not prepared_at:
                         prepared_at = (element.text or "").strip()
                     elif name == "AnnotationText" and active is not None:
@@ -371,16 +300,14 @@ class FederalReserveH41Provider(HTTPProvider):
                             observation_key = (board_series_id, period)
                             if observation_key in seen_observations:
                                 raise ValueError(
-                                    "H.4.1 duplicate observation for "
+                                    "H.8 duplicate observation for "
                                     f"{board_series_id} on {period.isoformat()}"
                                 )
                             seen_observations.add(observation_key)
                             record = self._observation_record(active, element.attrib)
                             records.append(record)
-                            status_counts[record["status"] or "UNKNOWN"] += 1
+                            status_counts[record["status"] or "MISSING"] += 1
                             missing_observations += int(record["is_missing"])
-                        # Clearing each observation keeps memory bounded even while a
-                        # source series contains its complete multi-decade history.
                         element.clear()
                     elif name == "Series":
                         if active is not None:
@@ -395,7 +322,7 @@ class FederalReserveH41Provider(HTTPProvider):
         }
         if invalid_series_counts:
             raise ValueError(
-                "H.4.1 requested Board series must appear exactly once: "
+                "H.8 requested Board series must appear exactly once: "
                 f"{invalid_series_counts}"
             )
         missing_series = sorted(requested_set - found)
@@ -416,16 +343,17 @@ class FederalReserveH41Provider(HTTPProvider):
             "missing_observation_count": missing_observations,
         }
 
-    def _data_member(self, archive: zipfile.ZipFile) -> zipfile.ZipInfo:
+    @staticmethod
+    def _data_member(archive: zipfile.ZipFile) -> zipfile.ZipInfo:
         members = [
             member
             for member in archive.infolist()
-            if member.filename.rsplit("/", 1)[-1] == H41_DATA_MEMBER
+            if member.filename.rsplit("/", 1)[-1] == H8_DATA_MEMBER
         ]
         if len(members) != 1:
             raise zipfile.BadZipFile(
-                "H.4.1 archive must contain exactly one "
-                f"{H41_DATA_MEMBER}; found {len(members)}"
+                "H.8 archive must contain exactly one "
+                f"{H8_DATA_MEMBER}; found {len(members)}"
             )
         return members[0]
 
@@ -433,9 +361,7 @@ class FederalReserveH41Provider(HTTPProvider):
     def _validate_series_dimensions(
         board_series_id: str, attributes: Mapping[str, str]
     ) -> None:
-        expected = dict(H41_COMMON_DIMENSIONS)
-        if board_series_id == "RESH4R_N.WW":
-            expected.update(H41_RESERVES_DIMENSIONS)
+        expected = H8_REQUIRED_DIMENSIONS[board_series_id]
         mismatches = {
             key: {"expected": expected_value, "actual": attributes.get(key)}
             for key, expected_value in expected.items()
@@ -443,8 +369,7 @@ class FederalReserveH41Provider(HTTPProvider):
         }
         if mismatches:
             raise ValueError(
-                f"H.4.1 semantic dimension drift for {board_series_id}: "
-                f"{mismatches}"
+                f"H.8 semantic dimension drift for {board_series_id}: {mismatches}"
             )
 
     @staticmethod
@@ -455,52 +380,47 @@ class FederalReserveH41Provider(HTTPProvider):
             period = date.fromisoformat(str(raw_period or ""))
         except ValueError as exc:
             raise ValueError(
-                "H.4.1 invalid observation date for "
-                f"{board_series_id}: {raw_period!r}"
+                f"H.8 invalid observation date for {board_series_id}: {raw_period!r}"
             ) from exc
         if period.weekday() != 2:
             raise ValueError(
-                f"H.4.1 non-Wednesday observation for {board_series_id}: "
+                f"H.8 non-Wednesday observation for {board_series_id}: "
                 f"{period.isoformat()}"
             )
         return period
 
     @staticmethod
     def _observation_record(
-        active: Mapping[str, Any],
-        observation: Mapping[str, str],
+        active: Mapping[str, Any], observation: Mapping[str, str]
     ) -> dict[str, Any]:
         board_series_id = str(active["board_series_id"])
-        target = H41_TARGET_SERIES[board_series_id]
+        target = H8_TARGET_SERIES[board_series_id]
         attributes = dict(active["series_attributes"])
-        raw_value = observation.get("OBS_VALUE")
         status = observation.get("OBS_STATUS", "")
-        if status not in H41_OBSERVATION_STATUSES:
+        if status not in H8_OBSERVATION_STATUSES:
             raise ValueError(
-                f"H.4.1 unknown observation status for {board_series_id}: {status!r}"
+                f"H.8 unknown observation status for {board_series_id}: {status!r}"
             )
+        raw_value = observation.get("OBS_VALUE")
         value = _decimal_or_none(raw_value, status)
         if status == "A" and value is None:
             raise ValueError(
-                f"H.4.1 A-status observation is not numeric for {board_series_id}"
+                f"H.8 A-status observation is not numeric for {board_series_id}"
             )
-        status_label = H41_OBSERVATION_STATUSES.get(status, "Unknown")
-        metadata = {
-            "board_series_id": board_series_id,
-            "fred_series_id": target["fred_series_id"],
-            "description": active.get("description") or target["name"],
-            "h41_status": status,
-            "h41_status_label": status_label,
-            "raw_value": raw_value,
-            "frequency_code": attributes.get("FREQ"),
-            "series_type": attributes.get("SERIESTYPE"),
-            "unit": attributes.get("UNIT"),
-            "unit_multiplier": attributes.get("UNIT_MULT"),
-            "currency": attributes.get("CURRENCY"),
-            "category": attributes.get("CATEGORY"),
-            "subcategory": attributes.get("SUBCATEGORY"),
-            "component": attributes.get("COMPONENT"),
-            "distribution": attributes.get("DISTRIBUTION"),
+        status_label = H8_OBSERVATION_STATUSES.get(status, "Unknown")
+        board_dimensions = {
+            key: attributes.get(key)
+            for key in (
+                "BG",
+                "CATEGORY",
+                "CURRENCY",
+                "FREQ",
+                "H8_UNITS",
+                "ITEM",
+                "SA",
+                "UNIT",
+                "UNIT_MULT",
+            )
         }
         return {
             "series_id": target["series_id"],
@@ -510,5 +430,21 @@ class FederalReserveH41Provider(HTTPProvider):
             "status": status,
             "status_label": status_label,
             "is_missing": value is None,
-            "metadata": metadata,
+            "metadata": {
+                "board_series_id": board_series_id,
+                "description": active.get("description") or target["name"],
+                "h8_status": status,
+                "h8_status_label": status_label,
+                "raw_value": raw_value,
+                "bg": attributes.get("BG"),
+                "category": attributes.get("CATEGORY"),
+                "currency": attributes.get("CURRENCY"),
+                "frequency_code": attributes.get("FREQ"),
+                "h8_units": attributes.get("H8_UNITS"),
+                "item": attributes.get("ITEM"),
+                "seasonal_adjustment": attributes.get("SA"),
+                "unit": attributes.get("UNIT"),
+                "unit_multiplier": attributes.get("UNIT_MULT"),
+                "board_dimensions": board_dimensions,
+            },
         }

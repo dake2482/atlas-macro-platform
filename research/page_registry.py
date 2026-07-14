@@ -366,15 +366,44 @@ PAGE_CONFIGS = {
     },
     "reserves": {
         "title": "银行准备金",
-        "eyebrow": "Reserve Adequacy",
-        "description": "准备金水平、变化速度与银行体系规模共同判断充裕度。",
-        "metrics": [
-            metric("准备金", "$3.31T", "4W -1.2%"),
-            metric("占银行资产", "13.8%", "-0.2pp"),
-            metric("8W Z-score", "-0.84", "偏低"),
-            metric("状态", "充裕", "缓冲下降"),
+        "eyebrow": "Reserves Coverage Proxy",
+        "description": (
+            "H.4.1 准备金余额与 H.8 美国商业银行总资产"
+            "只在共同周三对齐。比率为覆盖近似，不是 Federal Reserve "
+            "官方指标或监管结论。"
+        ),
+        "snapshot_contract_version": 1,
+        "period_options": [
+            {"value": "1y", "label": "1 年", "months": 12},
+            {"value": "3y", "label": "3 年", "months": 36},
+            {"value": "5y", "label": "5 年", "months": 60},
         ],
-        "analysis": "绝对水平尚未进入稀缺区，但下降速度值得跟踪。",
+        "default_period": "3y",
+        "tab_options": [
+            {
+                "value": "levels",
+                "label": "规模对齐",
+                "chart_keys": ["reserves-assets-history"],
+            },
+            {
+                "value": "ratio",
+                "label": "覆盖近似",
+                "chart_keys": ["reserve-ratio-history"],
+            },
+        ],
+        "default_tab": "levels",
+        "metrics": [
+            metric("准备金余额"),
+            metric("美国商业银行总资产"),
+            metric("准备金 / 商业银行资产覆盖近似"),
+            metric("覆盖近似 8 周变化"),
+            metric("覆盖近似 8 周变化 Z-score"),
+        ],
+        "analysis": (
+            "分子覆盖所有存款机构，分母覆盖美国商业银行，"
+            "机构宇宙不一致。页面只发布直接值和可复算统计，"
+            "不生成自动状态或交易建议。"
+        ),
     },
     "global-dollar": {
         "title": "全球美元",

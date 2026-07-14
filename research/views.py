@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import copy, deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -49,7 +50,10 @@ from .models import (
     SupplyChainNode,
     Thesis,
 )
-from .official_data import select_public_reserves_snapshot
+from .official_data import (
+    select_public_reserves_rate_spreads_snapshot,
+    select_public_reserves_snapshot,
+)
 from .page_registry import get_page_config
 from .public_ai_contract import is_pending_ai_company_contract_slug
 from .sec_company_facts import (
@@ -879,6 +883,134 @@ def assets_overview(request):
     )
 
 
+def _compose_reserves_components(
+    weekly_snapshot: DashboardSnapshot,
+    rate_snapshot: DashboardSnapshot | None,
+    *,
+    missing_failure: dict[str, Any] | None,
+) -> tuple[DashboardSnapshot, set[str]]:
+    """Compose validated snapshots for presentation without writing either one."""
+
+    composed = copy(weekly_snapshot)
+    weekly_data = deepcopy(dict(weekly_snapshot.data or {}))
+    metrics = list(weekly_data.get("metrics") or [])
+    charts = list(weekly_data.get("charts") or [])
+    sections = list(weekly_data.get("sections") or [])
+    source_keys = set(weekly_data.get("source_keys") or [])
+    presentation_failure = None
+    components = [
+        {
+            "key": "reserves",
+            "snapshot_id": weekly_snapshot.pk,
+            "publication_batch_id": str(weekly_snapshot.batch_id),
+            "as_of": weekly_snapshot.as_of.isoformat(),
+            "created_at": weekly_snapshot.created_at.isoformat(),
+            "quality_status": weekly_snapshot.quality_status,
+            "common_effective_date": weekly_data.get("common_effective_date"),
+            "refresh_failure": weekly_data.get("refresh_failure"),
+        }
+    ]
+    if rate_snapshot is not None:
+        rate_data = deepcopy(dict(rate_snapshot.data or {}))
+        rate_metrics = list(rate_data.get("metrics") or [])
+        rate_charts = list(rate_data.get("charts") or [])
+        rate_is_stale = (
+            rate_snapshot.quality_status == Observation.Quality.STALE
+            or bool(rate_data.get("refresh_failure"))
+        )
+        if rate_is_stale:
+            for component in [*rate_metrics, *rate_charts]:
+                metadata = dict(component.get("metadata") or {})
+                metadata["upstream_quality_status"] = component.get(
+                    "quality_status"
+                )
+                component["metadata"] = metadata
+                component["quality_status"] = Observation.Quality.STALE
+        metrics.extend(rate_metrics)
+        charts.extend(rate_charts)
+        sections.extend(rate_data.get("sections") or [])
+        source_keys.update(rate_data.get("source_keys") or [])
+        components.append(
+            {
+                "key": "reserves-rate-spreads",
+                "snapshot_id": rate_snapshot.pk,
+                "publication_batch_id": str(rate_snapshot.batch_id),
+                "as_of": rate_snapshot.as_of.isoformat(),
+                "created_at": rate_snapshot.created_at.isoformat(),
+                "quality_status": rate_snapshot.quality_status,
+                "common_effective_date": rate_data.get("common_effective_date"),
+                "refresh_failure": rate_data.get("refresh_failure"),
+            }
+        )
+        if rate_is_stale:
+            composed.quality_status = Observation.Quality.STALE
+            presentation_failure = rate_data.get("refresh_failure") or {
+                "reason": "日频资金利差组件为 stale。"
+            }
+    else:
+        missing_reason = (
+            str((missing_failure or {}).get("reason") or "")
+            or "尚无通过 reserves-rate-spreads v1 许可与结构校验的组件快照。"
+        )
+        sections.append(
+            {
+                "key": "missing-reserves-rate-spreads",
+                "title": "日频资金利差组件缺失",
+                "body": missing_reason,
+                "status": Observation.Quality.STALE,
+                "quality_status": Observation.Quality.STALE,
+                "full_width": True,
+            }
+        )
+        for key, title in (
+            ("reserves-funding-levels", "SOFR、13 周 T-bill 与 IORB"),
+            (
+                "reserves-sofr-tbill-spread-history",
+                "SOFR−13 周 T-bill 历史",
+            ),
+            ("reserves-sofr-iorb-spread-history", "SOFR−IORB 历史"),
+        ):
+            charts.append(
+                {
+                    "key": key,
+                    "title": title,
+                    "description": "日频资金利差组件缺失；不显示占位数值。",
+                    "kind": "line",
+                    "data": [],
+                    "source_keys": [],
+                    "quality_status": Observation.Quality.STALE,
+                    "missing_reason": missing_reason,
+                    "time_axis": "date",
+                    "frequency": "daily",
+                    "tab": "funding",
+                }
+            )
+        components.append(
+            {
+                "key": "reserves-rate-spreads",
+                "status": "missing",
+                "quality_status": Observation.Quality.STALE,
+                "reason": missing_reason,
+            }
+        )
+        composed.quality_status = Observation.Quality.STALE
+        presentation_failure = {
+            "reason": missing_reason,
+            "component": "reserves-rate-spreads",
+            "status": "missing",
+        }
+    weekly_data["metrics"] = metrics
+    weekly_data["charts"] = charts
+    weekly_data["sections"] = sections
+    weekly_data["source_keys"] = sorted(source_keys)
+    weekly_data["component_snapshots"] = components
+    if presentation_failure is not None and not weekly_data.get("refresh_failure"):
+        weekly_data["refresh_failure"] = presentation_failure
+    weekly_data["required_notices"] = public_source_notices(source_keys)
+    composed.data = weekly_data
+    return composed, source_keys
+
+
 def dashboard_page(request, page_key: str):
     if page_key == "fed-hawkish-dovish":
         return fed_hawkish_dovish(request)
@@ -923,7 +1055,31 @@ def dashboard_page(request, page_key: str):
                 blocked_refresh_failure = candidate_failure
         snapshot = select_public_reserves_snapshot(snapshot_candidates[:50])
         if snapshot is not None:
-            snapshot_source_keys = {"federal-reserve", "internal"}
+            rate_candidates = list(
+                DashboardSnapshot.objects.filter(
+                    key="reserves-rate-spreads",
+                    is_published=True,
+                    data__contract_version=1,
+                )
+                .filter(Q(data__demo=False) | ~Q(data__has_key="demo"))
+                .exclude(source__key="demo-market")
+                .select_related("source")
+                .order_by("-created_at", "-id")
+                [:50]
+            )
+            rate_failure = None
+            for candidate in rate_candidates:
+                candidate_failure = (candidate.data or {}).get("refresh_failure")
+                if rate_failure is None and isinstance(candidate_failure, dict):
+                    rate_failure = candidate_failure
+            rate_snapshot = select_public_reserves_rate_spreads_snapshot(
+                rate_candidates
+            )
+            snapshot, snapshot_source_keys = _compose_reserves_components(
+                snapshot,
+                rate_snapshot,
+                missing_failure=rate_failure,
+            )
     else:
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")

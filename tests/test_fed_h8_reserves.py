@@ -1214,7 +1214,7 @@ def test_h8_task_raises_when_required_reserves_publication_is_stale(monkeypatch)
         refresh_h8_sources.run()
 
 
-def test_reserves_catalog_keeps_rate_spreads_and_strict_adequacy_as_gaps():
+def test_reserves_catalog_tracks_live_rate_spreads_and_method_gaps():
     requirements = {item["key"]: item for item in DATA_REQUIREMENTS}
 
     assert requirements["fed-reserve-balances"]["status"] == "live"
@@ -1225,7 +1225,13 @@ def test_reserves_catalog_keeps_rate_spreads_and_strict_adequacy_as_gaps():
         == "needs_source"
     )
     rate_gap = requirements["reserves-sofr-tbill-spreads"]
-    assert rate_gap["status"] == "needs_source"
-    assert "SOFR−3M" in rate_gap["metric_name"]
+    assert rate_gap["status"] == "live"
+    assert "13-week T-bill" in rate_gap["metric_name"]
     assert "SOFR−IORB" in rate_gap["metric_name"]
-    assert "exact batches" in rate_gap["reason"]
+    assert (
+        "treasury-bill-rates:13w-coupon-equivalent" in rate_gap["source_name"]
+    )
+    assert (
+        requirements["reserves-intermediation-status-method"]["status"]
+        == "needs_source"
+    )

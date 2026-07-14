@@ -1211,17 +1211,29 @@ DATA_REQUIREMENTS = [
     {
         "key": "reserves-sofr-tbill-spreads",
         "page_key": "reserves",
-        "metric_name": "SOFR、3M Treasury、SOFR−3M 与 SOFR−IORB 历史",
-        "status": NEEDS_SOURCE,
+        "metric_name": "SOFR、13-week T-bill、SOFR−T-bill 与 SOFR−IORB 历史",
+        "status": LIVE,
         "source_name": (
-            "NY Fed SOFR + Federal Reserve PRATES IORB + "
-            "U.S. Treasury 3M par yield"
+            "NY Fed SOFR + Federal Reserve PRATES IORB + U.S. Treasury "
+            "treasury-bill-rates:13w-coupon-equivalent"
         ),
         "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
         "reason": (
-            "上游官方源已知，但尚未纳入 reserves v1 双源原子合同；"
-            "下一批需绑定各自 exact batches、共同日期与完整 lineage，"
-            "未完成前不标记 LIVE。"
+            "独立日频组件绑定三条最新 exact batches；SOFR 与 Treasury "
+            "必须同一刷新周期，历史只取 60 个自然日闭区间内的精确共同日。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "reserves-intermediation-status-method",
+        "page_key": "reserves",
+        "metric_name": "银行中介意愿/资金顺畅状态阈值方法",
+        "status": NEEDS_SOURCE,
+        "source_name": "Reviewed Federal Reserve and New York Fed ample-reserves research",
+        "source_url": "https://www.federalreserve.gov/monetarypolicy/policy-normalization.htm",
+        "reason": (
+            "原页面的状态阈值与方法不透明，必须独立审核后才能实现；"
+            "当前只发布可复算原始利差，不臆造“正常”或“顺畅”状态。"
         ),
         "priority": 1,
     },

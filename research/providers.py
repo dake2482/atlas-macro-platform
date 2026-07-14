@@ -813,8 +813,268 @@ class TreasuryRatesProvider(HTTPProvider):
     }
     XML_NS = {
         "atom": "http://www.w3.org/2005/Atom",
+        "data": "http://schemas.microsoft.com/ado/2007/08/dataservices",
         "meta": "http://schemas.microsoft.com/ado/2007/08/dataservices/metadata",
     }
+    BILL_13W_DATASET = "treasury-bill-rates:13w-coupon-equivalent"
+    BILL_13W_SERIES = "UST-BILL-13W-COUPON-EQUIVALENT"
+    BILL_13W_FEED = "daily_treasury_bill_rates"
+    BILL_13W_COUPON_EQUIVALENT_FIELD = "ROUND_B1_YIELD_13WK_2"
+    BILL_13W_BANK_DISCOUNT_FIELD = "ROUND_B1_CLOSE_13WK_2"
+    BILL_13W_QUOTE_CONVENTION = "13-week Coupon Equivalent"
+
+    @staticmethod
+    def _treasury_timestamp(raw_value: str) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+
+    def treasury_bill_rates_13w_coupon_equivalent(
+        self, *, current_year: int | None = None
+    ) -> ProviderResult:
+        """Fetch two annual bill feeds and expose only the 13-week CE quote.
+
+        The Treasury response carries both Bank Discount and Coupon Equivalent
+        quotations.  The former is retained as metadata only; it is never
+        substituted for the displayed comparison rate.
+        """
+
+        dataset = self.BILL_13W_DATASET
+        fetched_at = datetime.now(UTC)
+        resolved_year = current_year or fetched_at.year
+        if resolved_year - 1 < 1990 or resolved_year > fetched_at.year:
+            return ProviderResult.failure(
+                self.key,
+                dataset,
+                f"Treasury bill current year is out of range: {resolved_year}",
+            )
+        requested_years = [resolved_year - 1, resolved_year]
+        responses: list[tuple[int, str]] = []
+        for requested_year in requested_years:
+            payload, failure = self._get_text(
+                dataset,
+                "/resource-center/data-chart-center/interest-rates/pages/xml",
+                params={
+                    "data": self.BILL_13W_FEED,
+                    "field_tdr_date_value": str(requested_year),
+                },
+            )
+            if failure:
+                return failure
+            responses.append((requested_year, payload or ""))
+        fetched_at = datetime.now(UTC)
+        today = fetched_at.date()
+        records: list[dict[str, Any]] = []
+        artifacts: list[dict[str, Any]] = []
+        seen: dict[date, tuple[Decimal, Decimal, str, date]] = {}
+        feed_updates: dict[str, str] = {}
+        years_with_quotes: set[int] = set()
+
+        for requested_year, payload in responses:
+            try:
+                root = ElementTree.fromstring(payload)
+            except ElementTree.ParseError as exc:
+                return ProviderResult.failure(
+                    self.key, dataset, f"ParseError for {requested_year}: {exc}"
+                )
+            title = (root.findtext("atom:title", default="", namespaces=self.XML_NS) or "").strip()
+            if title != "DailyTreasuryBillRateData":
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    "Treasury bill feed convention drift: unexpected feed title",
+                )
+            raw_feed_updated = (
+                root.findtext("atom:updated", default="", namespaces=self.XML_NS) or ""
+            ).strip()
+            feed_updated = self._treasury_timestamp(raw_feed_updated)
+            if (
+                feed_updated is None
+                or feed_updated > fetched_at + timedelta(minutes=5)
+            ):
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    f"Treasury bill feed has invalid or future updated time: {raw_feed_updated}",
+                )
+            feed_updates[str(requested_year)] = feed_updated.isoformat()
+            entries = root.findall("atom:entry", self.XML_NS)
+            if not entries:
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    f"Treasury bill response for {requested_year} contains no entries",
+                )
+            for entry in entries:
+                properties = entry.find(
+                    "atom:content/meta:properties", self.XML_NS
+                )
+                if properties is None:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill entry for {requested_year} lacks properties",
+                    )
+                elements = {
+                    child.tag.rsplit("}", 1)[-1]: child for child in properties
+                }
+                values = {key: element.text for key, element in elements.items()}
+                raw_index_date = str(values.get("INDEX_DATE") or "")[:10]
+                raw_quote_date = str(values.get("QUOTE_DATE") or "")[:10]
+                raw_maturity_date = str(values.get("MATURITY_DATE_13WK") or "")[:10]
+                try:
+                    period = date.fromisoformat(raw_index_date)
+                    quote_date = date.fromisoformat(raw_quote_date)
+                    maturity_date = date.fromisoformat(raw_maturity_date)
+                except ValueError:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        "Treasury bill response contains a malformed observation, quote, or maturity date",
+                    )
+                if period.year != requested_year:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill response year {period.year} does not match requested year {requested_year}",
+                    )
+                if period > today:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill response contains future date {period.isoformat()}",
+                    )
+                if quote_date != period:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill INDEX_DATE and QUOTE_DATE mismatch on {period.isoformat()}",
+                    )
+                maturity_days = (maturity_date - period).days
+                if not 70 <= maturity_days <= 110:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill 13-week maturity convention drift on {period.isoformat()}",
+                    )
+                typed_fields = {
+                    "INDEX_DATE": "Edm.DateTime",
+                    "QUOTE_DATE": "Edm.DateTime",
+                    "MATURITY_DATE_13WK": "Edm.DateTime",
+                    self.BILL_13W_COUPON_EQUIVALENT_FIELD: "Edm.Double",
+                    self.BILL_13W_BANK_DISCOUNT_FIELD: "Edm.Double",
+                }
+                metadata_type = f"{{{self.XML_NS['meta']}}}type"
+                if any(
+                    field not in elements
+                    or elements[field].attrib.get(metadata_type) != expected_type
+                    for field, expected_type in typed_fields.items()
+                ):
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill quotation field convention drift on {period.isoformat()}",
+                    )
+                coupon_equivalent = _decimal_or_none(
+                    values.get(self.BILL_13W_COUPON_EQUIVALENT_FIELD)
+                )
+                bank_discount = _decimal_or_none(
+                    values.get(self.BILL_13W_BANK_DISCOUNT_FIELD)
+                )
+                cusip = str(values.get("CUSIP_13WK") or "").strip()
+                if (
+                    coupon_equivalent is None
+                    or not coupon_equivalent.is_finite()
+                    or bank_discount is None
+                    or not bank_discount.is_finite()
+                    or not re.fullmatch(r"[A-Z0-9]{9}", cusip)
+                ):
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill 13-week quotation is missing or malformed on {period.isoformat()}",
+                    )
+                identity = (coupon_equivalent, bank_discount, cusip, maturity_date)
+                if period in seen:
+                    kind = "conflicting duplicate" if seen[period] != identity else "duplicate"
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        f"Treasury bill response contains {kind} quote for {period.isoformat()}",
+                    )
+                seen[period] = identity
+                years_with_quotes.add(period.year)
+                records.append(
+                    {
+                        "series_id": self.BILL_13W_SERIES,
+                        "date": period.isoformat(),
+                        "value": coupon_equivalent,
+                        "metadata": {
+                            "treasury_field": self.BILL_13W_COUPON_EQUIVALENT_FIELD,
+                            "bank_discount_field": self.BILL_13W_BANK_DISCOUNT_FIELD,
+                            "bank_discount_rate": str(bank_discount),
+                            "cusip": cusip,
+                            "maturity_date": maturity_date.isoformat(),
+                            "quote_convention": self.BILL_13W_QUOTE_CONVENTION,
+                            "tenor": "13-week",
+                            "requested_year": requested_year,
+                            "requested_years": requested_years,
+                            "feed_updated_time": feed_updated.isoformat(),
+                            "dataset": dataset,
+                        },
+                    }
+                )
+            content = payload.encode()
+            source_url = (
+                f"{self.base_url}/resource-center/data-chart-center/interest-rates/pages/xml"
+                f"?data={self.BILL_13W_FEED}&field_tdr_date_value={requested_year}"
+            )
+            artifacts.append(
+                {
+                    "url": source_url,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size": len(content),
+                    "content_type": "application/atom+xml",
+                    "requested_year": requested_year,
+                }
+            )
+
+        if years_with_quotes != set(requested_years) or not records:
+            return ProviderResult.failure(
+                self.key,
+                dataset,
+                "Treasury bill response does not cover both requested years",
+            )
+        latest_value_date = max(seen)
+        if latest_value_date.year != resolved_year:
+            return ProviderResult.failure(
+                self.key,
+                dataset,
+                "Treasury bill response is missing the latest current-year 13-week quote",
+            )
+        records.sort(key=lambda item: str(item["date"]))
+        latest_feed_updated = max(
+            datetime.fromisoformat(value) for value in feed_updates.values()
+        )
+        return ProviderResult(
+            provider=self.key,
+            dataset=dataset,
+            records=records,
+            fetched_at=fetched_at,
+            metadata={
+                "series_id": self.BILL_13W_SERIES,
+                "quote_convention": self.BILL_13W_QUOTE_CONVENTION,
+                "coupon_equivalent_field": self.BILL_13W_COUPON_EQUIVALENT_FIELD,
+                "bank_discount_field": self.BILL_13W_BANK_DISCOUNT_FIELD,
+                "requested_years": requested_years,
+                "feed_updated_time": latest_feed_updated.isoformat(),
+                "feed_updated_times": feed_updates,
+                "latest_value_date": latest_value_date.isoformat(),
+                "artifacts": artifacts,
+            },
+        )
 
     def _curve(self, *, curve: str, fields: Mapping[str, str], year: int) -> ProviderResult:
         dataset = f"{curve}:{year}"

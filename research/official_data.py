@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from .calculations import yield_spread
@@ -66,6 +67,7 @@ from .models import (
     ReleaseVintageObservation,
     SeriesDefinition,
     Source,
+    SourceLicense,
     TreasuryAuction,
 )
 from .providers import (
@@ -305,6 +307,41 @@ RESERVES_CHANGE_SAMPLE_WINDOW = "exact 56 calendar days"
 RESERVES_ZSCORE_SAMPLE_WINDOW = (
     "Recent three-year window: minimum 52 and maximum 156 strict "
     "56-calendar-day change samples."
+)
+RESERVES_RATE_SPREADS_CONTRACT_VERSION = 1
+RESERVES_RATE_SPREADS_DATASETS = {
+    "sofr": ("ny-fed-markets", "reference-rate:sofr"),
+    "iorb": ("federal-reserve", "prates:iorb"),
+    "tbill": (
+        "us-treasury-rates",
+        TreasuryRatesProvider.BILL_13W_DATASET,
+    ),
+}
+RESERVES_RATE_SPREADS_SERIES = {
+    "sofr": "sofr",
+    "iorb": "iorb",
+    "tbill": TreasuryRatesProvider.BILL_13W_SERIES.lower(),
+}
+RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS = frozenset(
+    {
+        "reserves-sofr",
+        "reserves-tbill-13w-coupon-equivalent",
+        "reserves-iorb",
+        "reserves-sofr-tbill-spread",
+        "reserves-sofr-iorb-spread",
+    }
+)
+RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS = frozenset(
+    {
+        "reserves-funding-levels",
+        "reserves-sofr-tbill-spread-history",
+        "reserves-sofr-iorb-spread-history",
+    }
+)
+RESERVES_RATE_SPREADS_HISTORY_DAYS = 60
+RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS = 30
+RESERVES_RATE_SPREADS_QUOTE_CONVENTION = (
+    TreasuryRatesProvider.BILL_13W_QUOTE_CONVENTION
 )
 ECONOMY_CONTRACT_VERSION = 1
 ECONOMY_COMPONENTS = {
@@ -689,6 +726,39 @@ def _fresh_until(observation: Observation) -> datetime:
     else:
         period_end = value_date
     return period_end + timedelta(days=FRESHNESS_DAYS.get(frequency, 4))
+
+
+def _effective_source_license(
+    source: Source,
+    *,
+    lock: bool = False,
+    require_public: bool = False,
+    require_derived: bool = False,
+    require_storage: bool = False,
+) -> SourceLicense | None:
+    """Return the authoritative current, effective licence decision."""
+
+    today = timezone.localdate()
+    queryset = SourceLicense.objects.filter(
+        source=source,
+        is_current=True,
+        status__in=(Source.LicenseStatus.OPEN, Source.LicenseStatus.LICENSED),
+    ).filter(
+        Q(valid_from__isnull=True) | Q(valid_from__lte=today),
+        Q(valid_until__isnull=True) | Q(valid_until__gte=today),
+    )
+    if lock:
+        queryset = queryset.select_for_update()
+    licence = queryset.order_by("-created_at", "-pk").first()
+    if licence is None:
+        return None
+    if require_public and not licence.public_display_allowed:
+        return None
+    if require_derived and not licence.derived_display_allowed:
+        return None
+    if require_storage and not licence.historical_storage_allowed:
+        return None
+    return licence
 
 
 def _real_observations(
@@ -4886,6 +4956,7 @@ def _reserves_input_lineage(
     *,
     dataset: str,
     page_fresh_until: datetime,
+    license_scope: str | None = None,
 ) -> dict[str, Any]:
     value_usd_tn = _reserves_value_usd_tn(observation)
     multiplier = _reserves_unit_multiplier(observation)
@@ -4912,7 +4983,14 @@ def _reserves_input_lineage(
         "source_key": observation.source.key,
         "source_name": observation.source.name,
         "source_keys": sorted(_observation_source_keys(observation)),
-        "license_scope": observation.source.license_scope,
+        "license_scope": license_scope
+        or (
+            licence.scope
+            if (licence := _effective_source_license(
+                observation.source, require_public=True
+            ))
+            else ""
+        ),
         "value_date": observation.value_date.isoformat(),
         "as_of": observation.as_of.isoformat(),
         "fetched_at": observation.fetched_at.isoformat(),
@@ -4980,13 +5058,16 @@ def _reserves_internal_lineage(
         }
     )
     internal = ensure_source("internal")
+    internal_licence = _effective_source_license(
+        internal, require_public=True, require_derived=True
+    )
     return {
         "series_key": series_key,
         "value": str(value),
         "source_key": "internal",
         "source_name": internal.name,
         "source_keys": source_keys,
-        "license_scope": internal.license_scope,
+        "license_scope": internal_licence.scope if internal_licence else "",
         "value_date": datetime.combine(value_date, time.min, tzinfo=UTC).isoformat(),
         "as_of": min(
             _parse_payload_datetime(item.get("as_of"))
@@ -5017,16 +5098,23 @@ def _reserves_direct_metric(
     current: Observation,
     previous: Observation,
     page_fresh_until: datetime,
+    license_scope: str,
 ) -> dict[str, Any]:
     current_value = _reserves_value_usd_tn(current)
     previous_value = _reserves_value_usd_tn(previous)
     if current_value is None or previous_value is None:
         raise ValueError("reserve direct value has no valid USD normalization")
     current_lineage = _reserves_input_lineage(
-        current, dataset=dataset, page_fresh_until=page_fresh_until
+        current,
+        dataset=dataset,
+        page_fresh_until=page_fresh_until,
+        license_scope=license_scope,
     )
     previous_lineage = _reserves_input_lineage(
-        previous, dataset=dataset, page_fresh_until=page_fresh_until
+        previous,
+        dataset=dataset,
+        page_fresh_until=page_fresh_until,
+        license_scope=license_scope,
     )
     return {
         "key": key,
@@ -5041,7 +5129,7 @@ def _reserves_direct_metric(
         "source_key": current.source.key,
         "source_keys": [current.source.key],
         "fallback_source": None,
-        "license_scope": current.source.license_scope,
+        "license_scope": license_scope,
         "as_of": current.as_of.isoformat(),
         "value_date": current.value_date.isoformat(),
         "fetched_at": current.fetched_at.isoformat(),
@@ -5088,6 +5176,10 @@ def _reserves_derived_metric(
         }
     )
     current_date_value = datetime.combine(current_date, time.min, tzinfo=UTC)
+    internal = ensure_source("internal")
+    internal_licence = _effective_source_license(
+        internal, require_public=True, require_derived=True
+    )
     return {
         "key": key,
         "label": label,
@@ -5102,7 +5194,7 @@ def _reserves_derived_metric(
         "source": "Atlas Macro 透明计算（Federal Reserve 双官方源输入）",
         "source_key": "internal",
         "source_keys": source_keys,
-        "license_scope": ensure_source("internal").license_scope,
+        "license_scope": internal_licence.scope if internal_licence else "",
         "fallback_source": None,
         "as_of": min(
             _parse_payload_datetime(item.get("as_of"))
@@ -5267,6 +5359,20 @@ def _reserves_page_data(
                 status="unlicensed",
             )
         ]
+    federal_licence = _effective_source_license(
+        selected_runs["h41"].source,
+        require_public=True,
+        require_derived=True,
+    )
+    if federal_licence is None:
+        return None, [
+            _reserves_failure(
+                "licence",
+                "Federal Reserve current licence decision is unavailable",
+                status="unlicensed",
+            )
+        ]
+    federal_license_scope = federal_licence.scope
 
     common_dates = sorted(
         {
@@ -5347,6 +5453,7 @@ def _reserves_page_data(
                 observations[identity][period],
                 dataset=RESERVES_DATASETS[identity][1],
                 page_fresh_until=page_fresh_until,
+                license_scope=federal_license_scope,
             )
             for identity in ("h41", "h8")
         ]
@@ -5428,6 +5535,7 @@ def _reserves_page_data(
                 current=observations["h41"][current_date],
                 previous=observations["h41"][previous_date],
                 page_fresh_until=page_fresh_until,
+                license_scope=federal_license_scope,
             ),
             _reserves_direct_metric(
                 key="commercial-bank-assets",
@@ -5436,6 +5544,7 @@ def _reserves_page_data(
                 current=observations["h8"][current_date],
                 previous=observations["h8"][previous_date],
                 page_fresh_until=page_fresh_until,
+                license_scope=federal_license_scope,
             ),
             _reserves_derived_metric(
                 key="reserve-commercial-bank-assets-ratio",
@@ -5577,7 +5686,78 @@ def _reserves_page_data(
         _reserves_run_state(identity, selected_runs[identity], status="valid")
         for identity in RESERVES_DATASETS
     ]
+    recent_reserve_periods = sorted(observations["h41"])[-20:]
+    if len(recent_reserve_periods) != 20:
+        return None, [
+            _reserves_failure(
+                "recent-reserve-balances",
+                "fewer than 20 exact-batch H.4.1 reserve rows are available",
+                status="insufficient-sample",
+            )
+        ]
+    recent_reserve_rows = []
+    for period in recent_reserve_periods:
+        observation = observations["h41"][period]
+        value_usd_tn = _reserves_value_usd_tn(observation)
+        lineage = _reserves_input_lineage(
+            observation,
+            dataset=RESERVES_DATASETS["h41"][1],
+            page_fresh_until=page_fresh_until,
+            license_scope=federal_license_scope,
+        )
+        if value_usd_tn is None:
+            return None, [
+                _reserves_failure(
+                    "recent-reserve-balances",
+                    f"H.4.1 row {period.isoformat()} has invalid USD normalization",
+                )
+            ]
+        recent_reserve_rows.append(
+            {
+                "label": period.isoformat(),
+                "display_value": f"{value_usd_tn:,.3f} USD tn",
+                "value": float(value_usd_tn),
+                "unit": "USD tn",
+                "status": Observation.Quality.FRESH,
+                "quality_status": Observation.Quality.FRESH,
+                "source": observation.source.name,
+                "source_key": observation.source.key,
+                "source_keys": [observation.source.key],
+                "license_scope": federal_license_scope,
+                "fallback_source": None,
+                "value_date": observation.value_date.isoformat(),
+                "as_of": observation.as_of.isoformat(),
+                "fetched_at": observation.fetched_at.isoformat(),
+                "fresh_until": page_fresh_until.isoformat(),
+                "batch_id": str(observation.batch_id),
+                "metadata": {
+                    "normalization": "source value * UNIT_MULT / 1e12 USD",
+                    "input_batch_ids": [str(observation.batch_id)],
+                    "input_lineage": [lineage],
+                },
+            }
+        )
     sections = [
+        {
+            "key": "recent-reserve-balances",
+            "title": "近期数据（最近20条）",
+            "description": "日期 / 准备金（万亿 USD）；直接取本次 H.4.1 精确批次。",
+            "rows": recent_reserve_rows,
+            "status": Observation.Quality.FRESH,
+            "quality_status": Observation.Quality.FRESH,
+            "source_key": "federal-reserve",
+            "source_keys": ["federal-reserve"],
+            "license_scope": federal_license_scope,
+            "fallback_source": None,
+            "as_of": observations["h41"][recent_reserve_periods[-1]].as_of.isoformat(),
+            "fetched_at": max(
+                observations["h41"][period].fetched_at
+                for period in recent_reserve_periods
+            ).isoformat(),
+            "fresh_until": page_fresh_until.isoformat(),
+            "batch_id": expected_batches["h41"],
+            "full_width": True,
+        },
         {
             "key": "coverage-proxy-method",
             "title": "覆盖近似口径",
@@ -5620,7 +5800,7 @@ def _reserves_page_data(
     }
     prepared = (metrics, [level_chart, ratio_chart], sections, extra_data)
     if not _reserves_page_contract_is_buildable(
-        metrics, [level_chart, ratio_chart], extra_data
+        metrics, [level_chart, ratio_chart], extra_data, sections=sections
     ):
         return None, [
             _reserves_failure(
@@ -5634,10 +5814,32 @@ def _reserves_page_contract_is_buildable(
     metrics: list[dict[str, Any]],
     charts: list[dict[str, Any]],
     extra_data: dict[str, Any],
+    *,
+    sections: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Validate every public reserves v1 value and its exact-batch lineage."""
 
     if extra_data.get("contract_version") != RESERVES_CONTRACT_VERSION:
+        return False
+    resolved_sections = (
+        sections
+        if sections is not None
+        else list(extra_data.get("sections") or [])
+    )
+    sections_by_key = {
+        str(item.get("key") or ""): item
+        for item in resolved_sections
+        if isinstance(item, dict)
+    }
+    section_keys = set(sections_by_key)
+    if section_keys not in (
+        {"coverage-proxy-method", "publication-rule"},
+        {
+            "recent-reserve-balances",
+            "coverage-proxy-method",
+            "publication-rule",
+        },
+    ):
         return False
     metric_by_key = {
         str(item.get("key") or ""): item
@@ -6016,6 +6218,51 @@ def _reserves_page_contract_is_buildable(
     if not same(zscore_metric.get("value"), zscore):
         return False
 
+    if "recent-reserve-balances" in sections_by_key:
+        recent_section = sections_by_key["recent-reserve-balances"]
+        recent_rows = recent_section.get("rows")
+        h41_batch = str(inputs_by_component["h41"]["batch_id"])
+        section_scope = str(recent_section.get("license_scope") or "")
+        if (
+            recent_section.get("title") != "近期数据（最近20条）"
+            or recent_section.get("source_key") != "federal-reserve"
+            or set(recent_section.get("source_keys") or []) != {"federal-reserve"}
+            or recent_section.get("batch_id") != h41_batch
+            or recent_section.get("quality_status") != Observation.Quality.FRESH
+            or recent_section.get("fallback_source") is not None
+            or not section_scope
+            or not isinstance(recent_rows, list)
+            or len(recent_rows) != 20
+        ):
+            return False
+        recent_dates = [str(row.get("label") or "") for row in recent_rows]
+        if recent_dates != sorted(recent_dates) or len(recent_dates) != len(
+            set(recent_dates)
+        ):
+            return False
+        for row in recent_rows:
+            row_metadata = row.get("metadata") or {}
+            row_lineage = row_metadata.get("input_lineage")
+            lineage = row_lineage[0] if isinstance(row_lineage, list) and len(row_lineage) == 1 else None
+            if (
+                str(row.get("value_date") or "")[:10] != row.get("label")
+                or row.get("source_key") != "federal-reserve"
+                or set(row.get("source_keys") or []) != {"federal-reserve"}
+                or row.get("batch_id") != h41_batch
+                or row.get("quality_status") != Observation.Quality.FRESH
+                or row.get("fallback_source") is not None
+                or row.get("license_scope") != section_scope
+                or not safe_direct_lineage(
+                    lineage,
+                    expected_series=RESERVES_SERIES["h41"],
+                    expected_date=row.get("label"),
+                )
+                or lineage.get("license_scope") != section_scope
+                or not same(row.get("value"), lineage.get("value_usd_tn"))
+                or set(row_metadata.get("input_batch_ids") or []) != {h41_batch}
+            ):
+                return False
+
     for chart_key, chart in chart_by_key.items():
         chart_fetched_at = _parse_payload_datetime(chart.get("fetched_at"))
         if (
@@ -6290,6 +6537,42 @@ def _reserves_snapshot_contract_is_valid(
     )
     if allowed != {"federal-reserve", "internal"} or derived != allowed:
         return False
+    recent_section = next(
+        (
+            item
+            for item in data.get("sections", [])
+            if isinstance(item, dict)
+            and item.get("key") == "recent-reserve-balances"
+        ),
+        None,
+    )
+    if recent_section is None:
+        return False
+    exact_h41_tail = list(
+        reversed(
+            list(
+                Observation.objects.filter(
+                    source=selected_runs["h41"].source,
+                    series__key=RESERVES_SERIES["h41"],
+                    batch_id=selected_runs["h41"].batch_id,
+                )
+                .select_related("series")
+                .order_by("-value_date", "-id")[:20]
+            )
+        )
+    )
+    recent_rows = list(recent_section.get("rows") or [])
+    if len(exact_h41_tail) != 20 or len(recent_rows) != 20:
+        return False
+    for row, observation in zip(recent_rows, exact_h41_tail, strict=True):
+        value_usd_tn = _reserves_value_usd_tn(observation)
+        if (
+            row.get("label") != observation.value_date.date().isoformat()
+            or value_usd_tn is None
+            or abs(Decimal(str(row.get("value"))) - value_usd_tn)
+            > Decimal("0.00000001")
+        ):
+            return False
     normalized = {
         item.key: item
         for item in MetricSnapshot.objects.filter(
@@ -6352,6 +6635,15 @@ def _coordinate_reserves_dashboard(
         Source.objects.select_for_update()
         .filter(key__in={"federal-reserve", "internal"})
         .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(
+            source__key__in={"federal-reserve", "internal"},
+            is_current=True,
+        )
+        .order_by("source__key")
         .values_list("pk", flat=True)
     )
     selected, states, triggered = _select_reserves_runs(trigger_runs)
@@ -6427,6 +6719,1320 @@ def _coordinate_reserves_dashboard(
         )
         return [], {"reserves"}
     return dashboards, set()
+
+
+def _reserves_rate_spreads_failure(
+    component: str,
+    reason: str,
+    *,
+    status: str = "invalid",
+) -> dict[str, Any]:
+    return {
+        "component": component,
+        "status": status,
+        "reason": reason[:320],
+    }
+
+
+def _reserves_rate_spreads_run_identity(run: IngestionRun) -> str | None:
+    return next(
+        (
+            identity
+            for identity, (source_key, dataset) in RESERVES_RATE_SPREADS_DATASETS.items()
+            if run.source.key == source_key and run.dataset == dataset
+        ),
+        None,
+    )
+
+
+def _latest_reserves_rate_spreads_attempt(identity: str) -> IngestionRun | None:
+    source_key, dataset = RESERVES_RATE_SPREADS_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(source__key=source_key, dataset=dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _reserves_rate_spreads_run_state(
+    identity: str,
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    source_key, dataset = RESERVES_RATE_SPREADS_DATASETS[identity]
+    return {
+        "component": identity,
+        "source": source_key,
+        "dataset": dataset,
+        "status": status or (run.status if run else "missing"),
+        "row_count": run.row_count if run else 0,
+        "reason": (
+            reason
+            or (run.error if run else "required exact-dataset run is missing")
+        )[:320],
+        "batch_id": str(run.batch_id) if run else None,
+        "ingestion_run_id": run.pk if run else None,
+        "refresh_cycle_id": (
+            str((run.metadata or {}).get("refresh_cycle_id") or "")
+            if run
+            else ""
+        ),
+    }
+
+
+def _select_reserves_rate_spreads_runs(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
+    relevant: dict[str, dict[int, IngestionRun]] = {
+        identity: {} for identity in RESERVES_RATE_SPREADS_DATASETS
+    }
+    for run in trigger_runs:
+        identity = _reserves_rate_spreads_run_identity(run)
+        if identity is not None:
+            relevant[identity][run.pk] = run
+    if not any(relevant.values()):
+        return None, [], False
+    for identity, triggered in relevant.items():
+        if not triggered:
+            continue
+        latest = _latest_reserves_rate_spreads_attempt(identity)
+        if latest is None or any(run.pk != latest.pk for run in triggered.values()):
+            return None, [], False
+    selected = {
+        identity: _latest_reserves_rate_spreads_attempt(identity)
+        for identity in RESERVES_RATE_SPREADS_DATASETS
+    }
+    states = [
+        _reserves_rate_spreads_run_state(identity, selected[identity])
+        for identity in RESERVES_RATE_SPREADS_DATASETS
+    ]
+    if any(
+        run is None
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in selected.values()
+    ):
+        return None, states, True
+    sofr_cycle = str((selected["sofr"].metadata or {}).get("refresh_cycle_id") or "")
+    tbill_cycle = str((selected["tbill"].metadata or {}).get("refresh_cycle_id") or "")
+    if not sofr_cycle or sofr_cycle != tbill_cycle:
+        states.append(
+            _reserves_rate_spreads_failure(
+                "refresh-cycle",
+                "SOFR and Treasury bill exact batches do not share one nonempty refresh cycle",
+                status="cycle-mismatch",
+            )
+        )
+        return None, states, True
+    return (
+        {identity: run for identity, run in selected.items() if run is not None},
+        states,
+        True,
+    )
+
+
+def _reserves_rate_spreads_input_lineage(
+    observation: Observation,
+    *,
+    page_fresh_until: datetime,
+    license_scope: str,
+) -> dict[str, Any]:
+    metadata = dict(observation.metadata or {})
+    return {
+        "series_key": observation.series.key,
+        "value": str(observation.value),
+        "source_key": observation.source.key,
+        "source_name": observation.source.name,
+        "source_keys": [observation.source.key],
+        "license_scope": license_scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "batch_id": str(observation.batch_id),
+        "quality_status": observation.quality_status,
+        "fallback_source": (
+            observation.fallback_source.key
+            if observation.fallback_source_id
+            else None
+        ),
+        "quote_convention": metadata.get("quote_convention"),
+        "treasury_field": metadata.get("treasury_field"),
+        "bank_discount_rate": metadata.get("bank_discount_rate"),
+        "bank_discount_field": metadata.get("bank_discount_field"),
+        "cusip": metadata.get("cusip"),
+        "maturity_date": metadata.get("maturity_date"),
+        "feed_updated_time": metadata.get("feed_updated_time"),
+    }
+
+
+def _reserves_rate_spreads_derived_lineage(
+    *,
+    series_key: str,
+    value: Decimal,
+    period: date,
+    inputs: list[dict[str, Any]],
+    formula: str,
+    page_fresh_until: datetime,
+    license_scope: str,
+) -> dict[str, Any]:
+    batch_ids = sorted({str(item["batch_id"]) for item in inputs})
+    source_keys = sorted(
+        {"internal", *(str(item["source_key"]) for item in inputs)}
+    )
+    internal = ensure_source("internal")
+    return {
+        "series_key": series_key,
+        "value": str(value),
+        "source_key": "internal",
+        "source_name": internal.name,
+        "source_keys": source_keys,
+        "license_scope": license_scope,
+        "value_date": datetime.combine(period, time.min, tzinfo=UTC).isoformat(),
+        "as_of": min(
+            _parse_payload_datetime(item["as_of"]) for item in inputs
+        ).isoformat(),
+        "fetched_at": max(
+            _parse_payload_datetime(item["fetched_at"]) for item in inputs
+        ).isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "batch_id": ",".join(batch_ids),
+        "input_batch_ids": batch_ids,
+        "input_lineage": inputs,
+        "formula": formula,
+        "quality_status": Observation.Quality.ESTIMATED,
+        "fallback_source": None,
+        "quote_convention": (
+            RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+            if any(item["series_key"] == RESERVES_RATE_SPREADS_SERIES["tbill"] for item in inputs)
+            else None
+        ),
+    }
+
+
+def _reserves_rate_spreads_metric(
+    *,
+    key: str,
+    label: str,
+    value: Decimal,
+    period: date,
+    inputs: list[dict[str, Any]],
+    page_fresh_until: datetime,
+    derived: bool,
+    formula: str,
+    internal_license_scope: str,
+) -> dict[str, Any]:
+    primary = inputs[0]
+    batch_ids = sorted({str(item["batch_id"]) for item in inputs})
+    input_source_keys = sorted({str(item["source_key"]) for item in inputs})
+    unit = "bp" if derived else "%"
+    return {
+        "key": key,
+        "label": label,
+        "value": float(value),
+        "display_value": (
+            f"{value:+,.2f}bp" if derived else f"{value:,.2f}%"
+        ),
+        "change": None,
+        "change_unit": "",
+        "unit": unit,
+        "quality_status": (
+            Observation.Quality.ESTIMATED
+            if derived
+            else Observation.Quality.FRESH
+        ),
+        "source": (
+            f"Atlas Macro 计算：{formula}"
+            if derived
+            else str(primary["source_name"])
+        ),
+        "source_key": "internal" if derived else str(primary["source_key"]),
+        "source_keys": sorted(
+            {*input_source_keys, *({"internal"} if derived else set())}
+        ),
+        "license_scope": (
+            internal_license_scope
+            if derived
+            else str(primary["license_scope"])
+        ),
+        "fallback_source": None,
+        "as_of": min(
+            _parse_payload_datetime(item["as_of"]) for item in inputs
+        ).isoformat(),
+        "value_date": datetime.combine(period, time.min, tzinfo=UTC).isoformat(),
+        "fetched_at": max(
+            _parse_payload_datetime(item["fetched_at"]) for item in inputs
+        ).isoformat(),
+        "fresh_until": page_fresh_until.isoformat(),
+        "batch_id": ",".join(batch_ids),
+        "metadata": {
+            "common_effective_date": period.isoformat(),
+            "formula": formula,
+            "calculation_owner": "Atlas Macro" if derived else "Official source",
+            "input_series": sorted(str(item["series_key"]) for item in inputs),
+            "input_batch_ids": batch_ids,
+            "input_value_dates": sorted(str(item["value_date"]) for item in inputs),
+            "input_lineage": inputs,
+            "quote_convention": (
+                RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+                if any(
+                    item["series_key"] == RESERVES_RATE_SPREADS_SERIES["tbill"]
+                    for item in inputs
+                )
+                else None
+            ),
+            "treasury_field": next(
+                (
+                    item.get("treasury_field")
+                    for item in inputs
+                    if item["series_key"] == RESERVES_RATE_SPREADS_SERIES["tbill"]
+                ),
+                None,
+            ),
+            "bank_discount_rate": next(
+                (
+                    item.get("bank_discount_rate")
+                    for item in inputs
+                    if item["series_key"] == RESERVES_RATE_SPREADS_SERIES["tbill"]
+                ),
+                None,
+            ),
+        },
+    }
+
+
+def _reserves_rate_spreads_page_data(
+    selected_runs: dict[str, IngestionRun],
+) -> tuple[
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None,
+    list[dict[str, Any]],
+]:
+    now = timezone.now()
+    today_et = now.astimezone(ZoneInfo("America/New_York")).date()
+    public_sources, derived_sources = current_display_source_key_sets(
+        {"ny-fed-markets", "federal-reserve", "us-treasury-rates", "internal"}
+    )
+    required_sources = {
+        "ny-fed-markets",
+        "federal-reserve",
+        "us-treasury-rates",
+        "internal",
+    }
+    if public_sources != required_sources or derived_sources != required_sources:
+        return None, [
+            _reserves_rate_spreads_failure(
+                "licence",
+                "all three official inputs and Atlas derived display require current licences",
+                status="unlicensed",
+            )
+        ]
+    sources_by_key = {
+        item.key: item
+        for item in Source.objects.filter(key__in=required_sources)
+    }
+    licence_scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = sources_by_key.get(source_key)
+        licence = (
+            _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return None, [
+                _reserves_rate_spreads_failure(
+                    "licence",
+                    f"{source_key} current licence decision is unavailable",
+                    status="unlicensed",
+                )
+            ]
+        licence_scopes[source_key] = licence.scope
+    observations: dict[str, dict[date, Observation]] = {}
+    for identity, run in selected_runs.items():
+        run_fetched_at = _parse_payload_datetime((run.metadata or {}).get("fetched_at"))
+        if run_fetched_at is None or any(
+            candidate is not None and candidate > now
+            for candidate in (run.started_at, run.completed_at, run_fetched_at)
+        ):
+            return None, [
+                _reserves_rate_spreads_failure(
+                    identity,
+                    "exact-dataset run has a missing or future retrieval timestamp",
+                    status="future-timestamp",
+                )
+            ]
+        source_key, _dataset = RESERVES_RATE_SPREADS_DATASETS[identity]
+        rows = list(
+            Observation.objects.filter(
+                source__key=source_key,
+                series__key=RESERVES_RATE_SPREADS_SERIES[identity],
+                batch_id=run.batch_id,
+            )
+            .select_related("series", "source", "fallback_source")
+            .order_by("value_date", "id")
+        )
+        batch_row_count = Observation.objects.filter(
+            source__key=source_key, batch_id=run.batch_id
+        ).count()
+        if len(rows) != run.row_count or batch_row_count != run.row_count:
+            return None, [
+                _reserves_rate_spreads_failure(
+                    identity,
+                    "stored observations do not equal the complete exact run batch",
+                    status="mixed-batch",
+                )
+            ]
+        by_date: dict[date, Observation] = {}
+        for observation in rows:
+            period = observation.value_date.date()
+            value = observation.value
+            if period > today_et and identity == "iorb":
+                continue
+            if (
+                period in by_date
+                or period > today_et
+                or observation.fetched_at > now
+                or observation.fallback_source_id
+                or observation.quality_status != Observation.Quality.FRESH
+                or not value.is_finite()
+                or not Decimal("-5") <= value <= Decimal("25")
+            ):
+                return None, [
+                    _reserves_rate_spreads_failure(
+                        identity,
+                        f"exact-batch observation {period.isoformat()} failed quality, range, or date checks",
+                    )
+                ]
+            if identity == "tbill" and (
+                (observation.metadata or {}).get("quote_convention")
+                != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+                or (observation.metadata or {}).get("treasury_field")
+                != TreasuryRatesProvider.BILL_13W_COUPON_EQUIVALENT_FIELD
+                or (observation.metadata or {}).get("bank_discount_rate") in {None, ""}
+            ):
+                return None, [
+                    _reserves_rate_spreads_failure(
+                        identity,
+                        "Treasury 13-week quote convention or field lineage drifted",
+                        status="convention-drift",
+                    )
+                ]
+            by_date[period] = observation
+        if not by_date:
+            return None, [
+                _reserves_rate_spreads_failure(identity, "exact batch has no observations")
+            ]
+        observations[identity] = by_date
+    common_date = max(observations["sofr"])
+    if (
+        common_date not in observations["tbill"]
+        or common_date not in observations["iorb"]
+        or max(observations["tbill"]) < common_date
+    ):
+        return None, [
+            _reserves_rate_spreads_failure(
+                "common-date",
+                "SOFR tail is not present in both Treasury and IORB exact batches",
+                status="stalled-peer",
+            )
+        ]
+    current_inputs = [
+        observations[identity][common_date]
+        for identity in ("sofr", "tbill", "iorb")
+    ]
+    deadlines = [_fresh_until(item) for item in current_inputs]
+    if any(deadline < now for deadline in deadlines):
+        return None, [
+            _reserves_rate_spreads_failure(
+                "freshness",
+                "latest exact common inputs are stale",
+                status=Observation.Quality.STALE,
+            )
+        ]
+    page_fresh_until = min(deadlines)
+    window_start = common_date - timedelta(
+        days=RESERVES_RATE_SPREADS_HISTORY_DAYS - 1
+    )
+    history_dates = sorted(
+        period
+        for period in (
+            set(observations["sofr"])
+            & set(observations["tbill"])
+            & set(observations["iorb"])
+        )
+        if window_start <= period <= common_date
+    )
+    if (
+        len(history_dates) < RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS
+        or not history_dates
+        or history_dates[-1] != common_date
+    ):
+        return None, [
+            _reserves_rate_spreads_failure(
+                "history",
+                "60-calendar-day exact-date intersection contains fewer than 30 rows",
+                status="insufficient-sample",
+            )
+        ]
+    lineage_by_date: dict[date, dict[str, dict[str, Any]]] = {}
+    funding_rows: list[dict[str, Any]] = []
+    tbill_spread_rows: list[dict[str, Any]] = []
+    iorb_spread_rows: list[dict[str, Any]] = []
+    for period in history_dates:
+        period_lineage = {
+            identity: _reserves_rate_spreads_input_lineage(
+                observations[identity][period],
+                page_fresh_until=page_fresh_until,
+                license_scope=licence_scopes[
+                    RESERVES_RATE_SPREADS_DATASETS[identity][0]
+                ],
+            )
+            for identity in ("sofr", "tbill", "iorb")
+        }
+        lineage_by_date[period] = period_lineage
+        sofr_value = observations["sofr"][period].value
+        tbill_value = observations["tbill"][period].value
+        iorb_value = observations["iorb"][period].value
+        tbill_spread = Decimal("100") * (sofr_value - tbill_value)
+        iorb_spread = Decimal("100") * (sofr_value - iorb_value)
+        funding_rows.append(
+            {
+                "date": period.isoformat(),
+                "SOFR": float(sofr_value),
+                "13-week T-bill Coupon Equivalent": float(tbill_value),
+                "IORB": float(iorb_value),
+                "_source_keys": [
+                    "federal-reserve",
+                    "ny-fed-markets",
+                    "us-treasury-rates",
+                ],
+                "_batch_ids": sorted(
+                    str(item["batch_id"]) for item in period_lineage.values()
+                ),
+                "_lineage": {
+                    "SOFR": period_lineage["sofr"],
+                    "13-week T-bill Coupon Equivalent": period_lineage["tbill"],
+                    "IORB": period_lineage["iorb"],
+                },
+            }
+        )
+        tbill_derived = _reserves_rate_spreads_derived_lineage(
+            series_key="reserves-sofr-tbill-spread",
+            value=tbill_spread,
+            period=period,
+            inputs=[period_lineage["sofr"], period_lineage["tbill"]],
+            formula="100 * (SOFR - 13-week T-bill Coupon Equivalent)",
+            page_fresh_until=page_fresh_until,
+            license_scope=licence_scopes["internal"],
+        )
+        iorb_derived = _reserves_rate_spreads_derived_lineage(
+            series_key="reserves-sofr-iorb-spread",
+            value=iorb_spread,
+            period=period,
+            inputs=[period_lineage["sofr"], period_lineage["iorb"]],
+            formula="100 * (SOFR - IORB)",
+            page_fresh_until=page_fresh_until,
+            license_scope=licence_scopes["internal"],
+        )
+        tbill_spread_rows.append(
+            {
+                "date": period.isoformat(),
+                "SOFR−13-week T-bill": float(tbill_spread),
+                "_source_keys": tbill_derived["source_keys"],
+                "_batch_ids": tbill_derived["input_batch_ids"],
+                "_lineage": {"SOFR−13-week T-bill": tbill_derived},
+            }
+        )
+        iorb_spread_rows.append(
+            {
+                "date": period.isoformat(),
+                "SOFR−IORB": float(iorb_spread),
+                "_source_keys": iorb_derived["source_keys"],
+                "_batch_ids": iorb_derived["input_batch_ids"],
+                "_lineage": {"SOFR−IORB": iorb_derived},
+            }
+        )
+    current_lineage = lineage_by_date[common_date]
+    sofr_value = observations["sofr"][common_date].value
+    tbill_value = observations["tbill"][common_date].value
+    iorb_value = observations["iorb"][common_date].value
+    metrics = [
+        _reserves_rate_spreads_metric(
+            key="reserves-sofr",
+            label="SOFR",
+            value=sofr_value,
+            period=common_date,
+            inputs=[current_lineage["sofr"]],
+            page_fresh_until=page_fresh_until,
+            derived=False,
+            formula="Direct NY Fed SOFR percent rate",
+            internal_license_scope=licence_scopes["internal"],
+        ),
+        _reserves_rate_spreads_metric(
+            key="reserves-tbill-13w-coupon-equivalent",
+            label="13-week T-bill Coupon Equivalent",
+            value=tbill_value,
+            period=common_date,
+            inputs=[current_lineage["tbill"]],
+            page_fresh_until=page_fresh_until,
+            derived=False,
+            formula="Direct Treasury 13-week Coupon Equivalent",
+            internal_license_scope=licence_scopes["internal"],
+        ),
+        _reserves_rate_spreads_metric(
+            key="reserves-iorb",
+            label="IORB",
+            value=iorb_value,
+            period=common_date,
+            inputs=[current_lineage["iorb"]],
+            page_fresh_until=page_fresh_until,
+            derived=False,
+            formula="Direct Federal Reserve PRATES IORB",
+            internal_license_scope=licence_scopes["internal"],
+        ),
+        _reserves_rate_spreads_metric(
+            key="reserves-sofr-tbill-spread",
+            label="SOFR−13-week T-bill",
+            value=Decimal("100") * (sofr_value - tbill_value),
+            period=common_date,
+            inputs=[current_lineage["sofr"], current_lineage["tbill"]],
+            page_fresh_until=page_fresh_until,
+            derived=True,
+            formula="100 * (SOFR - 13-week T-bill Coupon Equivalent)",
+            internal_license_scope=licence_scopes["internal"],
+        ),
+        _reserves_rate_spreads_metric(
+            key="reserves-sofr-iorb-spread",
+            label="SOFR−IORB",
+            value=Decimal("100") * (sofr_value - iorb_value),
+            period=common_date,
+            inputs=[current_lineage["sofr"], current_lineage["iorb"]],
+            page_fresh_until=page_fresh_until,
+            derived=True,
+            formula="100 * (SOFR - IORB)",
+            internal_license_scope=licence_scopes["internal"],
+        ),
+    ]
+    charts = _existing(
+        _lineage_chart(
+            key="reserves-funding-levels",
+            title="SOFR、13 周 T-bill 与 IORB",
+            description="只展示最近 60 个自然日内三个官方源的精确共同有效日，单位：%。",
+            rows=funding_rows,
+            fields=("SOFR", "13-week T-bill Coupon Equivalent", "IORB"),
+            tab="funding",
+            frequency="daily",
+            include_internal=False,
+        ),
+        _lineage_chart(
+            key="reserves-sofr-tbill-spread-history",
+            title="SOFR−13 周 T-bill 历史",
+            description="100 × (SOFR − 13-week Coupon Equivalent)，单位：bp；不前值填充。",
+            rows=tbill_spread_rows,
+            fields=("SOFR−13-week T-bill",),
+            tab="funding",
+            frequency="daily",
+        ),
+        _lineage_chart(
+            key="reserves-sofr-iorb-spread-history",
+            title="SOFR−IORB 历史",
+            description="100 × (SOFR − IORB)，单位：bp；不前值填充。",
+            rows=iorb_spread_rows,
+            fields=("SOFR−IORB",),
+            tab="funding",
+            frequency="daily",
+        ),
+    )
+    sections = [
+        {
+            "key": "rate-spread-method",
+            "title": "日频资金利差口径",
+            "body": (
+                "当前值以 SOFR 精确批次尾部为准；Treasury 可因 15:30 ET "
+                "报价而领先一个工作日，但必须包含该 SOFR 日。历史只取向前 "
+                "60 个自然日内三源共同有效日，不做前值填充。"
+            ),
+            "full_width": True,
+        },
+        {
+            "key": "tbill-quote-convention",
+            "title": "13 周国库券报价口径",
+            "body": (
+                "显示值严格使用 ROUND_B1_YIELD_13WK_2 Coupon Equivalent；"
+                "Bank Discount 只保留在逐点元数据，绝不替代显示值。"
+            ),
+            "full_width": True,
+        },
+    ]
+    refresh_cycle_id = str(
+        (selected_runs["sofr"].metadata or {}).get("refresh_cycle_id") or ""
+    )
+    extra_data = {
+        "contract_version": RESERVES_RATE_SPREADS_CONTRACT_VERSION,
+        "common_effective_date": common_date.isoformat(),
+        "history_window_calendar_days": RESERVES_RATE_SPREADS_HISTORY_DAYS,
+        "history_start_date": window_start.isoformat(),
+        "history_row_count": len(history_dates),
+        "no_forward_fill": True,
+        "quote_convention": RESERVES_RATE_SPREADS_QUOTE_CONVENTION,
+        "refresh_cycle_id": refresh_cycle_id,
+        "license_decisions": [
+            {"source_key": source_key, "scope": licence_scopes[source_key]}
+            for source_key in sorted(licence_scopes)
+        ],
+        "component_runs": [
+            _reserves_rate_spreads_run_state(identity, selected_runs[identity], status="valid")
+            for identity in RESERVES_RATE_SPREADS_DATASETS
+        ],
+        "input_datasets": [
+            {
+                "component": identity,
+                "source_key": RESERVES_RATE_SPREADS_DATASETS[identity][0],
+                "dataset": RESERVES_RATE_SPREADS_DATASETS[identity][1],
+                "series_key": RESERVES_RATE_SPREADS_SERIES[identity],
+                "batch_id": str(selected_runs[identity].batch_id),
+            }
+            for identity in ("sofr", "tbill", "iorb")
+        ],
+    }
+    prepared = (metrics, charts, sections, extra_data)
+    if not _reserves_rate_spreads_page_contract_is_buildable(
+        metrics, charts, extra_data
+    ):
+        return None, [
+            _reserves_rate_spreads_failure(
+                "contract", "prepared rate-spread component failed its v1 validator"
+            )
+        ]
+    return prepared, []
+
+
+def _reserves_rate_spreads_page_contract_is_buildable(
+    metrics: list[dict[str, Any]],
+    charts: list[dict[str, Any]],
+    extra_data: dict[str, Any],
+) -> bool:
+    metric_by_key = {
+        str(item.get("key") or ""): item
+        for item in metrics
+        if isinstance(item, dict)
+    }
+    chart_by_key = {
+        str(item.get("key") or ""): item
+        for item in charts
+        if isinstance(item, dict)
+    }
+    if (
+        extra_data.get("contract_version")
+        != RESERVES_RATE_SPREADS_CONTRACT_VERSION
+        or set(metric_by_key) != set(RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS)
+        or set(chart_by_key) != set(RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS)
+        or extra_data.get("history_window_calendar_days")
+        != RESERVES_RATE_SPREADS_HISTORY_DAYS
+        or extra_data.get("no_forward_fill") is not True
+        or extra_data.get("quote_convention")
+        != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+    ):
+        return False
+    try:
+        common_date = date.fromisoformat(str(extra_data["common_effective_date"]))
+        history_start = date.fromisoformat(str(extra_data["history_start_date"]))
+    except (KeyError, ValueError):
+        return False
+    if history_start != common_date - timedelta(
+        days=RESERVES_RATE_SPREADS_HISTORY_DAYS - 1
+    ):
+        return False
+    input_datasets = extra_data.get("input_datasets")
+    if not isinstance(input_datasets, list) or len(input_datasets) != 3:
+        return False
+    inputs_by_component = {
+        str(item.get("component") or ""): item
+        for item in input_datasets
+        if isinstance(item, dict)
+    }
+    if set(inputs_by_component) != set(RESERVES_RATE_SPREADS_DATASETS):
+        return False
+    license_decisions = extra_data.get("license_decisions")
+    if not isinstance(license_decisions, list):
+        return False
+    license_scopes = {
+        str(item.get("source_key") or ""): str(item.get("scope") or "")
+        for item in license_decisions
+        if isinstance(item, dict)
+    }
+    if set(license_scopes) != {
+        "ny-fed-markets",
+        "federal-reserve",
+        "us-treasury-rates",
+        "internal",
+    } or any(not scope for scope in license_scopes.values()):
+        return False
+    expected_batches = {
+        str(item.get("batch_id") or "") for item in input_datasets
+    }
+    if "" in expected_batches or len(expected_batches) != 3:
+        return False
+    for identity, item in inputs_by_component.items():
+        if (
+            (item.get("source_key"), item.get("dataset"))
+            != RESERVES_RATE_SPREADS_DATASETS[identity]
+            or item.get("series_key") != RESERVES_RATE_SPREADS_SERIES[identity]
+        ):
+            return False
+    component_runs = extra_data.get("component_runs")
+    if (
+        not isinstance(component_runs, list)
+        or len(component_runs) != 3
+        or any(
+            not isinstance(item, dict)
+            or item.get("status") != "valid"
+            or item.get("row_count", 0) <= 0
+            or not item.get("ingestion_run_id")
+            for item in component_runs
+        )
+    ):
+        return False
+    runs_by_component = {
+        str(item.get("component") or ""): item for item in component_runs
+    }
+    if set(runs_by_component) != set(RESERVES_RATE_SPREADS_DATASETS):
+        return False
+    for identity, item in runs_by_component.items():
+        expected = inputs_by_component[identity]
+        if (
+            (item.get("source"), item.get("dataset"))
+            != RESERVES_RATE_SPREADS_DATASETS[identity]
+            or item.get("batch_id") != expected.get("batch_id")
+        ):
+            return False
+
+    def decimal_value(raw: Any) -> Decimal | None:
+        try:
+            value = Decimal(str(raw))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        return value if value.is_finite() else None
+
+    def same(left: Any, right: Any) -> bool:
+        left_value = decimal_value(left)
+        right_value = decimal_value(right)
+        return bool(
+            left_value is not None
+            and right_value is not None
+            and abs(left_value - right_value) <= Decimal("0.00000001")
+        )
+
+    def safe_direct(item: Any, identity: str, period: date) -> bool:
+        if not isinstance(item, dict):
+            return False
+        value = decimal_value(item.get("value"))
+        expected = inputs_by_component[identity]
+        if (
+            item.get("series_key") != RESERVES_RATE_SPREADS_SERIES[identity]
+            or item.get("source_key") != RESERVES_RATE_SPREADS_DATASETS[identity][0]
+            or item.get("batch_id") != expected.get("batch_id")
+            or str(item.get("value_date") or "")[:10] != period.isoformat()
+            or _parse_payload_datetime(item.get("as_of")) is None
+            or _parse_payload_datetime(item.get("fetched_at")) is None
+            or _parse_payload_datetime(item.get("fresh_until")) is None
+            or item.get("quality_status") != Observation.Quality.FRESH
+            or item.get("fallback_source") is not None
+            or item.get("license_scope")
+            != license_scopes[RESERVES_RATE_SPREADS_DATASETS[identity][0]]
+            or value is None
+            or not Decimal("-5") <= value <= Decimal("25")
+        ):
+            return False
+        return identity != "tbill" or (
+            item.get("quote_convention") == RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+            and item.get("treasury_field")
+            == TreasuryRatesProvider.BILL_13W_COUPON_EQUIVALENT_FIELD
+            and item.get("bank_discount_rate") not in {None, ""}
+            and item.get("cusip")
+            and item.get("maturity_date")
+        )
+
+    direct_metric_specs = {
+        "reserves-sofr": "sofr",
+        "reserves-tbill-13w-coupon-equivalent": "tbill",
+        "reserves-iorb": "iorb",
+    }
+    for key, identity in direct_metric_specs.items():
+        metric = metric_by_key[key]
+        metadata = metric.get("metadata") or {}
+        lineage = metadata.get("input_lineage")
+        if (
+            metric.get("quality_status") != Observation.Quality.FRESH
+            or metric.get("source_key") != RESERVES_RATE_SPREADS_DATASETS[identity][0]
+            or metric.get("license_scope")
+            != license_scopes[RESERVES_RATE_SPREADS_DATASETS[identity][0]]
+            or not isinstance(lineage, list)
+            or len(lineage) != 1
+            or not safe_direct(lineage[0], identity, common_date)
+            or not same(metric.get("value"), lineage[0].get("value"))
+            or set(metadata.get("input_batch_ids") or [])
+            != {str(inputs_by_component[identity]["batch_id"])}
+        ):
+            return False
+    spread_specs = {
+        "reserves-sofr-tbill-spread": (
+            "tbill",
+            "100 * (SOFR - 13-week T-bill Coupon Equivalent)",
+        ),
+        "reserves-sofr-iorb-spread": ("iorb", "100 * (SOFR - IORB)"),
+    }
+    for key, (peer, formula) in spread_specs.items():
+        metric = metric_by_key[key]
+        metadata = metric.get("metadata") or {}
+        lineage = metadata.get("input_lineage")
+        if not isinstance(lineage, list) or len(lineage) != 2:
+            return False
+        by_series = {
+            str(item.get("series_key") or ""): item
+            for item in lineage
+            if isinstance(item, dict)
+        }
+        sofr_lineage = by_series.get(RESERVES_RATE_SPREADS_SERIES["sofr"])
+        peer_lineage = by_series.get(RESERVES_RATE_SPREADS_SERIES[peer])
+        if (
+            metric.get("quality_status") != Observation.Quality.ESTIMATED
+            or metric.get("source_key") != "internal"
+            or metric.get("license_scope") != license_scopes["internal"]
+            or metadata.get("formula") != formula
+            or not safe_direct(sofr_lineage, "sofr", common_date)
+            or not safe_direct(peer_lineage, peer, common_date)
+            or not same(
+                metric.get("value"),
+                Decimal("100")
+                * (
+                    Decimal(str(sofr_lineage["value"]))
+                    - Decimal(str(peer_lineage["value"]))
+                ),
+            )
+        ):
+            return False
+        if peer == "tbill" and metadata.get("quote_convention") != RESERVES_RATE_SPREADS_QUOTE_CONVENTION:
+            return False
+    chart_rows = {key: value.get("data") for key, value in chart_by_key.items()}
+    if any(
+        not isinstance(rows, list)
+        or len(rows) < RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS
+        for rows in chart_rows.values()
+    ):
+        return False
+    date_lists = [
+        [str(row.get("date") or "") for row in rows]
+        for rows in chart_rows.values()
+    ]
+    if any(dates != date_lists[0] for dates in date_lists[1:]):
+        return False
+    try:
+        dates = [date.fromisoformat(item) for item in date_lists[0]]
+    except ValueError:
+        return False
+    if (
+        dates != sorted(dates)
+        or len(dates) != len(set(dates))
+        or dates[-1] != common_date
+        or dates[0] < history_start
+        or extra_data.get("history_row_count") != len(dates)
+    ):
+        return False
+    funding_rows = chart_rows["reserves-funding-levels"]
+    tbill_rows = chart_rows["reserves-sofr-tbill-spread-history"]
+    iorb_rows = chart_rows["reserves-sofr-iorb-spread-history"]
+    for period, funding, tbill_row, iorb_row in zip(
+        dates, funding_rows, tbill_rows, iorb_rows, strict=True
+    ):
+        funding_lineage = funding.get("_lineage") or {}
+        sofr = funding_lineage.get("SOFR")
+        tbill = funding_lineage.get("13-week T-bill Coupon Equivalent")
+        iorb = funding_lineage.get("IORB")
+        if (
+            not safe_direct(sofr, "sofr", period)
+            or not safe_direct(tbill, "tbill", period)
+            or not safe_direct(iorb, "iorb", period)
+            or not same(funding.get("SOFR"), sofr["value"])
+            or not same(funding.get("13-week T-bill Coupon Equivalent"), tbill["value"])
+            or not same(funding.get("IORB"), iorb["value"])
+        ):
+            return False
+        for row, field, peer, expected_formula in (
+            (
+                tbill_row,
+                "SOFR−13-week T-bill",
+                tbill,
+                "100 * (SOFR - 13-week T-bill Coupon Equivalent)",
+            ),
+            (iorb_row, "SOFR−IORB", iorb, "100 * (SOFR - IORB)"),
+        ):
+            derived = (row.get("_lineage") or {}).get(field)
+            if (
+                not isinstance(derived, dict)
+                or derived.get("source_key") != "internal"
+                or derived.get("quality_status") != Observation.Quality.ESTIMATED
+                or derived.get("formula") != expected_formula
+                or derived.get("fallback_source") is not None
+                or derived.get("license_scope") != license_scopes["internal"]
+                or not same(
+                    row.get(field),
+                    Decimal("100")
+                    * (Decimal(str(sofr["value"])) - Decimal(str(peer["value"]))),
+                )
+            ):
+                return False
+    for chart in charts:
+        if (
+            chart.get("time_axis") != "date"
+            or chart.get("frequency") != "daily"
+            or not chart.get("as_of")
+            or not chart.get("fetched_at")
+            or not chart.get("fresh_until")
+            or not chart.get("license_scopes")
+            or chart.get("fallback_sources") != []
+            or not set(chart.get("batch_ids") or []) <= expected_batches
+        ):
+            return False
+    return True
+
+
+def _latest_reserves_rate_spreads_snapshot() -> DashboardSnapshot | None:
+    return (
+        DashboardSnapshot.objects.filter(
+            key="reserves-rate-spreads",
+            is_published=True,
+            data__contract_version=RESERVES_RATE_SPREADS_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+
+
+def _reserves_rate_spreads_snapshot_effective_date(
+    snapshot: DashboardSnapshot,
+) -> date:
+    try:
+        return date.fromisoformat(str((snapshot.data or {})["common_effective_date"]))
+    except (KeyError, ValueError):
+        return snapshot.as_of.date()
+
+
+def _reserves_rate_spreads_snapshot_contract_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    selected_runs: dict[str, IngestionRun] | None = None,
+    allow_stale: bool = False,
+    reconcile_metric_snapshots: bool = True,
+) -> bool:
+    data = dict(snapshot.data or {})
+    expected_sources = {
+        "ny-fed-markets",
+        "federal-reserve",
+        "us-treasury-rates",
+        "internal",
+    }
+    input_datasets = data.get("input_datasets") or []
+    expected_batches = {
+        str(item.get("batch_id") or "")
+        for item in input_datasets
+        if isinstance(item, dict)
+    }
+    if (
+        snapshot.key != "reserves-rate-spreads"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or data.get("demo") is not False
+        or data.get("contract_version") != RESERVES_RATE_SPREADS_CONTRACT_VERSION
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or set(data.get("component_batches") or []) != expected_batches
+        or len(expected_batches) != 3
+        or set(data.get("source_keys") or []) != expected_sources
+        or snapshot.quality_status
+        not in {
+            Observation.Quality.FRESH,
+            Observation.Quality.ESTIMATED,
+            Observation.Quality.STALE,
+        }
+        or (not allow_stale and snapshot.quality_status == Observation.Quality.STALE)
+        or (not allow_stale and data.get("refresh_failure"))
+        or not _reserves_rate_spreads_page_contract_is_buildable(
+            list(data.get("metrics") or []),
+            list(data.get("charts") or []),
+            data,
+        )
+    ):
+        return False
+    public_sources, derived_sources = current_display_source_key_sets(expected_sources)
+    if public_sources != expected_sources or derived_sources != expected_sources:
+        return False
+    current_scopes: dict[str, str] = {}
+    for source in Source.objects.filter(key__in=expected_sources):
+        licence = _effective_source_license(
+            source, require_public=True, require_derived=True
+        )
+        if licence is None:
+            return False
+        current_scopes[source.key] = licence.scope
+    stored_scopes = {
+        str(item.get("source_key") or ""): str(item.get("scope") or "")
+        for item in data.get("license_decisions", [])
+        if isinstance(item, dict)
+    }
+    if stored_scopes != current_scopes:
+        return False
+    if selected_runs is not None and expected_batches != {
+        str(run.batch_id) for run in selected_runs.values()
+    }:
+        return False
+    if not reconcile_metric_snapshots:
+        return True
+    normalized = {
+        item.key: item
+        for item in MetricSnapshot.objects.filter(
+            batch_id=snapshot.batch_id,
+            key__startswith="reserves-rate-spreads-",
+        ).select_related("source", "fallback_source")
+    }
+    expected_metric_rows = {
+        f"reserves-rate-spreads-{key}"
+        for key in RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS
+    }
+    if set(normalized) != expected_metric_rows:
+        return False
+    for metric in data.get("metrics", []):
+        stored = normalized.get(f"reserves-rate-spreads-{metric.get('key')}")
+        metadata = metric.get("metadata") or {}
+        if (
+            stored is None
+            or stored.value is None
+            or stored.value.quantize(Decimal("0.00000001"))
+            != Decimal(str(metric.get("value"))).quantize(Decimal("0.00000001"))
+            or stored.source.key != metric.get("source_key")
+            or stored.fallback_source_id is not None
+            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.quality_status != metric.get("quality_status")
+            or not stored.license_scope
+            or stored.metadata.get("formula") != metadata.get("formula")
+            or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
+            or set(stored.metadata.get("input_batch_ids") or [])
+            != set(metadata.get("input_batch_ids") or [])
+            or stored.metadata.get("quote_convention")
+            != metadata.get("quote_convention")
+        ):
+            return False
+    return True
+
+
+def reserves_rate_spreads_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    """Allow a retained stale daily component only when its full v1 remains valid."""
+
+    return _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        allow_stale=True,
+        reconcile_metric_snapshots=False,
+    )
+
+
+def select_public_reserves_rate_spreads_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="reserves-rate-spreads", is_published=True
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if reserves_rate_spreads_snapshot_is_publicly_displayable(candidate)
+        ),
+        None,
+    )
+
+
+def _mark_reserves_rate_spreads_stale(
+    components: list[dict[str, Any]],
+    *,
+    reason: str,
+) -> None:
+    latest = (
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="reserves-rate-spreads",
+            is_published=True,
+            data__contract_version=RESERVES_RATE_SPREADS_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return
+    data = dict(latest.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason": reason,
+        "components": components,
+        "sources": [
+            {**item, "error": str(item.get("reason") or "")}
+            for item in components
+        ],
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+def _reserves_rate_spreads_runs_still_latest(
+    selected_runs: dict[str, IngestionRun],
+) -> bool:
+    return all(
+        (latest := _latest_reserves_rate_spreads_attempt(identity)) is not None
+        and latest.pk == selected_runs[identity].pk
+        for identity in RESERVES_RATE_SPREADS_DATASETS
+    )
+
+
+@transaction.atomic
+def _coordinate_reserves_rate_spreads_dashboard(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    required_sources = {
+        "ny-fed-markets",
+        "federal-reserve",
+        "us-treasury-rates",
+        "internal",
+    }
+    for source_key in required_sources:
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in=required_sources)
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(source__key__in=required_sources, is_current=True)
+        .order_by("source__key")
+        .values_list("pk", flat=True)
+    )
+    selected, states, triggered = _select_reserves_rate_spreads_runs(trigger_runs)
+    if not triggered:
+        return [], set()
+    previous_snapshot = _latest_reserves_rate_spreads_snapshot()
+    if selected is None:
+        _mark_reserves_rate_spreads_stale(
+            states,
+            reason=(
+                "最近一次 SOFR、IORB 或 13 周 T-bill 精确数据集未成功，"
+                "或 SOFR/Treasury 不属于同一刷新周期；继续保留上一完整组件。"
+            ),
+        )
+        return (
+            [],
+            {"reserves-rate-spreads"} if previous_snapshot is not None else set(),
+        )
+    prepared, failures = _reserves_rate_spreads_page_data(selected)
+    if prepared is None:
+        _mark_reserves_rate_spreads_stale(
+            failures,
+            reason=(
+                "三源未形成可发布的精确共同日、60 日历史、许可与报价口径合同；"
+                "继续保留上一完整组件。"
+            ),
+        )
+        return (
+            [],
+            {"reserves-rate-spreads"} if previous_snapshot is not None else set(),
+        )
+    candidate_date = date.fromisoformat(prepared[3]["common_effective_date"])
+    if (
+        previous_snapshot is not None
+        and candidate_date
+        < _reserves_rate_spreads_snapshot_effective_date(previous_snapshot)
+    ):
+        _mark_reserves_rate_spreads_stale(
+            [
+                _reserves_rate_spreads_failure(
+                    "common-date",
+                    "candidate common effective date regressed behind the published v1 component",
+                    status=Observation.Quality.STALE,
+                )
+            ],
+            reason="日频利差候选日期发生回退；拒绝发布并保留上一版。",
+        )
+        return [], {"reserves-rate-spreads"}
+    try:
+        with transaction.atomic():
+            publication_batch = uuid.uuid4()
+            published = _publish_dashboard(
+                key="reserves-rate-spreads",
+                title="准备金页日频资金利差",
+                summary=(
+                    "NY Fed SOFR、Federal Reserve PRATES IORB 与 U.S. Treasury "
+                    "13-week Bill Coupon Equivalent 以精确共同有效日独立原子发布。"
+                ),
+                metrics=prepared[0],
+                charts=prepared[1],
+                sections=prepared[2],
+                extra_data=prepared[3],
+                required_metric_keys=RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS,
+                batch_id=publication_batch,
+            )
+            latest = _latest_reserves_rate_spreads_snapshot()
+            if (
+                latest is None
+                or not _reserves_rate_spreads_runs_still_latest(selected)
+                or not _reserves_rate_spreads_snapshot_contract_is_valid(
+                    latest, selected_runs=selected
+                )
+            ):
+                raise ValueError("reserves-rate-spreads publication postcondition failed")
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ):
+        _mark_reserves_rate_spreads_stale(
+            [
+                _reserves_rate_spreads_failure(
+                    "publication",
+                    "publication postcondition or latest-attempt concurrency check failed",
+                )
+            ],
+            reason=(
+                "日频利差 v1 发布后置条件未满足；新写入已回滚，"
+                "继续保留上一完整组件。"
+            ),
+        )
+        return [], {"reserves-rate-spreads"}
+    return ([published] if published is not None else []), set()
 
 
 def _liquidity_run_identity(run: IngestionRun) -> str | None:
@@ -7011,6 +8617,38 @@ def _liquidity_fed_funds_component(
             )
         copied = deepcopy(metric)
         copied_metadata = dict(copied.get("metadata") or {})
+        normalized_input_lineage = deepcopy(input_lineage)
+        for lineage_item in normalized_input_lineage:
+            lineage_source_key = str(lineage_item.get("source_key") or "")
+            lineage_source = Source.objects.filter(key=lineage_source_key).first()
+            lineage_licence = (
+                _effective_source_license(lineage_source, require_public=True)
+                if lineage_source is not None
+                else None
+            )
+            if lineage_licence is None:
+                return _liquidity_component_failure(
+                    "fed-funds",
+                    (
+                        "required Fed Funds metric "
+                        f"{metric_key} has a lineage source without a current licence"
+                    ),
+                    status="unlicensed",
+                    snapshot=snapshot,
+                )
+            lineage_item["license_scope"] = lineage_licence.scope
+        copied_metadata["input_lineage"] = normalized_input_lineage
+        metric_licence = _effective_source_license(
+            normalized.source,
+            require_public=True,
+        )
+        if metric_licence is None:
+            return _liquidity_component_failure(
+                "fed-funds",
+                f"required Fed Funds metric {metric_key} lacks a current licence",
+                status="unlicensed",
+                snapshot=snapshot,
+            )
         copied_metadata.update(
             {
                 "component_page_key": "fed-funds",
@@ -7020,11 +8658,11 @@ def _liquidity_fed_funds_component(
                 "component_metric_snapshot_id": normalized.pk,
                 "component_metric_snapshot_key": normalized.key,
                 "component_metric_snapshot_batch_id": str(normalized.batch_id),
-                "inherited_license_scope": normalized.license_scope,
+                "inherited_license_scope": metric_licence.scope,
             }
         )
         copied["metadata"] = copied_metadata
-        copied["license_scope"] = normalized.license_scope
+        copied["license_scope"] = metric_licence.scope
         copied_metrics.append(copied)
         metric_snapshot_ids.append(normalized.pk)
         value_dates.add(metric_date.isoformat())
@@ -10590,6 +12228,150 @@ def _store_treasury_curve_observations(result, source, run) -> int:
     return len(to_create) + len(to_update)
 
 
+def _store_treasury_bill_observations(result, source, run) -> int:
+    """Persist the complete two-year 13-week bill response without regression."""
+
+    if (
+        source.key != RESERVES_RATE_SPREADS_DATASETS["tbill"][0]
+        or result.dataset != RESERVES_RATE_SPREADS_DATASETS["tbill"][1]
+        or run.dataset != RESERVES_RATE_SPREADS_DATASETS["tbill"][1]
+    ):
+        raise ValueError("Treasury bill persistence source/run identity mismatch")
+    metadata = dict(result.metadata or {})
+    requested_years = metadata.get("requested_years")
+    if (
+        not isinstance(requested_years, list)
+        or len(requested_years) != 2
+        or not all(isinstance(item, int) for item in requested_years)
+        or requested_years[1] != requested_years[0] + 1
+        or requested_years[1] > timezone.now().year
+    ):
+        raise ValueError("Treasury bill requested-year contract is invalid")
+    if not result.records:
+        raise ValueError("Treasury bill exact batch contains no records")
+    record_dates: list[date] = []
+    for record in result.records:
+        try:
+            period = date.fromisoformat(str(record.get("date") or "")[:10])
+        except ValueError as exc:
+            raise ValueError("Treasury bill exact batch has a malformed date") from exc
+        record_metadata = dict(record.get("metadata") or {})
+        if (
+            record.get("series_id") != TreasuryRatesProvider.BILL_13W_SERIES
+            or record.get("value") is None
+            or not Decimal(str(record["value"])).is_finite()
+            or period.year not in requested_years
+            or record_metadata.get("quote_convention")
+            != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+            or record_metadata.get("treasury_field")
+            != TreasuryRatesProvider.BILL_13W_COUPON_EQUIVALENT_FIELD
+            or record_metadata.get("bank_discount_rate") in {None, ""}
+        ):
+            raise ValueError("Treasury bill exact batch quotation contract is invalid")
+        record_dates.append(period)
+    if (
+        len(record_dates) != len(set(record_dates))
+        or {item.year for item in record_dates} != set(requested_years)
+        or max(record_dates).year != requested_years[-1]
+    ):
+        raise ValueError("Treasury bill exact batch does not cover both requested years")
+    artifacts = list(metadata.get("artifacts") or [])
+    if (
+        len(artifacts) != 2
+        or {item.get("requested_year") for item in artifacts}
+        != set(requested_years)
+        or any(
+            not item.get("url")
+            or len(str(item.get("sha256") or "")) != 64
+            or int(item.get("size") or 0) <= 0
+            for item in artifacts
+        )
+    ):
+        raise ValueError("Treasury bill exact batch requires one artifact per response")
+    feed_updated = _parse_payload_datetime(metadata.get("feed_updated_time"))
+    wall_now = datetime.now(UTC)
+    if (
+        feed_updated is None
+        or feed_updated > result.fetched_at + timedelta(minutes=5)
+        or feed_updated > wall_now + timedelta(minutes=5)
+    ):
+        raise ValueError("Treasury bill feed update watermark is invalid or future")
+
+    Source.objects.select_for_update().get(pk=source.pk)
+    storage_licence = _effective_source_license(
+        source, lock=True, require_storage=True
+    )
+    if storage_licence is None:
+        raise ValueError(
+            "Treasury bill source lacks a current historical-storage licence"
+        )
+    latest_attempt = (
+        IngestionRun.objects.filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError(
+            "superseded Treasury bill ingestion run cannot persist observations"
+        )
+    durable_feed_updates: list[datetime] = []
+    for previous in IngestionRun.objects.filter(
+        source=source, dataset=run.dataset
+    ).exclude(pk=run.pk):
+        raw_value = (previous.metadata or {}).get("feed_updated_time")
+        if raw_value in {None, ""}:
+            continue
+        parsed = _parse_payload_datetime(raw_value)
+        if parsed is None:
+            raise ValueError("Treasury bill run has an invalid feed watermark")
+        durable_feed_updates.append(parsed)
+    existing = Observation.objects.filter(
+        source=source,
+        series__key=RESERVES_RATE_SPREADS_SERIES["tbill"],
+    )
+    for observation_metadata in existing.values_list("metadata", flat=True).iterator(
+        chunk_size=2000
+    ):
+        raw_value = (observation_metadata or {}).get("feed_updated_time")
+        if raw_value in {None, ""}:
+            continue
+        parsed = _parse_payload_datetime(raw_value)
+        if parsed is None:
+            raise ValueError("Treasury bill observation has an invalid feed watermark")
+        durable_feed_updates.append(parsed)
+    if durable_feed_updates and feed_updated < max(durable_feed_updates):
+        raise ValueError(
+            "Treasury bill feed update regressed behind the durable watermark"
+        )
+    existing_latest = existing.order_by("-value_date", "-id").first()
+    if existing_latest is not None and max(record_dates) < existing_latest.value_date.date():
+        raise ValueError(
+            "Treasury bill latest quote regressed behind stored observations"
+        )
+    run.metadata = {
+        **dict(run.metadata or {}),
+        "feed_updated_time": feed_updated.isoformat(),
+        "requested_years": requested_years,
+        "latest_value_date": max(record_dates).isoformat(),
+        "quote_convention": RESERVES_RATE_SPREADS_QUOTE_CONVENTION,
+    }
+    run.save(update_fields=["metadata", "updated_at"])
+    row_count = store_series_observations(result, source, run)
+    if row_count != len(result.records):
+        raise ValueError("Treasury bill persistence did not retain the complete exact batch")
+    for artifact in artifacts:
+        RawArtifact.objects.create(
+            run=run,
+            uri=f"{artifact['url']}#sha256={artifact['sha256']}",
+            sha256=str(artifact["sha256"]),
+            content_type=str(artifact.get("content_type") or "application/atom+xml"),
+            size_bytes=int(artifact["size"]),
+        )
+    if RawArtifact.objects.filter(run=run).count() != 2:
+        raise ValueError("Treasury bill persistence artifact postcondition failed")
+    return row_count
+
+
 def _store_h41_observations(result, source, run) -> int:
     """Backward-compatible H.4.1 persistence entry point used by tests/jobs."""
 
@@ -10622,7 +12404,117 @@ def _store_h8_observations(result, source, run) -> int:
     return _store_board_archive_observations(result, source, run)
 
 
+def _guard_daily_rate_persistence(
+    result: Any,
+    source: Source,
+    run: IngestionRun,
+    *,
+    expected_source: str,
+    expected_dataset: str,
+    expected_series: str,
+    allow_future_periods: bool = False,
+) -> None:
+    """Close supersession and stored-tail races for a daily rate exact batch."""
+
+    if (
+        source.key != expected_source
+        or result.dataset != expected_dataset
+        or run.dataset != expected_dataset
+    ):
+        raise ValueError("daily rate persistence source/run identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    storage_licence = _effective_source_license(
+        source, lock=True, require_storage=True
+    )
+    if storage_licence is None:
+        raise ValueError(
+            f"{expected_dataset} lacks a current historical-storage licence"
+        )
+    latest_attempt = (
+        IngestionRun.objects.filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError(
+            f"superseded {run.dataset} ingestion run cannot persist observations"
+        )
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    business_now = timezone.now()
+    wall_now = datetime.now(UTC)
+    numeric_records = [
+        record for record in result.records if record.get("value") is not None
+    ]
+    periods: list[date] = []
+    for record in numeric_records:
+        try:
+            period = date.fromisoformat(str(record.get("date") or "")[:10])
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("daily rate exact batch contains a malformed row") from exc
+        if (
+            str(record.get("series_id") or "").upper() != expected_series.upper()
+            or not value.is_finite()
+            or (period > business_now.date() and not allow_future_periods)
+        ):
+            raise ValueError("daily rate exact batch row failed identity or date checks")
+        periods.append(period)
+    if (
+        not periods
+        or len(periods) != len(set(periods))
+        or fetched_at > wall_now + timedelta(minutes=5)
+    ):
+        raise ValueError("daily rate exact batch is empty, duplicated, or future-dated")
+    existing_latest = (
+        Observation.objects.filter(
+            source=source,
+            series__key=expected_series.lower(),
+        )
+        .order_by("-value_date", "-id")
+        .first()
+    )
+    if existing_latest is not None and max(periods) < existing_latest.value_date.date():
+        raise ValueError(
+            f"{expected_dataset} latest date regressed behind stored observations"
+        )
+    run.metadata = {
+        **dict(run.metadata or {}),
+        "latest_value_date": max(periods).isoformat(),
+        "exact_series": expected_series,
+    }
+    run.save(update_fields=["metadata", "updated_at"])
+
+
+def _store_ny_fed_reference_rate_observations(result, source, run) -> int:
+    expected_series = {
+        "reference-rate:sofr": "SOFR",
+        "reference-rate:effr": "EFFR",
+    }.get(result.dataset)
+    if expected_series is None:
+        raise ValueError("unsupported guarded NY Fed reference-rate dataset")
+    _guard_daily_rate_persistence(
+        result,
+        source,
+        run,
+        expected_source="ny-fed-markets",
+        expected_dataset=result.dataset,
+        expected_series=expected_series,
+    )
+    return store_series_observations(result, source, run)
+
+
 def _store_prates_observations(result, source, run) -> int:
+    _guard_daily_rate_persistence(
+        result,
+        source,
+        run,
+        expected_source="federal-reserve",
+        expected_dataset="prates:iorb",
+        expected_series="IORB",
+        allow_future_periods=True,
+    )
     return _store_board_archive_observations(result, source, run)
 
 
@@ -10844,10 +12736,20 @@ def _publish_dashboard(
         for item in metrics
         if isinstance(item, dict)
     }
-    source_scopes = {
-        item.key: item.license_scope[:120]
-        for item in Source.objects.filter(key__in=metric_source_keys)
+    metric_sources = {
+        item.key: item for item in Source.objects.filter(key__in=metric_source_keys)
     }
+    source_scopes: dict[str, str] = {}
+    for source_key, component_source in metric_sources.items():
+        licence = _effective_source_license(
+            component_source,
+            require_public=True,
+        )
+        if licence is None:
+            raise ValueError(
+                f"dashboard metric source lacks a current public licence: {source_key}"
+            )
+        source_scopes[source_key] = licence.scope
     normalized_metrics: list[dict[str, Any]] = []
     for raw_metric in metrics:
         metric = deepcopy(raw_metric)
@@ -10860,10 +12762,7 @@ def _publish_dashboard(
                 f"dashboard metric declares unknown source key: {metric_source_key}"
             )
         metric["source_key"] = metric_source_key
-        metric["license_scope"] = source_scopes.get(
-            metric_source_key,
-            source.license_scope[:120],
-        )
+        metric["license_scope"] = source_scopes[metric_source_key]
         normalized_metrics.append(metric)
     metrics = normalized_metrics
     if required_metric_keys and not required_metric_keys <= {
@@ -10923,10 +12822,22 @@ def _publish_dashboard(
             item.key: item
             for item in Source.objects.filter(key__in=chart_source_keys)
         }
-        chart["license_scopes"] = [
-            f"{chart_sources[key].name}: {chart_sources[key].license_scope}"
+        chart_licence_scopes: dict[str, str] = {}
+        for source_key, chart_source in chart_sources.items():
+            licence = _effective_source_license(
+                chart_source,
+                require_public=True,
+            )
+            if licence is None:
+                raise ValueError(
+                    f"dashboard chart source lacks a current public licence: {source_key}"
+                )
+            chart_licence_scopes[source_key] = licence.scope
+        effective_chart_scopes = [
+            f"{chart_sources[key].name}: {chart_licence_scopes[key]}"
             for key in sorted(chart_sources)
         ]
+        chart["license_scopes"] = effective_chart_scopes
         chart["fallback_sources"] = sorted(
             _payload_fallback_source_keys(chart)
         )
@@ -11084,6 +12995,11 @@ def _publish_dashboard(
                 "calculation_owner"
             ),
             "normalization": component_metadata.get("normalization"),
+            "quote_convention": component_metadata.get("quote_convention"),
+            "treasury_field": component_metadata.get("treasury_field"),
+            "bank_discount_rate": component_metadata.get(
+                "bank_discount_rate"
+            ),
             "coverage_proxy": component_metadata.get("coverage_proxy"),
             "sample_window": component_metadata.get("sample_window"),
             "lag_calendar_days": component_metadata.get(
@@ -11174,7 +13090,19 @@ def _publish_dashboard(
                 "quality_status": item.get(
                     "quality_status", Observation.Quality.FRESH
                 ),
-                "license_scope": component_source.license_scope[:120],
+                "license_scope": source_scopes.get(
+                    component_source.key,
+                    (
+                        licence.scope
+                        if (
+                            licence := _effective_source_license(
+                                component_source,
+                                require_public=True,
+                            )
+                        )
+                        else ""
+                    ),
+                )[:120],
                 "metadata": metric_metadata(item),
             },
         )
@@ -11923,12 +13851,21 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     year = current_year or timezone.now().year
     refresh_cycle_id = str(uuid.uuid4())
     runs: list[IngestionRun] = []
+    liquidity_trigger_runs: list[IngestionRun] = []
     providers = [
         (
             NYFedMarketsProvider(),
             (
-                ("sofr", {"limit": 800}),
-                ("effr", {"limit": 800}),
+                (
+                    "sofr",
+                    {"limit": 800},
+                    _store_ny_fed_reference_rate_observations,
+                ),
+                (
+                    "effr",
+                    {"limit": 800},
+                    _store_ny_fed_reference_rate_observations,
+                ),
                 ("reverse_repo_results", {"limit": 120}),
                 ("standing_repo_results", {"limit": 240}),
                 ("soma_summary", {"limit": 260}),
@@ -11947,6 +13884,11 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                     "real_yield_curve",
                     {"year": year},
                     _store_treasury_curve_observations,
+                ),
+                (
+                    "treasury_bill_rates_13w_coupon_equivalent",
+                    {"current_year": year},
+                    _store_treasury_bill_observations,
                 ),
             ),
         ),
@@ -12024,7 +13966,10 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                     "refresh_cycle_id": refresh_cycle_id,
                 }
                 persist = persist_override[0] if persist_override else store_series_observations
-                runs.append(record_provider_result(result, persist=persist))
+                run = record_provider_result(result, persist=persist)
+                runs.append(run)
+                if method_name != "treasury_bill_rates_13w_coupon_equivalent":
+                    liquidity_trigger_runs.append(run)
     finally:
         for provider, _ in providers:
             provider.close()
@@ -12107,13 +14052,18 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     )
     dashboards.extend(fed_funds_dashboards)
     stale_dashboard_keys |= stale_fed_funds_keys
+    rate_spread_dashboards, stale_rate_spread_keys = (
+        _coordinate_reserves_rate_spreads_dashboard(runs)
+    )
+    dashboards.extend(rate_spread_dashboards)
+    stale_dashboard_keys |= stale_rate_spread_keys
     treasury_dashboards, stale_treasury_keys = (
         _coordinate_treasury_curve_dashboards(runs, end_year=year)
     )
     dashboards.extend(treasury_dashboards)
     stale_dashboard_keys |= stale_treasury_keys
     liquidity_dashboards, stale_liquidity_keys = (
-        _coordinate_liquidity_dashboard(runs)
+        _coordinate_liquidity_dashboard(liquidity_trigger_runs)
     )
     dashboards.extend(liquidity_dashboards)
     stale_dashboard_keys |= stale_liquidity_keys
@@ -12331,6 +14281,10 @@ def refresh_prates_data() -> dict[str, Any]:
         _coordinate_liquidity_dashboard([run])
     )
     dashboards.extend(liquidity_dashboards)
+    rate_spread_dashboards, stale_rate_spread_keys = (
+        _coordinate_reserves_rate_spreads_dashboard([run])
+    )
+    dashboards.extend(rate_spread_dashboards)
     return {
         "runs": [
             {
@@ -12344,7 +14298,9 @@ def refresh_prates_data() -> dict[str, Any]:
         ],
         "dashboard_keys": [dashboard.key for dashboard in dashboards],
         "stale_dashboard_keys": sorted(
-            stale_fed_funds_keys | stale_liquidity_keys
+            stale_fed_funds_keys
+            | stale_liquidity_keys
+            | stale_rate_spread_keys
         ),
     }
 

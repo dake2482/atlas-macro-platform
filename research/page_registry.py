@@ -390,6 +390,15 @@ PAGE_CONFIGS = {
                 "label": "覆盖近似",
                 "chart_keys": ["reserve-ratio-history"],
             },
+            {
+                "value": "funding",
+                "label": "资金利差",
+                "chart_keys": [
+                    "reserves-funding-levels",
+                    "reserves-sofr-tbill-spread-history",
+                    "reserves-sofr-iorb-spread-history",
+                ],
+            },
         ],
         "default_tab": "levels",
         "metrics": [
@@ -398,6 +407,11 @@ PAGE_CONFIGS = {
             metric("准备金 / 商业银行资产覆盖近似"),
             metric("覆盖近似 8 周变化"),
             metric("覆盖近似 8 周变化 Z-score"),
+            metric("SOFR"),
+            metric("13-week T-bill Coupon Equivalent"),
+            metric("IORB"),
+            metric("SOFR−13-week T-bill"),
+            metric("SOFR−IORB"),
         ],
         "analysis": (
             "分子覆盖所有存款机构，分母覆盖美国商业银行，"

@@ -805,6 +805,11 @@ SERIES_CATALOG = {
     "SOFR": ("Secured Overnight Financing Rate", "%", "daily"),
     "EFFR": ("Effective Federal Funds Rate", "%", "daily"),
     "IORB": ("Interest Rate on Reserve Balances", "%", "daily"),
+    "UST-BILL-13W-COUPON-EQUIVALENT": (
+        "U.S. Treasury 13-week Bill Coupon Equivalent",
+        "%",
+        "daily",
+    ),
     "H10-BROAD-DOLLAR": (
         "Federal Reserve H.10 Nominal Broad Dollar Index",
         "index",

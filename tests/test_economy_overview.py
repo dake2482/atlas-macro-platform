@@ -76,6 +76,56 @@ COMPONENTS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _select_synthetic_strict_children_fixture(monkeypatch):
+    """Keep generic economy unit fixtures explicit at the strict-child boundary."""
+
+    def select_fixture():
+        snapshot = (
+            DashboardSnapshot.objects.filter(key="gdp", is_published=True)
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if snapshot is not None:
+            snapshot.gdp_publication_state = "current_candidate"
+        return snapshot
+
+    monkeypatch.setattr(
+        "research.official_data.select_public_gdp_snapshot",
+        select_fixture,
+    )
+
+    def select_employment_fixture():
+        snapshot = (
+            DashboardSnapshot.objects.filter(key="employment", is_published=True)
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if snapshot is not None:
+            snapshot.employment_publication_state = "current_candidate"
+        return snapshot
+
+    monkeypatch.setattr(
+        "research.official_data.select_public_employment_snapshot",
+        select_employment_fixture,
+    )
+
+    def select_inflation_fixture():
+        snapshot = (
+            DashboardSnapshot.objects.filter(key="inflation", is_published=True)
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if snapshot is not None:
+            snapshot.inflation_publication_state = "current_candidate"
+        return snapshot
+
+    monkeypatch.setattr(
+        "research.official_data.select_public_inflation_snapshot",
+        select_inflation_fixture,
+    )
+
+
 def _chart_rows(value: Decimal, batch_id: uuid.UUID, source_keys: list[str]):
     latest = date(2026, 6, 1)
     rows = []
@@ -189,6 +239,17 @@ def _create_component(
     fingerprint = hashlib.sha256(
         f"{page_key}:{value}:{spec['value_date'].isoformat()}".encode()
     ).hexdigest()
+    payload_integrity_hash = hashlib.sha256(
+        f"payload:{page_key}:{value}:{publication_batch}".encode()
+    ).hexdigest()
+    source_roles = (
+        [
+            {"role": "bls", "source_key": "bls"},
+            {"role": "bea-pio", "source_key": "bea-pio-release"},
+        ]
+        if page_key == "inflation"
+        else [{"role": page_key, "source_key": spec["source_key"]}]
+    )
     snapshot = DashboardSnapshot.objects.create(
         key=page_key,
         title=page_key,
@@ -207,6 +268,16 @@ def _create_component(
             "fresh_until": fresh_until.isoformat(),
             "publication_batch_id": str(publication_batch),
             "fingerprint": fingerprint,
+            "payload_integrity_hash": payload_integrity_hash,
+            "contract_version": 2 if page_key in {"gdp", "employment", "inflation"} else 1,
+            "formula_version": f"{page_key}-fixture-v2",
+            "component_roles": {
+                page_key: {
+                    "source_key": spec["source_key"],
+                    "batch_id": str(input_batch),
+                }
+            },
+            "input_runs": source_roles,
         },
         source=internal,
         is_published=True,
@@ -393,7 +464,7 @@ def test_economy_rejects_component_internal_batch_mismatch(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_economy_rejects_child_that_omits_new_successful_selected_batch(
+def test_economy_skips_source_wide_batch_check_for_strict_employment_and_inflation(
     monkeypatch,
 ):
     monkeypatch.setattr("research.official_data.timezone.now", lambda: FIXED_NOW)
@@ -424,20 +495,15 @@ def test_economy_rejects_child_that_omits_new_successful_selected_batch(
     dashboards, stale = _coordinate_economy_dashboard()
 
     assert dashboards == []
-    assert stale == {"economy"}
+    assert stale == set()
     parent.refresh_from_db()
-    assert parent.quality_status == "stale"
-    failures = parent.data["refresh_failure"]["components"]
-    failed_pages = {item["page_key"] for item in failures}
-    assert {"employment", "inflation"} <= failed_pages
+    assert parent.quality_status == "estimated"
+    assert "refresh_failure" not in parent.data
     assert all(
         str(latest_bls.batch_id) not in item["component_batches"]
         for item in parent.data["component_snapshots"]
         if item["page_key"] in {"employment", "inflation"}
     )
-    assert "latest successful source batch" in parent.data["refresh_failure"][
-        "reason"
-    ]
 
 
 @pytest.mark.django_db
@@ -723,6 +789,7 @@ def test_both_official_refresh_entrypoints_trigger_economy_coordinator(
         "DOLWeeklyClaimsProvider": "dol-eta-ui",
         "FederalReserveRSSProvider": "federal-reserve",
         "BEAGDPReleaseProvider": "bea-release",
+        "CensusMARTSProvider": "census",
         "CensusMARTSReleaseProvider": "census-release",
         "BEAPIOReleaseProvider": "bea-pio-release",
         "FederalReserveG19Provider": "federal-reserve-g19",
@@ -742,11 +809,31 @@ def test_both_official_refresh_entrypoints_trigger_economy_coordinator(
     monkeypatch.setattr(
         "research.official_data._coordinate_economy_dashboard", coordinate
     )
+    inflation_calls = []
+
+    def coordinate_inflation(runs):
+        inflation_calls.append(
+            {(run.source.key, run.dataset, run.status) for run in runs}
+        )
+        return [], {"inflation"}
+
+    monkeypatch.setattr(
+        "research.official_data.coordinate_inflation_dashboard",
+        coordinate_inflation,
+    )
 
     refresh_official_data(current_year=2026)
     refresh_macro_official_data(current_year=2026)
 
     assert calls == ["economy", "economy"]
+    assert len(inflation_calls) == 2
+    assert {source for source, _dataset, _status in inflation_calls[0]} >= {
+        "bls",
+        "bea-pio-release",
+    }
+    assert "bea-pio-release" in {
+        source for source, _dataset, _status in inflation_calls[1]
+    }
 
 
 def test_economy_required_metric_contract_is_exact():

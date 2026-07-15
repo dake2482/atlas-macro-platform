@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+import uuid
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from importlib import import_module
 
 import pytest
@@ -360,3 +362,140 @@ def test_real_0016_to_0017_fed_migration_fails_closed_and_preserves_legacy_value
     assert migrated_enriched.analysis_status == "draft"
     assert migrated_enriched.analysis_evidence[0]["kind"] == "legacy_unverified"
     assert migrated_enriched.analysis_evidence[0]["legacy_hawkish_score"] == 7
+
+
+@pytest.mark.django_db(transaction=True)
+def test_real_0017_to_0018_preserves_vintages_and_allows_new_acquisition_batch():
+    executor = MigrationExecutor(connection)
+    old_target = [("research", "0017_fed_document_analysis_provenance")]
+    new_target = [("research", "0018_release_vintage_batch_identity")]
+    executor.migrate(old_target)
+    old_apps = executor.loader.project_state(old_target).apps
+    OldSource = old_apps.get_model("research", "Source")
+    OldSeries = old_apps.get_model("research", "SeriesDefinition")
+    OldVintage = old_apps.get_model("research", "ReleaseVintageObservation")
+    source = OldSource.objects.create(
+        key="migration-bea-release",
+        name="Migration BEA release",
+        license_scope="public-domain official data",
+    )
+    series = OldSeries.objects.create(
+        key="migration-bea-a191rl",
+        name="Migration real GDP",
+        unit="percent",
+        frequency="quarterly",
+        source=source,
+    )
+    fetched_at = timezone.now()
+    original_batch = uuid.uuid4()
+    first = OldVintage.objects.create(
+        series=series,
+        value="2.1",
+        value_date=datetime(2026, 1, 1, tzinfo=UTC),
+        as_of=datetime(2026, 6, 25, tzinfo=UTC),
+        release_date=date(2026, 6, 25),
+        estimate_round="Third",
+        vintage_label="Third",
+        fetched_at=fetched_at,
+        batch_id=original_batch,
+        source=source,
+        quality_status="fresh",
+        license_scope=source.license_scope,
+        metadata={"fixture": "first"},
+    )
+    second = OldVintage.objects.create(
+        series=series,
+        value="1.6",
+        value_date=datetime(2026, 1, 1, tzinfo=UTC),
+        as_of=datetime(2026, 5, 28, tzinfo=UTC),
+        release_date=date(2026, 5, 28),
+        estimate_round="Second",
+        vintage_label="Second",
+        fetched_at=fetched_at,
+        batch_id=original_batch,
+        source=source,
+        quality_status="fresh",
+        license_scope=source.license_scope,
+        metadata={"fixture": "second"},
+    )
+
+    executor = MigrationExecutor(connection)
+    executor.migrate(new_target)
+    new_apps = executor.loader.project_state(new_target).apps
+    NewVintage = new_apps.get_model("research", "ReleaseVintageObservation")
+    assert list(
+        NewVintage.objects.filter(pk__in=(first.pk, second.pk))
+        .order_by("pk")
+        .values_list("value", "batch_id", "metadata")
+    ) == [
+        (Decimal("2.1"), original_batch, {"fixture": "first"}),
+        (Decimal("1.6"), original_batch, {"fixture": "second"}),
+    ]
+
+    new_batch = uuid.uuid4()
+    retained = NewVintage.objects.get(pk=first.pk)
+    duplicate_release_new_acquisition = NewVintage.objects.create(
+        series_id=retained.series_id,
+        value=retained.value,
+        value_date=retained.value_date,
+        as_of=retained.as_of,
+        release_date=retained.release_date,
+        estimate_round=retained.estimate_round,
+        vintage_label=retained.vintage_label,
+        fetched_at=retained.fetched_at,
+        batch_id=new_batch,
+        source_id=retained.source_id,
+        quality_status=retained.quality_status,
+        license_scope=retained.license_scope,
+        metadata=retained.metadata,
+    )
+    assert duplicate_release_new_acquisition.batch_id == new_batch
+    assert NewVintage.objects.filter(
+        series_id=retained.series_id,
+        value_date=retained.value_date,
+        release_date=retained.release_date,
+        estimate_round=retained.estimate_round,
+        source_id=retained.source_id,
+    ).count() == 2
+
+
+@pytest.mark.django_db(transaction=True)
+def test_real_0018_to_0019_preserves_runs_and_accepts_full_bls_dataset_identity():
+    executor = MigrationExecutor(connection)
+    old_target = [("research", "0018_release_vintage_batch_identity")]
+    new_target = [("research", "0019_expand_ingestion_run_dataset")]
+    executor.migrate(old_target)
+    old_apps = executor.loader.project_state(old_target).apps
+    OldSource = old_apps.get_model("research", "Source")
+    OldRun = old_apps.get_model("research", "IngestionRun")
+    source = OldSource.objects.create(
+        key="migration-bls",
+        name="Migration BLS",
+        license_scope="public official data",
+    )
+    original_dataset = "series:" + "X" * 113
+    original = OldRun.objects.create(
+        source=source,
+        dataset=original_dataset,
+        started_at=timezone.now(),
+        status="success",
+        row_count=1,
+    )
+
+    executor = MigrationExecutor(connection)
+    executor.migrate(new_target)
+    new_apps = executor.loader.project_state(new_target).apps
+    NewRun = new_apps.get_model("research", "IngestionRun")
+    assert NewRun._meta.get_field("dataset").max_length == 512
+    assert NewRun.objects.get(pk=original.pk).dataset == original_dataset
+
+    full_bls_dataset = "series:" + ",".join(
+        f"SERIES{index:03d}" for index in range(32)
+    )
+    assert 120 < len(full_bls_dataset) <= 512
+    created = NewRun.objects.create(
+        source_id=source.pk,
+        dataset=full_bls_dataset,
+        started_at=timezone.now(),
+    )
+    assert NewRun.objects.get(pk=created.pk).dataset == full_bls_dataset

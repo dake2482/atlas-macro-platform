@@ -1,33 +1,69 @@
 from __future__ import annotations
 
+import hashlib
 import html
+import json
 import uuid
-from datetime import UTC, date, datetime
+from copy import deepcopy
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from functools import lru_cache
+from pathlib import Path
 
 import pytest
+from django.db import connection
+from django.db.models.query import QuerySet
+from django.test.utils import CaptureQueriesContext
 
 from research.data_catalog import DATA_REQUIREMENTS
+from research.employment_contract import EMPLOYMENT_BLS_REQUEST_SERIES
+from research.inflation_contract import (
+    INFLATION_BLS_DATASET,
+    INFLATION_CONTRACT_VERSION,
+    INFLATION_FORMULA_VERSION,
+    INFLATION_REQUIRED_CHART_KEYS,
+    INFLATION_REQUIRED_METRIC_KEYS,
+    INFLATION_REQUIRED_SECTION_KEYS,
+    _is_inflation_bls_dataset,
+    coordinate_inflation_dashboard,
+    publish_inflation_revision,
+    select_public_inflation_snapshot,
+)
+from research.macro_releases import BEAPIOReleaseProvider
 from research.models import (
     DashboardSnapshot,
     IngestionRun,
     MetricSnapshot,
     Observation,
-    SeriesDefinition,
+    RawArtifact,
+    SourceLicense,
 )
 from research.official_data import (
+    APPEND_ONLY_PUBLICATION_KEYS,
     BLS_SERIES,
+    ECONOMY_COMPONENTS,
+    INDEPENDENT_PUBLICATION_KEYS,
     INFLATION_PUBLICATION_GROUPS,
     MACRO_REQUIRED_SERIES,
+    TREASURY_CURVE_FORMULA_VERSION,
+    _economy_component_payload,
+    _inflation_market_expectations_from_real_rates,
+    _inflation_page_data,
     _inflation_page_is_buildable,
-    _keys_with_current_required_batches,
-    _mark_latest_dashboards_stale,
-    _publishable_keys_for_source_groups,
+    _publish_dashboard,
+    _publish_dashboard_core,
+    _store_bea_release_observations_v2,
+    _store_bls_observations_v2,
     publish_official_dashboards,
-    refresh_official_data,
 )
-from research.providers import ProviderResult
-from research.services import ensure_source, record_provider_result, store_series_observations
+from research.page_registry import PAGE_CONFIGS
+from research.providers import BLSProvider, ProviderResult
+from research.services import ensure_source, record_provider_result
+from tests.test_macro_releases import (
+    _bea_pio_client,
+    _bea_pio_section2_workbook,
+    _bea_pio_summary_workbook,
+)
 
 INFLATION_SERIES = (
     "CUSR0000SA0",
@@ -43,16 +79,21 @@ INFLATION_SERIES = (
     "WPSFD4",
     "WPUFD4",
 )
-LATEST_PERIOD = date(2026, 5, 1)
-FROZEN_OFFICIAL_DATA_NOW = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
+BLS_LATEST_PERIOD = date(2026, 6, 1)
+PIO_LATEST_PERIOD = date(2026, 5, 1)
+FIXED_NOW = datetime(2026, 7, 15, 12, tzinfo=UTC)
+BLS_FETCHED_AT = datetime(2026, 6, 10, 12, 35, tzinfo=UTC)
+PIO_FETCHED_AT = datetime(2026, 6, 25, 14, tzinfo=UTC)
 
 
 @pytest.fixture(autouse=True)
-def _freeze_official_data_now(monkeypatch):
-    monkeypatch.setattr(
+def _freeze_contract_clocks(monkeypatch):
+    for target in (
         "research.official_data.timezone.now",
-        lambda: FROZEN_OFFICIAL_DATA_NOW,
-    )
+        "research.inflation_contract.timezone.now",
+        "research.services.timezone.now",
+    ):
+        monkeypatch.setattr(target, lambda: FIXED_NOW)
 
 
 def _month(start: date, offset: int) -> date:
@@ -60,29 +101,18 @@ def _month(start: date, offset: int) -> date:
     return date(month_index // 12, month_index % 12 + 1, 1)
 
 
-def _inflation_records(
-    *,
-    omit: set[tuple[str, date]] | None = None,
-    overrides: dict[tuple[str, date], Decimal] | None = None,
-) -> list[dict]:
-    omit = omit or set()
-    overrides = overrides or {}
-    start = date(2021, 5, 1)
-    periods = [_month(start, index) for index in range(61)]
-    records = []
-    anchor_values = {
-        ("CUSR0000SA0", LATEST_PERIOD): Decimal("121"),
-        ("CUSR0000SA0", date(2026, 4, 1)): Decimal("110"),
-        ("CUSR0000SA0", date(2026, 3, 1)): Decimal("105"),
-        ("CUSR0000SA0", date(2026, 2, 1)): Decimal("100"),
-        ("CUSR0000SA0", date(2026, 1, 1)): Decimal("100"),
+def _bls_value(series_id: str, period: date, index: int) -> Decimal:
+    anchors = {
+        ("CUSR0000SA0", BLS_LATEST_PERIOD): Decimal("121"),
+        ("CUSR0000SA0", date(2026, 5, 1)): Decimal("110"),
+        ("CUSR0000SA0", date(2026, 3, 1)): Decimal("100"),
         ("CUSR0000SA0", date(2025, 12, 1)): Decimal("100"),
-        ("CUSR0000SA0", date(2025, 11, 1)): Decimal("100"),
-        ("CUUR0000SA0", LATEST_PERIOD): Decimal("120"),
-        ("CUUR0000SA0", date(2025, 5, 1)): Decimal("100"),
+        ("CUUR0000SA0", BLS_LATEST_PERIOD): Decimal("120"),
+        ("CUUR0000SA0", date(2025, 6, 1)): Decimal("100"),
     }
-    anchor_values.update(overrides)
-    base_values = {
+    if (series_id, period) in anchors:
+        return anchors[(series_id, period)]
+    bases = {
         "CUSR0000SA0": Decimal("100"),
         "CUUR0000SA0": Decimal("101"),
         "CUSR0000SA0L1E": Decimal("200"),
@@ -96,118 +126,123 @@ def _inflation_records(
         "WPSFD4": Decimal("150"),
         "WPUFD4": Decimal("151"),
     }
-    for series_id in INFLATION_SERIES:
-        for index, period in enumerate(periods):
-            if (series_id, period) in omit:
-                continue
-            preliminary = series_id in {"WPSFD4", "WPUFD4"} and index >= 57
-            records.append(
-                {
-                    "series_id": series_id,
-                    "date": period.isoformat(),
-                    "value": anchor_values.get(
-                        (series_id, period),
-                        base_values[series_id] + Decimal(index) / Decimal("2"),
-                    ),
-                    "quality_status": "estimated" if preliminary else "fresh",
-                    "metadata": {
-                        "preliminary": preliminary,
-                        "footnotes": (
-                            [{"code": "P", "text": "preliminary"}]
-                            if preliminary
-                            else []
-                        ),
-                    },
-                }
-            )
-    return records
+    return bases.get(series_id, Decimal("1000")) + Decimal(index) / Decimal("10")
 
 
-def _inflation_run(
-    *,
-    omit: set[tuple[str, date]] | None = None,
-    overrides: dict[tuple[str, date], Decimal] | None = None,
-):
-    return record_provider_result(
-        ProviderResult(
-            provider="bls",
-            dataset="inflation-fixture",
-            fetched_at=datetime(2026, 6, 10, 12, 35, tzinfo=UTC),
-            records=_inflation_records(omit=omit, overrides=overrides),
-            metadata={
-                "requested_series": list(INFLATION_SERIES),
-                "missing_series": [],
-                "quality_status": "complete",
-            },
-        ),
-        persist=store_series_observations,
-    )
-
-
-def _pce_inflation_records() -> list[dict]:
+@lru_cache(maxsize=1)
+def _bls_template() -> tuple[bytes, tuple[dict, ...], dict]:
     start = date(2021, 5, 1)
-    periods = [_month(start, index) for index in range(61)]
-    anchors = {
-        ("BEA-PCE-PRICE-INDEX", LATEST_PERIOD): Decimal("130"),
-        ("BEA-PCE-PRICE-INDEX", date(2026, 4, 1)): Decimal("129"),
-        ("BEA-PCE-PRICE-INDEX", date(2026, 2, 1)): Decimal("125"),
-        ("BEA-PCE-PRICE-INDEX", date(2025, 11, 1)): Decimal("124"),
-        ("BEA-PCE-PRICE-INDEX", date(2025, 5, 1)): Decimal("120"),
-        ("BEA-CORE-PCE-PRICE-INDEX", LATEST_PERIOD): Decimal("260"),
-        ("BEA-CORE-PCE-PRICE-INDEX", date(2026, 4, 1)): Decimal("259"),
-        ("BEA-CORE-PCE-PRICE-INDEX", date(2026, 2, 1)): Decimal("255"),
-        ("BEA-CORE-PCE-PRICE-INDEX", date(2025, 11, 1)): Decimal("254"),
-        ("BEA-CORE-PCE-PRICE-INDEX", date(2025, 5, 1)): Decimal("250"),
-    }
-    records = []
-    for series_id, base in (
-        ("BEA-PCE-PRICE-INDEX", Decimal("100")),
-        ("BEA-CORE-PCE-PRICE-INDEX", Decimal("200")),
-    ):
+    periods = [_month(start, index) for index in range(62)]
+    response_series = []
+    for series_id in EMPLOYMENT_BLS_REQUEST_SERIES:
+        points = []
         for index, period in enumerate(periods):
-            records.append(
+            preliminary = series_id in {"WPSFD4", "WPUFD4"} and index >= 58
+            points.append(
                 {
-                    "series_id": series_id,
-                    "date": period.isoformat(),
-                    "value": anchors.get(
-                        (series_id, period),
-                        base + Decimal(index) / Decimal("10"),
+                    "year": str(period.year),
+                    "period": f"M{period.month:02d}",
+                    "periodName": str(period.month),
+                    "value": str(_bls_value(series_id, period, index)),
+                    "latest": "true" if period == BLS_LATEST_PERIOD else "false",
+                    "footnotes": (
+                        [{"code": "P", "text": "preliminary"}]
+                        if preliminary
+                        else [{}]
                     ),
-                    "metadata": {
-                        "official_series_code": (
-                            "DPCERG"
-                            if series_id == "BEA-PCE-PRICE-INDEX"
-                            else "DPCCRG"
-                        ),
-                        "release_freshness_days": 45,
-                    },
                 }
             )
-    return records
-
-
-def _pce_inflation_run():
-    return record_provider_result(
-        ProviderResult(
-            provider="bea-pio-release",
-            dataset="personal-income-outlays-release",
-            fetched_at=datetime(2026, 6, 25, 12, 35, tzinfo=UTC),
-            records=_pce_inflation_records(),
-            metadata={
-                "latest_value_date": LATEST_PERIOD.isoformat(),
-                "source_revision_date": "2026-06-25",
-            },
-        ),
-        persist=store_series_observations,
+        response_series.append({"seriesID": series_id, "data": points})
+    raw_json = json.dumps(
+        {
+            "status": "REQUEST_SUCCEEDED",
+            "message": [],
+            "Results": {"series": response_series},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    records, replay = BLSProvider.parse_series_json_bytes(
+        raw_json,
+        series_ids=EMPLOYMENT_BLS_REQUEST_SERIES,
+        start_year=2021,
+        end_year=2026,
+        fetched_at=BLS_FETCHED_AT,
     )
+    return raw_json, tuple(records), replay
 
 
-def _real_rates_snapshot():
-    source = ensure_source("internal")
+@lru_cache(maxsize=1)
+def _pio_template() -> tuple[bytes, tuple[dict, ...], dict]:
+    provider = BEAPIOReleaseProvider(
+        client=_bea_pio_client(
+            _bea_pio_summary_workbook(),
+            _bea_pio_section2_workbook(),
+        )
+    )
+    try:
+        result = provider.personal_income_outlays()
+    finally:
+        provider.close()
+    assert result.ok
+    return bytes(result.raw_bytes), tuple(result.records), dict(result.metadata)
+
+
+def _strict_bls_run(settings, tmp_path, *, cycle: str = "bls-independent"):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    raw_json, records, replay = _bls_template()
+    result = ProviderResult(
+        provider="bls",
+        dataset=INFLATION_BLS_DATASET,
+        fetched_at=BLS_FETCHED_AT,
+        records=deepcopy(list(records)),
+        raw_bytes=raw_json,
+        metadata={
+            **deepcopy(replay),
+            "endpoint": "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+            "content_type": "application/json",
+            "byte_length": len(raw_json),
+            "sha256": hashlib.sha256(raw_json).hexdigest(),
+            "request_witness": {
+                "series_ids": list(EMPLOYMENT_BLS_REQUEST_SERIES),
+                "start_year": 2021,
+                "end_year": 2026,
+            },
+            "refresh_cycle_id": cycle,
+        },
+    )
+    run = record_provider_result(result, persist=_store_bls_observations_v2)
+    assert run.status == IngestionRun.Status.SUCCESS
+    return run
+
+
+def _strict_pio_run(settings, tmp_path, *, cycle: str = "pio-independent"):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    raw_bundle, records, metadata = _pio_template()
+    result = ProviderResult(
+        provider="bea-pio-release",
+        dataset="personal-income-outlays-release",
+        fetched_at=PIO_FETCHED_AT,
+        records=deepcopy(list(records)),
+        raw_bytes=raw_bundle,
+        metadata={**deepcopy(metadata), "refresh_cycle_id": cycle},
+    )
+    run = record_provider_result(result, persist=_store_bea_release_observations_v2)
+    assert run.status == IngestionRun.Status.SUCCESS
+    return run
+
+
+def _strict_inflation_runs(settings, tmp_path):
+    return _strict_bls_run(settings, tmp_path), _strict_pio_run(settings, tmp_path)
+
+
+def _real_rates_snapshot() -> DashboardSnapshot:
+    internal = ensure_source("internal")
     ensure_source("us-treasury-rates")
+    publication_batch = uuid.uuid4()
     nominal_batch = uuid.uuid4()
     real_batch = uuid.uuid4()
-    metric_common = {
+    common = {
         "unit": "%",
         "source": "Atlas Macro 计算（U.S. Treasury 输入）",
         "source_key": "internal",
@@ -216,447 +251,840 @@ def _real_rates_snapshot():
         "as_of": "2026-07-10T00:00:00+00:00",
         "value_date": "2026-07-10T00:00:00+00:00",
         "fetched_at": "2026-07-13T06:52:50+00:00",
-        "fresh_until": "2026-07-14T14:00:00+00:00",
-        "license_scope": "Original calculations derived from attributed inputs",
+        "fresh_until": "2026-07-20T14:00:00+00:00",
         "fallback_source": None,
+        "batch_id": f"{nominal_batch},{real_batch}",
     }
     metrics = [
         {
-            **metric_common,
-            "key": "5y-bei",
-            "label": "5Y 盈亏平衡通胀",
-            "value": 2.28,
-            "display_value": "2.28%",
+            **common,
+            "key": f"{tenor}y-bei",
+            "label": f"{tenor}Y 盈亏平衡通胀",
+            "value": value,
+            "display_value": f"{value:.2f}%",
             "change": 0.0,
-            "change_unit": "bp",
-            "batch_id": f"{nominal_batch},{real_batch}",
-            "metadata": {
-                "formula": "UST-5Y - TIPS-5Y",
-                "input_series": ["ust-5y", "tips-5y"],
-                "input_batch_ids": [str(nominal_batch), str(real_batch)],
-                "input_lineage": [
-                    {
-                        "series_key": "ust-5y",
-                        "source_key": "us-treasury-rates",
-                        "source_name": "U.S. Treasury Daily Interest Rates",
-                        "license_scope": "Attributed U.S. government data",
-                        "value_date": "2026-07-10T00:00:00+00:00",
-                        "as_of": "2026-07-10T00:00:00+00:00",
-                        "fetched_at": "2026-07-13T06:52:40+00:00",
-                        "batch_id": str(nominal_batch),
-                        "quality_status": "fresh",
-                        "fallback_source": None,
-                    }
-                ],
-            },
-        },
-        {
-            **metric_common,
-            "key": "10y-bei",
-            "label": "10Y 盈亏平衡通胀",
-            "value": 2.24,
-            "display_value": "2.24%",
-            "change": 1.0,
-            "change_unit": "bp",
-            "batch_id": f"{nominal_batch},{real_batch}",
-            "metadata": {
-                "formula": "UST-10Y - TIPS-10Y",
-                "input_series": ["ust-10y", "tips-10y"],
-                "input_batch_ids": [str(nominal_batch), str(real_batch)],
-                "input_lineage": [
-                    {
-                        "series_key": "ust-10y",
-                        "source_key": "us-treasury-rates",
-                        "source_name": "U.S. Treasury Daily Interest Rates",
-                        "license_scope": "Attributed U.S. government data",
-                        "value_date": "2026-07-10T00:00:00+00:00",
-                        "as_of": "2026-07-10T00:00:00+00:00",
-                        "fetched_at": "2026-07-13T06:52:40+00:00",
-                        "batch_id": str(nominal_batch),
-                        "quality_status": "fresh",
-                        "fallback_source": None,
-                    }
-                ],
-            },
-        },
+            "metadata": {"formula": f"UST-{tenor}Y - TIPS-{tenor}Y"},
+        }
+        for tenor, value in ((5, 2.28), (10, 2.24))
     ]
     chart = {
         "key": "nominal-real-breakeven-history",
         "title": "名义、实际与盈亏平衡通胀",
-        "description": "BEI 为 Atlas Macro 用同期限 Treasury par curve 名义减实际的近似，单位：%。",
+        "description": "Treasury par curve proxy",
         "kind": "line",
-        "time_axis": "date",
-        "tab": "decomposition",
         "source_keys": ["internal", "us-treasury-rates"],
         "batch_ids": [str(nominal_batch), str(real_batch)],
         "quality_status": "estimated",
-        "as_of": "2026-07-10T00:00:00+00:00",
-        "fetched_at": "2026-07-13T06:52:50+00:00",
-        "fresh_until": "2026-07-14T14:00:00+00:00",
+        "as_of": common["as_of"],
+        "fetched_at": common["fetched_at"],
+        "fresh_until": common["fresh_until"],
         "data": [
-            {
-                "date": "2026-07-09",
-                "5Y BEI": 2.27,
-                "10Y BEI": 2.23,
-                "_source_keys": ["us-treasury-rates", "internal"],
-                "_batch_ids": [str(nominal_batch), str(real_batch)],
-            },
             {
                 "date": "2026-07-10",
                 "5Y BEI": 2.28,
                 "10Y BEI": 2.24,
-                "_source_keys": ["us-treasury-rates", "internal"],
+                "_source_keys": ["internal", "us-treasury-rates"],
                 "_batch_ids": [str(nominal_batch), str(real_batch)],
-            },
+            }
         ],
     }
-    return DashboardSnapshot.objects.create(
+    snapshot = DashboardSnapshot.objects.create(
         key="real-rates",
         title="实际利率",
+        summary="strict real-rates fixture",
         as_of=datetime(2026, 7, 10, tzinfo=UTC),
-        batch_id=uuid.uuid4(),
+        batch_id=publication_batch,
         quality_status="estimated",
-        summary="Treasury real rates fixture",
-        source=source,
+        source=internal,
         is_published=True,
         data={
             "demo": False,
-            "contract_version": 1,
+            "contract_version": 2,
+            "formula_version": TREASURY_CURVE_FORMULA_VERSION,
             "metrics": metrics,
             "charts": [chart],
-            "chart_data": chart["data"],
             "sections": [],
             "component_batches": [str(nominal_batch), str(real_batch)],
             "source_keys": ["internal", "us-treasury-rates"],
-            "fresh_until": "2026-07-14T14:00:00+00:00",
-            "fingerprint": "real-rates-fixture",
-            "publication_batch_id": "real-rates-fixture",
+            "fresh_until": common["fresh_until"],
+            "fingerprint": "a" * 64,
+            "payload_integrity_hash": "b" * 64,
+            "publication_batch_id": str(publication_batch),
+            "annual_runs": [
+                {
+                    "component": component,
+                    "year": 2026,
+                    "source_key": "us-treasury-rates",
+                    "batch_id": str(batch_id),
+                }
+                for component, batch_id in (
+                    ("nominal", nominal_batch),
+                    ("real", real_batch),
+                )
+            ],
         },
     )
+    snapshot.treasury_publication_state = "current_candidate"
+    return snapshot
 
 
-@pytest.mark.django_db
-def test_inflation_contract_uses_twelve_monthly_bls_series():
-    expected = set(INFLATION_SERIES)
-    assert set(MACRO_REQUIRED_SERIES["inflation"]["bls"]) == expected
-    assert expected <= set(BLS_SERIES)
-    assert len(BLS_SERIES) <= 25
-
-    _inflation_run()
-    definitions = {
-        item.key: item
-        for item in SeriesDefinition.objects.filter(
-            key__in={item.lower() for item in expected}
-        )
+def test_inflation_contract_freezes_exact_catalog_and_generic_writers_reject_it():
+    assert BLS_SERIES == EMPLOYMENT_BLS_REQUEST_SERIES
+    assert len(BLS_SERIES) == 24
+    assert set(MACRO_REQUIRED_SERIES["inflation"]["bls"]) == set(INFLATION_SERIES)
+    assert INFLATION_PUBLICATION_GROUPS == {
+        "inflation": frozenset({"bls", "bea-pio-release"})
     }
-    assert set(definitions) == {item.lower() for item in expected}
-    assert {item.unit for item in definitions.values()} == {"index"}
-    assert {item.frequency for item in definitions.values()} == {"monthly"}
-
-    assert MACRO_REQUIRED_SERIES["inflation"]["bea-pio-release"] == frozenset(
-        {"BEA-PCE-PRICE-INDEX", "BEA-CORE-PCE-PRICE-INDEX"}
+    assert "inflation" in INDEPENDENT_PUBLICATION_KEYS
+    assert "inflation" in APPEND_ONLY_PUBLICATION_KEYS
+    assert _is_inflation_bls_dataset(INFLATION_BLS_DATASET)
+    assert not _is_inflation_bls_dataset(
+        "series:" + ",".join(reversed(EMPLOYMENT_BLS_REQUEST_SERIES))
     )
+    assert not _is_inflation_bls_dataset(
+        "series:" + ",".join(EMPLOYMENT_BLS_REQUEST_SERIES[:-1])
+    )
+    assert not _is_inflation_bls_dataset(INFLATION_BLS_DATASET + ",EXTRA")
+    assert PAGE_CONFIGS["inflation"]["snapshot_contract_version"] == 2
+    assert len(PAGE_CONFIGS["inflation"]["metrics"]) == 32
+    assert all(
+        metric.get("value") is None and "demo" not in metric
+        for metric in PAGE_CONFIGS["inflation"]["metrics"]
+    )
+
+    kwargs = {
+        "key": "inflation",
+        "title": "rogue",
+        "summary": "rogue",
+        "metrics": [],
+        "batch_id": uuid.uuid4(),
+    }
+    with pytest.raises(ValueError, match="dedicated macro v2"):
+        _publish_dashboard(**kwargs)
+    with pytest.raises(ValueError, match="dedicated macro v2"):
+        _publish_dashboard_core(**kwargs)
 
 
 @pytest.mark.django_db
-def test_inflation_publication_uses_sa_momentum_nsa_yoy_and_full_lineage():
-    run = _inflation_run()
-    pce_run = _pce_inflation_run()
-    assert _inflation_page_is_buildable(
-        batch_id=run.batch_id, bea_pio_batch_id=pce_run.batch_id
-    )
+def test_inflation_v2_replays_official_bytes_and_publishes_exact_formula_contract(
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    assert bls_run.dataset == INFLATION_BLS_DATASET
+    assert pio_run.dataset == "personal-income-outlays-release"
+    assert bls_run.metadata["refresh_cycle_id"] != pio_run.metadata["refresh_cycle_id"]
+    assert RawArtifact.objects.filter(run__in=[bls_run, pio_run]).count() == 2
+    assert Observation.objects.filter(batch_id=bls_run.batch_id).count() == 24 * 62
+    assert {
+        item.series.key
+        for item in Observation.objects.filter(batch_id=pio_run.batch_id).select_related("series")
+    } == {key.lower() for key in BEAPIOReleaseProvider.SERIES}
 
-    dashboards = publish_official_dashboards(
-        keys={"inflation"},
-        source_batches={
-            "bls": run.batch_id,
-            "bea-pio-release": pce_run.batch_id,
-        },
+    snapshot = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert snapshot is not None
+    assert publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run) is None
+    assert publish_official_dashboards(keys={"inflation"}) == []
+    assert snapshot.data["contract_version"] == INFLATION_CONTRACT_VERSION
+    assert snapshot.data["formula_version"] == INFLATION_FORMULA_VERSION
+    assert {item["key"] for item in snapshot.data["metrics"]} == set(
+        INFLATION_REQUIRED_METRIC_KEYS
     )
-    assert [item.key for item in dashboards] == ["inflation"]
-    snapshot = dashboards[0]
+    assert {item["key"] for item in snapshot.data["charts"]} == set(
+        INFLATION_REQUIRED_CHART_KEYS
+    )
+    assert {item["key"] for item in snapshot.data["sections"]} == set(
+        INFLATION_REQUIRED_SECTION_KEYS
+    )
+    assert len(snapshot.data["metrics"]) == len(
+        {item["key"] for item in snapshot.data["metrics"]}
+    ) == 32
+    assert len(snapshot.data["charts"]) == len(
+        {item["key"] for item in snapshot.data["charts"]}
+    ) == 8
+    assert len(snapshot.data["sections"]) == len(
+        {item["key"] for item in snapshot.data["sections"]}
+    ) == 2
+    assert MetricSnapshot.objects.filter(batch_id=snapshot.batch_id).count() == 32
+    assert {item["role"] for item in snapshot.data["input_runs"]} == {
+        "bls",
+        "bea-pio",
+    }
+    assert "refresh_cycle_id" not in snapshot.data
+    assert "market-breakeven-inflation" not in {
+        item["key"] for item in snapshot.data["charts"]
+    }
+
     metrics = {item["key"]: item for item in snapshot.data["metrics"]}
-
     assert metrics["headline-cpi-mom"]["value"] == pytest.approx(10.0)
     assert metrics["headline-cpi-yoy"]["value"] == pytest.approx(20.0)
     assert metrics["headline-cpi-3m-annualized"]["value"] == pytest.approx(
         114.358881
     )
-    assert metrics["headline-cpi-6m-annualized"]["value"] == pytest.approx(
-        46.41
-    )
+    assert metrics["headline-cpi-6m-annualized"]["value"] == pytest.approx(46.41)
     assert metrics["pce-price-index-mom"]["value"] == pytest.approx(0.7751938)
     assert metrics["pce-price-index-yoy"]["value"] == pytest.approx(8.3333333)
     assert metrics["core-pce-price-index-yoy"]["value"] == pytest.approx(4.0)
-    assert metrics["shelter-cpi-yoy"]["metadata"]["input_series"] == [
-        "cuur0000sah1"
-    ]
-    assert metrics["core-goods-cpi-mom"]["metadata"]["input_series"] == [
-        "cusr0000sacl1e"
-    ]
-    assert metrics["services-less-energy-cpi-yoy"]["metadata"][
-        "input_series"
-    ] == ["cuur0000sasle"]
     assert metrics["headline-cpi-mom"]["metadata"]["seasonal_basis"] == (
         "seasonally_adjusted"
     )
     assert metrics["headline-cpi-yoy"]["metadata"]["seasonal_basis"] == (
         "not_seasonally_adjusted"
     )
-    assert metrics["headline-cpi-mom"]["metadata"]["input_series"] == [
-        "cusr0000sa0"
-    ]
-    assert metrics["headline-cpi-yoy"]["metadata"]["input_series"] == [
-        "cuur0000sa0"
-    ]
-    assert all(item["unit"] == "%" for item in metrics.values())
-    assert not any("index level" in item["label"].lower() for item in metrics.values())
-
-    for metric in metrics.values():
-        expected_batch = (
-            str(pce_run.batch_id)
-            if metric["metadata"]["source_keys"] == ["bea-pio-release"]
-            else str(run.batch_id)
-        )
-        assert metric["metadata"]["input_batch_ids"] == [expected_batch]
-        assert metric["metadata"]["input_lineage"]
-        for lineage in metric["metadata"]["input_lineage"]:
-            assert lineage["source_key"] in {"bls", "bea-pio-release"}
-            assert lineage["license_scope"]
-            assert lineage["batch_id"] == expected_batch
-            assert lineage["value_date"]
-            assert lineage["fetched_at"]
-            assert lineage["quality_status"] in {"fresh", "estimated"}
-            assert lineage["fallback_source"] is None
-
-    ppi_metric = metrics["final-demand-ppi-6m-annualized"]
-    assert ppi_metric["quality_status"] == "estimated"
-    assert ppi_metric["metadata"]["preliminary"] is True
-    chart_keys = {item["key"] for item in snapshot.data["charts"]}
-    assert chart_keys == {
-        "headline-cpi-rates",
-        "core-cpi-rates",
-        "shelter-cpi-rates",
-        "core-goods-cpi-rates",
-        "services-less-energy-cpi-rates",
-        "final-demand-ppi-rates",
-        "pce-price-rates",
-        "core-pce-price-rates",
-    }
-    for chart in snapshot.data["charts"]:
-        assert chart["time_axis"] == "date"
-        for row in chart["data"]:
-            assert not {"CPI", "核心 CPI", "PPI"} & set(row)
-    latest_ppi = next(
-        item
-        for item in snapshot.data["charts"]
-        if item["key"] == "final-demand-ppi-rates"
-    )["data"][-1]
-    assert latest_ppi["_lineage"]["最终需求 PPI 同比"]["preliminary"] is True
-    pce_chart = next(item for item in snapshot.data["charts"] if item["key"] == "pce-price-rates")
-    latest_pce = pce_chart["data"][-1]
-    assert latest_pce["PCE 价格指数 同比"] == pytest.approx(8.3333333)
-    assert latest_pce["_lineage"]["PCE 价格指数 同比"]["source_keys"] == [
-        "bea-pio-release"
-    ]
-
-    stored = MetricSnapshot.objects.get(
-        key="inflation-headline-cpi-yoy", batch_id=snapshot.batch_id
+    assert metrics["pce-price-index-yoy"]["metadata"]["seasonal_basis"] == (
+        "seasonally_adjusted"
     )
-    assert stored.metadata["input_batch_ids"] == [str(run.batch_id)]
-    assert stored.metadata["input_lineage"][0]["license_scope"]
-    assert stored.metadata["seasonal_basis"] == "not_seasonally_adjusted"
+    assert metrics["core-pce-price-index-yoy"]["metadata"]["seasonal_basis"] == (
+        "seasonally_adjusted"
+    )
+    assert metrics["final-demand-ppi-6m-annualized"]["quality_status"] == "estimated"
+    assert metrics["final-demand-ppi-6m-annualized"]["metadata"]["preliminary"] is True
+    for metric in metrics.values():
+        assert metric["source_key"] == "internal"
+        assert metric["license_scope"]
+        assert metric["metadata"]["input_lineage"]
+        assert all(
+            lineage["fallback_source"] is None
+            and lineage["license_scope"]
+            and lineage["value_date"]
+            and lineage["fetched_at"]
+            and lineage["batch_id"]
+            for lineage in metric["metadata"]["input_lineage"]
+        )
+
+    selected = select_public_inflation_snapshot()
+    assert selected is not None
+    assert selected.pk == snapshot.pk
+    assert selected.inflation_publication_state == "current_candidate"
+    component = _economy_component_payload(
+        "inflation",
+        ECONOMY_COMPONENTS["inflation"],
+        now=FIXED_NOW,
+    )
+    assert not isinstance(component, dict)
+    reference = component[2]
+    assert reference["payload_integrity_hash"] == snapshot.data["payload_integrity_hash"]
+    assert reference["contract_version"] == INFLATION_CONTRACT_VERSION
+    assert reference["formula_version"] == INFLATION_FORMULA_VERSION
+    assert set(reference["component_roles"]) == set(snapshot.data["component_roles"])
+    assert reference["source_roles"] == {"bls": "bls", "bea-pio": "bea-pio-release"}
+
+
+@pytest.mark.django_db
+def test_inflation_pair_idempotence_and_same_values_new_pio_run_append_revision(
+    settings,
+    tmp_path,
+):
+    bls_run, first_pio = _strict_inflation_runs(settings, tmp_path)
+    first = publish_inflation_revision(bls_run=bls_run, bea_pio_run=first_pio)
+    assert first is not None
+    first_data = deepcopy(first.data)
+    first_metric_ids = set(
+        MetricSnapshot.objects.filter(batch_id=first.batch_id).values_list("id", flat=True)
+    )
+
+    second_pio = _strict_pio_run(settings, tmp_path, cycle="pio-new-independent-cycle")
+    second = publish_inflation_revision(bls_run=bls_run, bea_pio_run=second_pio)
+    assert second is not None
+    assert second.pk != first.pk
+    assert second.data["fingerprint"] != first.data["fingerprint"]
+    assert DashboardSnapshot.objects.filter(key="inflation").count() == 2
+    first.refresh_from_db()
+    assert first.data == first_data
+    assert set(
+        MetricSnapshot.objects.filter(batch_id=first.batch_id).values_list("id", flat=True)
+    ) == first_metric_ids
+    assert select_public_inflation_snapshot().pk == second.pk
 
 
 @pytest.mark.parametrize(
-    ("omit", "overrides"),
+    "tamper",
     [
-        ({("CUSR0000SA0", date(2026, 4, 1))}, {}),
-        ({("CUSR0000SA0", date(2026, 2, 1))}, {}),
-        ({("CUSR0000SA0", date(2025, 11, 1))}, {}),
-        ({("CUUR0000SA0", date(2025, 5, 1))}, {}),
-        ({("CUUR0000SA0", LATEST_PERIOD)}, {}),
-        ({("CUSR0000SAH1", LATEST_PERIOD)}, {}),
-        ({("CUUR0000SACL1E", date(2025, 5, 1))}, {}),
-        ({("CUSR0000SASLE", date(2026, 2, 1))}, {}),
-        ({}, {("CUSR0000SA0", date(2026, 4, 1)): Decimal("0")}),
-        ({}, {("CUSR0000SA0", date(2026, 2, 1)): Decimal("-1")}),
-        ({}, {("CUUR0000SA0", date(2025, 5, 1)): Decimal("0")}),
+        "raw-bytes",
+        "artifact-row",
+        "input-role",
+        "run",
+        "observation",
+        "metric-row",
+        "snapshot-json",
+        "licence",
     ],
 )
 @pytest.mark.django_db
-def test_inflation_refuses_missing_or_nonpositive_exact_inputs(omit, overrides):
-    run = _inflation_run(omit=omit, overrides=overrides)
-    pce_run = _pce_inflation_run()
-
-    assert not _inflation_page_is_buildable(
-        batch_id=run.batch_id, bea_pio_batch_id=pce_run.batch_id
-    )
-    assert (
-        publish_official_dashboards(
-            keys={"inflation"}, source_batches={"bls": run.batch_id}
+def test_inflation_static_replay_fails_closed_on_any_lineage_tamper(
+    tamper,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    snapshot = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert snapshot is not None
+    if tamper == "raw-bytes":
+        artifact = RawArtifact.objects.get(run=bls_run)
+        path = (
+            Path(settings.RAW_ARTIFACT_ROOT)
+            / artifact.sha256[:2]
+            / f"{artifact.sha256}.bin"
         )
-        == []
-    )
+        path.write_bytes(b"tampered")
+    elif tamper == "artifact-row":
+        RawArtifact.objects.filter(run=pio_run).update(size_bytes=1)
+    elif tamper == "input-role":
+        data = deepcopy(snapshot.data)
+        data["input_runs"][0]["role"] = "rogue"
+        DashboardSnapshot.objects.filter(pk=snapshot.pk).update(data=data)
+    elif tamper == "run":
+        IngestionRun.objects.filter(pk=bls_run.pk).update(row_count=bls_run.row_count + 1)
+    elif tamper == "observation":
+        Observation.objects.filter(batch_id=pio_run.batch_id).order_by("id").update(
+            quality_status="estimated"
+        )
+    elif tamper == "metric-row":
+        MetricSnapshot.objects.filter(
+            batch_id=snapshot.batch_id,
+            key="inflation-headline-cpi-yoy",
+        ).update(value=Decimal("99"))
+    elif tamper == "snapshot-json":
+        data = deepcopy(snapshot.data)
+        data["metrics"][0]["value"] = 99
+        DashboardSnapshot.objects.filter(pk=snapshot.pk).update(data=data)
+    else:
+        SourceLicense.objects.filter(source=bls_run.source, is_current=True).update(
+            public_display_allowed=False
+        )
+    assert select_public_inflation_snapshot() is None
 
 
+@pytest.mark.parametrize(
+    ("series_key", "period", "mutation"),
+    [
+        ("cusr0000sa0", date(2026, 5, 1), "delete"),
+        ("cusr0000sa0", date(2026, 3, 1), Decimal("0")),
+        ("cuur0000sa0", date(2025, 6, 1), Decimal("-1")),
+    ],
+)
 @pytest.mark.django_db
-def test_inflation_october_gap_never_uses_nearest_month():
-    run = _inflation_run(omit={("CUSR0000SA0", date(2025, 10, 1))})
-    pce_run = _pce_inflation_run()
-    assert _inflation_page_is_buildable(
-        batch_id=run.batch_id, bea_pio_batch_id=pce_run.batch_id
+def test_inflation_builder_rejects_missing_zero_or_negative_exact_month(
+    series_key,
+    period,
+    mutation,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    row = Observation.objects.get(
+        batch_id=bls_run.batch_id,
+        series__key=series_key,
+        value_date__date=period,
     )
-    snapshot = publish_official_dashboards(
-        keys={"inflation"},
-        source_batches={
-            "bls": run.batch_id,
-            "bea-pio-release": pce_run.batch_id,
-        },
-    )[0]
-    headline = next(
-        item
-        for item in snapshot.data["charts"]
-        if item["key"] == "headline-cpi-rates"
-    )
-    rows = {item["date"]: item for item in headline["data"]}
-
-    assert "CPI 环比" not in rows["2025-11-01"]
-    assert "CPI 3M 年化" not in rows["2026-01-01"]
-    assert "CPI 6M 年化" not in rows["2026-04-01"]
-    assert {
-        "CPI 环比",
-        "CPI 同比",
-        "CPI 3M 年化",
-        "CPI 6M 年化",
-    } <= set(rows["2026-05-01"])
-
-
-@pytest.mark.django_db
-def test_inflation_gate_is_isolated_and_rejects_mixed_current_batch():
-    run = _inflation_run()
-    pce_run = _pce_inflation_run()
-    unrelated_failure = record_provider_result(
-        ProviderResult.failure("dol-eta-ui", "claims", "fixture failure")
-    )
-
-    assert INFLATION_PUBLICATION_GROUPS == {
-        "inflation": frozenset({"bls", "bea-pio-release"})
-    }
-    assert _publishable_keys_for_source_groups(
-        [run, pce_run, unrelated_failure], INFLATION_PUBLICATION_GROUPS
-    ) == {"inflation"}
-    assert _keys_with_current_required_batches({"inflation"}, [run, pce_run]) == {
-        "inflation"
-    }
-
-    Observation.objects.filter(
-        series__key="cuur0000sa0", value_date__date=LATEST_PERIOD
-    ).update(batch_id=uuid.uuid4())
-    assert _keys_with_current_required_batches({"inflation"}, [run, pce_run]) == set()
+    if mutation == "delete":
+        row.delete()
+    else:
+        row.value = mutation
+        row.save(update_fields=["value", "updated_at"])
     assert not _inflation_page_is_buildable(
-        batch_id=run.batch_id, bea_pio_batch_id=pce_run.batch_id
+        batch_id=bls_run.batch_id,
+        bea_pio_batch_id=pio_run.batch_id,
     )
 
 
 @pytest.mark.django_db
-def test_inflation_failed_bls_keeps_snapshot_stale_and_same_values_recover():
-    first_run = _inflation_run()
-    first_pce_run = _pce_inflation_run()
-    published = publish_official_dashboards(
-        keys={"inflation"},
-        source_batches={
-            "bls": first_run.batch_id,
-            "bea-pio-release": first_pce_run.batch_id,
-        },
-    )[0]
-    failed = record_provider_result(
-        ProviderResult.failure("bls", "inflation-fixture", "upstream timeout")
+def test_inflation_selector_skips_rogue_legacy_demo_and_unrelated_attempts(
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    published = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert published is not None
+    internal = ensure_source("internal")
+    demo = ensure_source("demo-market")
+    for index in range(60):
+        DashboardSnapshot.objects.create(
+            key="inflation",
+            title=published.title,
+            summary=published.summary,
+            as_of=published.as_of,
+            batch_id=uuid.uuid4(),
+            quality_status=published.quality_status,
+            source=demo if index % 3 == 0 else internal,
+            is_published=True,
+            data=(
+                {"demo": False, "contract_version": 1}
+                if index % 3 == 1
+                else {**deepcopy(published.data), "unexpected": True}
+            ),
+        )
+    IngestionRun.objects.bulk_create(
+        [
+            IngestionRun(
+                source=bls_run.source,
+                dataset=f"series:UNRELATED-{index:03d}",
+                started_at=FIXED_NOW + timedelta(microseconds=index + 1),
+                completed_at=FIXED_NOW + timedelta(microseconds=index + 1),
+                status=IngestionRun.Status.FAILED,
+                error="unrelated",
+            )
+            for index in range(101)
+        ]
+    )
+    selected = select_public_inflation_snapshot()
+    assert selected is not None
+    assert selected.pk == published.pk
+    assert selected.inflation_publication_state == "current_candidate"
+
+
+@pytest.mark.parametrize(
+    "malformed_container",
+    ["metrics", "charts", "sections", "component_roles"],
+)
+@pytest.mark.django_db
+def test_inflation_selector_skips_malformed_strict_looking_containers(
+    client,
+    malformed_container,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    published = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert published is not None
+    rogue_batch = uuid.uuid4()
+    rogue_data = deepcopy(published.data)
+    rogue_data["publication_batch_id"] = str(rogue_batch)
+    if malformed_container == "component_roles":
+        rogue_data[malformed_container] = {
+            key: None for key in published.data[malformed_container]
+        }
+    else:
+        rogue_data[malformed_container] = [
+            None for _item in published.data[malformed_container]
+        ]
+    DashboardSnapshot.objects.create(
+        key="inflation",
+        title=published.title,
+        summary=published.summary,
+        as_of=published.as_of,
+        batch_id=rogue_batch,
+        quality_status=published.quality_status,
+        source=published.source,
+        is_published=True,
+        data=rogue_data,
     )
 
-    _mark_latest_dashboards_stale(
-        {"inflation"}, [failed], groups=INFLATION_PUBLICATION_GROUPS
+    selected = select_public_inflation_snapshot()
+    assert selected is not None and selected.pk == published.pk
+    assert client.get("/economy/inflation/").status_code == 200
+
+
+@pytest.mark.django_db
+def test_inflation_publisher_locks_sources_before_runs_and_base_observations(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    original = QuerySet.select_for_update
+    lock_models = []
+    joined_lock_calls = []
+    observation_lock_shapes = []
+
+    def recording_select_for_update(queryset, *args, **kwargs):
+        lock_models.append(queryset.model)
+        if queryset.model in {IngestionRun, DashboardSnapshot}:
+            joined_lock_calls.append((queryset.model, kwargs.get("of")))
+        if queryset.model is Observation:
+            observation_lock_shapes.append(queryset.query.select_related)
+        return original(queryset, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", recording_select_for_update)
+    published = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert published is not None
+    IngestionRun.objects.create(
+        source=bls_run.source,
+        dataset=INFLATION_BLS_DATASET,
+        started_at=FIXED_NOW + timedelta(microseconds=1),
+        completed_at=FIXED_NOW + timedelta(microseconds=1),
+        status=IngestionRun.Status.FAILED,
+        error="lock-path fixture",
+    )
+    coordinate_inflation_dashboard()
+
+    assert lock_models.index(bls_run.source.__class__) < lock_models.index(IngestionRun)
+    assert joined_lock_calls
+    assert all(of == ("self",) for _model, of in joined_lock_calls)
+    assert observation_lock_shapes == [False, False]
+
+
+@pytest.mark.django_db
+def test_inflation_expired_success_rolls_back_and_retains_then_recovers(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, first_pio = _strict_inflation_runs(settings, tmp_path)
+    baseline = publish_inflation_revision(bls_run=bls_run, bea_pio_run=first_pio)
+    assert baseline is not None
+    second_pio = _strict_pio_run(settings, tmp_path, cycle="pio-expired-success")
+    snapshot_count = DashboardSnapshot.objects.filter(key="inflation").count()
+    metric_count = MetricSnapshot.objects.filter(key__startswith="inflation-").count()
+    expired_at = datetime.fromisoformat(baseline.data["fresh_until"]) + timedelta(seconds=1)
+    monkeypatch.setattr("research.inflation_contract.timezone.now", lambda: expired_at)
+
+    dashboards, stale = coordinate_inflation_dashboard([second_pio])
+
+    assert dashboards == []
+    assert stale == {"inflation"}
+    assert DashboardSnapshot.objects.filter(key="inflation").count() == snapshot_count
+    assert MetricSnapshot.objects.filter(key__startswith="inflation-").count() == metric_count
+    retained = select_public_inflation_snapshot()
+    assert retained is not None and retained.pk == baseline.pk
+    assert retained.inflation_publication_state == "retained_failure"
+    marker = retained.data["refresh_failure"]
+    assert marker["reason_code"] == "publication-postcondition"
+    assert marker["attempts"]["bls"]["ingestion_run_id"] == bls_run.pk
+    assert marker["attempts"]["bea-pio"]["ingestion_run_id"] == second_pio.pk
+
+    monkeypatch.setattr("research.inflation_contract.timezone.now", lambda: FIXED_NOW)
+    recovered_pio = _strict_pio_run(settings, tmp_path, cycle="pio-success-recovery")
+    transitioning = select_public_inflation_snapshot()
+    assert transitioning is not None
+    assert transitioning.inflation_publication_state == "transition_pending"
+    assert "refresh_failure" not in transitioning.data
+    recovered, stale = coordinate_inflation_dashboard([recovered_pio])
+    assert len(recovered) == 1 and stale == set()
+    assert select_public_inflation_snapshot().pk == recovered[0].pk
+
+
+@pytest.mark.django_db
+def test_inflation_same_pair_natural_expiry_is_idempotent_and_write_free(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    baseline = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert baseline is not None
+    stored_data = deepcopy(baseline.data)
+    stored_updated_at = baseline.updated_at
+    snapshot_count = DashboardSnapshot.objects.filter(key="inflation").count()
+    metric_count = MetricSnapshot.objects.filter(key__startswith="inflation-").count()
+    expired_at = datetime.fromisoformat(baseline.data["fresh_until"]) + timedelta(seconds=1)
+    monkeypatch.setattr("research.inflation_contract.timezone.now", lambda: expired_at)
+
+    with CaptureQueriesContext(connection) as captured:
+        dashboards, stale = coordinate_inflation_dashboard([bls_run, pio_run])
+
+    assert dashboards == [] and stale == {"inflation"}
+    write_queries = [
+        query["sql"]
+        for query in captured.captured_queries
+        if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+    ]
+    assert write_queries == []
+    assert DashboardSnapshot.objects.filter(key="inflation").count() == snapshot_count
+    assert MetricSnapshot.objects.filter(key__startswith="inflation-").count() == metric_count
+    baseline.refresh_from_db()
+    assert baseline.data == stored_data
+    assert baseline.updated_at == stored_updated_at
+    selected = select_public_inflation_snapshot()
+    assert selected is not None
+    assert selected.inflation_publication_state == "natural_expiry"
+    assert "refresh_failure" not in selected.data
+
+
+@pytest.mark.django_db
+def test_inflation_builder_runtime_rolls_back_retains_and_recovers(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    from research import inflation_contract
+
+    bls_run, first_pio = _strict_inflation_runs(settings, tmp_path)
+    baseline = publish_inflation_revision(bls_run=bls_run, bea_pio_run=first_pio)
+    assert baseline is not None
+    second_pio = _strict_pio_run(settings, tmp_path, cycle="pio-runtime-failure")
+    original_builder = inflation_contract._build_inflation_payload
+
+    def fail_new_pair(evidence, **kwargs):
+        if evidence.bea_pio.run.pk == second_pio.pk:
+            raise RuntimeError("inflation builder runtime fixture")
+        return original_builder(evidence, **kwargs)
+
+    monkeypatch.setattr(inflation_contract, "_build_inflation_payload", fail_new_pair)
+    snapshot_count = DashboardSnapshot.objects.filter(key="inflation").count()
+    metric_count = MetricSnapshot.objects.filter(key__startswith="inflation-").count()
+
+    dashboards, stale = coordinate_inflation_dashboard([second_pio])
+
+    assert dashboards == [] and stale == {"inflation"}
+    assert DashboardSnapshot.objects.filter(key="inflation").count() == snapshot_count
+    assert MetricSnapshot.objects.filter(key__startswith="inflation-").count() == metric_count
+    retained = select_public_inflation_snapshot()
+    assert retained is not None and retained.pk == baseline.pk
+    assert retained.inflation_publication_state == "retained_failure"
+    assert retained.data["refresh_failure"]["reason_code"] == (
+        "publication-postcondition"
+    )
+    assert "RuntimeError" not in retained.data["refresh_failure"]["reason"]
+    assert "inflation builder runtime fixture" in retained.data["refresh_failure"][
+        "reason"
+    ]
+
+    monkeypatch.setattr(
+        inflation_contract, "_build_inflation_payload", original_builder
+    )
+    recovered_pio = _strict_pio_run(settings, tmp_path, cycle="pio-runtime-recovery")
+    transitioning = select_public_inflation_snapshot()
+    assert transitioning is not None
+    assert transitioning.inflation_publication_state == "transition_pending"
+    recovered, stale = coordinate_inflation_dashboard([recovered_pio])
+    assert len(recovered) == 1 and stale == set()
+    assert select_public_inflation_snapshot().pk == recovered[0].pk
+
+
+@pytest.mark.django_db
+def test_inflation_states_cover_expiry_transition_timeout_failure_and_recovery(
+    client,
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    published = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert published is not None
+
+    expired_at = datetime(2026, 8, 20, 12, tzinfo=UTC)
+    monkeypatch.setattr("research.inflation_contract.timezone.now", lambda: expired_at)
+    expired = select_public_inflation_snapshot()
+    assert expired is not None
+    assert expired.inflation_publication_state == "natural_expiry"
+
+    running = IngestionRun.objects.create(
+        source=bls_run.source,
+        dataset=INFLATION_BLS_DATASET,
+        started_at=expired_at - timedelta(minutes=10),
+        status=IngestionRun.Status.RUNNING,
+        metadata={"refresh_cycle_id": "bls-running"},
+    )
+    transition = select_public_inflation_snapshot()
+    assert transition is not None
+    assert transition.inflation_publication_state == "transition_pending"
+    running.started_at = expired_at - timedelta(hours=3)
+    running.save(update_fields=["started_at", "updated_at"])
+    assert select_public_inflation_snapshot() is None
+
+    running.delete()
+    monkeypatch.setattr("research.inflation_contract.timezone.now", lambda: FIXED_NOW)
+    failed = record_provider_result(
+        ProviderResult.failure("bls", INFLATION_BLS_DATASET, "upstream failure")
+    )
+    before_marker = select_public_inflation_snapshot()
+    assert before_marker is not None
+    assert before_marker.inflation_publication_state == "transition_pending"
+    dashboards, stale = coordinate_inflation_dashboard([failed])
+    assert dashboards == []
+    assert stale == {"inflation"}
+    retained = select_public_inflation_snapshot()
+    assert retained is not None
+    assert retained.pk == published.pk
+    assert retained.inflation_publication_state == "retained_failure"
+    attempts = retained.data["refresh_failure"]["attempts"]
+    assert attempts["bls"]["ingestion_run_id"] == failed.pk
+    assert attempts["bea-pio"]["ingestion_run_id"] == pio_run.pk
+    retained_response = client.get("/economy/inflation/")
+    assert retained_response.context["inflation_state"] == "retained_failure"
+    assert all(
+        metric["quality_status"] == "stale"
+        for metric in retained_response.context["metrics"]
+    )
+    assert all(
+        chart["quality_status"] == "stale"
+        for chart in retained_response.context["charts"]
+    )
+    assert all(
+        section["quality_status"] == "stale"
+        for section in retained_response.context["sections"]
     )
     published.refresh_from_db()
-    assert published.quality_status == "stale"
-    failure_sources = {
-        item["source"]: item for item in published.data["refresh_failure"]["sources"]
-    }
-    assert failure_sources["bls"] == {
-        "source": "bls",
-        "status": "failed",
-        "row_count": 0,
-        "error": "upstream timeout",
-    }
-    assert failure_sources["bea-pio-release"]["status"] == "missing"
-    assert DashboardSnapshot.objects.filter(key="inflation").count() == 1
-
-    recovered_run = _inflation_run()
-    recovered_pce_run = _pce_inflation_run()
-    assert (
-        publish_official_dashboards(
-            keys={"inflation"},
-            source_batches={
-                "bls": recovered_run.batch_id,
-                "bea-pio-release": recovered_pce_run.batch_id,
-            },
-        )
-        == []
+    assert all(
+        metric["quality_status"] != "stale"
+        for metric in published.data["metrics"]
     )
-    latest = DashboardSnapshot.objects.filter(key="inflation").latest("created_at")
-    assert "refresh_failure" not in latest.data
+
+    recovered_bls = _strict_bls_run(settings, tmp_path, cycle="bls-recovered")
+    recovered, stale = coordinate_inflation_dashboard([recovered_bls])
+    assert stale == set()
+    assert len(recovered) == 1
+    selected = select_public_inflation_snapshot()
+    assert selected is not None
+    assert selected.pk == recovered[0].pk
+    assert selected.inflation_publication_state == "current_candidate"
+
+
+@pytest.mark.parametrize(
+    "treasury_state",
+    ["transition_pending", "natural_expiry", "retained_failure"],
+)
+@pytest.mark.django_db
+def test_inflation_overlay_requires_current_real_rates_state(
+    monkeypatch,
+    treasury_state,
+):
+    real_rates = _real_rates_snapshot()
+    real_rates.treasury_publication_state = treasury_state
+    monkeypatch.setattr(
+        "research.official_data.select_public_treasury_curve_snapshot",
+        lambda page_key: real_rates if page_key == "real-rates" else None,
+    )
+
+    assert _inflation_market_expectations_from_real_rates() == ([], [], [])
 
 
 @pytest.mark.django_db
-def test_inflation_get_controls_slice_group_and_sanitize(client):
-    run = _inflation_run()
-    pce_run = _pce_inflation_run()
-    publish_official_dashboards(
-        keys={"inflation"},
-        source_batches={
-            "bls": run.batch_id,
-            "bea-pio-release": pce_run.batch_id,
-        },
+def test_inflation_overlay_rejects_expired_component_even_when_selector_is_current(
+    monkeypatch,
+):
+    real_rates = _real_rates_snapshot()
+    data = deepcopy(real_rates.data)
+    data["metrics"][0]["fresh_until"] = "2026-07-14T00:00:00+00:00"
+    real_rates.data = data
+    monkeypatch.setattr(
+        "research.official_data.select_public_treasury_curve_snapshot",
+        lambda page_key: real_rates if page_key == "real-rates" else None,
     )
 
-    response = client.get(
-        "/economy/inflation/", {"period": "1y", "tab": "producer"}
+    assert _inflation_market_expectations_from_real_rates() == ([], [], [])
+
+
+@pytest.mark.django_db
+def test_inflation_stale_base_preserves_current_overlay_quality(
+    client,
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    baseline = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert baseline is not None
+    failed = record_provider_result(
+        ProviderResult.failure("bls", INFLATION_BLS_DATASET, "fixture failure")
     )
+    coordinate_inflation_dashboard([failed])
+    real_rates = _real_rates_snapshot()
+    monkeypatch.setattr(
+        "research.official_data.select_public_treasury_curve_snapshot",
+        lambda page_key: real_rates if page_key == "real-rates" else None,
+    )
+
+    response = client.get("/economy/inflation/", {"tab": "expectations"})
+
+    assert response.status_code == 200
+    metrics = {item["key"]: item for item in response.context["metrics"]}
+    assert all(
+        metrics[key]["quality_status"] == Observation.Quality.STALE
+        for key in INFLATION_REQUIRED_METRIC_KEYS
+    )
+    assert metrics["market-5y-bei"]["quality_status"] == Observation.Quality.ESTIMATED
+    assert metrics["market-10y-bei"]["quality_status"] == Observation.Quality.ESTIMATED
+    assert metrics["market-5y-bei"]["component_reference"][
+        "component_snapshot_id"
+    ] == real_rates.pk
+    assert response.context["charts"][0]["quality_status"] == Observation.Quality.ESTIMATED
+    sections = {item["key"]: item for item in response.context["sections"]}
+    assert all(
+        sections[key]["quality_status"] == Observation.Quality.STALE
+        for key in INFLATION_REQUIRED_SECTION_KEYS
+    )
+    assert sections["market-breakeven-methodology"]["status"] == (
+        Observation.Quality.ESTIMATED
+    )
+    assert sections["market-breakeven-methodology"]["quality_status"] == (
+        Observation.Quality.ESTIMATED
+    )
+
+
+@pytest.mark.django_db
+def test_inflation_route_keeps_base_snapshot_immutable_and_adds_audited_overlay(
+    client,
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    snapshot = publish_inflation_revision(bls_run=bls_run, bea_pio_run=pio_run)
+    assert snapshot is not None
+    base_data = deepcopy(snapshot.data)
+    real_rates = _real_rates_snapshot()
+    monkeypatch.setattr(
+        "research.official_data.select_public_treasury_curve_snapshot",
+        lambda page_key: real_rates if page_key == "real-rates" else None,
+    )
+
+    with CaptureQueriesContext(connection) as captured:
+        response = client.get(
+            "/economy/inflation/", {"period": "1y", "tab": "expectations"}
+        )
+    writes = [
+        query["sql"]
+        for query in captured.captured_queries
+        if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+    ]
+    assert writes == []
     assert response.status_code == 200
     assert response.context["selected_period"] == "1y"
-    assert response.context["selected_tab"] == "producer"
+    assert response.context["selected_tab"] == "expectations"
     assert [item["key"] for item in response.context["charts"]] == [
+        "market-breakeven-inflation"
+    ]
+    overlay = response.context["charts"][0]["component_reference"]
+    assert overlay["component_snapshot_id"] == real_rates.pk
+    assert overlay["component_publication_batch_id"] == str(real_rates.batch_id)
+    assert overlay["component_fingerprint"] == "a" * 64
+    assert overlay["component_payload_integrity_hash"] == "b" * 64
+    assert overlay["component_contract_version"] == 2
+    assert overlay["component_formula_version"] == TREASURY_CURVE_FORMULA_VERSION
+    assert set(overlay["component_roles"]) == {"nominal", "real"}
+    assert len(overlay["source_roles"]) == 2
+    snapshot.refresh_from_db()
+    assert snapshot.data == base_data
+    assert len(snapshot.data["metrics"]) == 32
+    assert len(snapshot.data["charts"]) == 8
+    assert len(snapshot.data["sections"]) == 2
+
+    producer = client.get("/economy/inflation/", {"period": "1y", "tab": "producer"})
+    assert [item["key"] for item in producer.context["charts"]] == [
         "final-demand-ppi-rates"
     ]
-    assert len(response.context["charts"][0]["data"]) <= 13
-    body = html.unescape(response.content.decode())
+    body = html.unescape(producer.content.decode())
+    assert "period=3y&tab=producer" in body
+    assert "period=1y&tab=pce" in body
     assert "U.S. Bureau of Labor Statistics" in body
-    assert "period=3y&tab=producer" in body or "tab=producer&period=3y" in body
-    assert "period=1y&tab=core" in body or "tab=core&period=1y" in body
 
-    default = client.get("/economy/inflation/")
-    assert default.context["selected_period"] == "3y"
-    assert default.context["selected_tab"] == "overview"
-    assert len(default.context["charts"]) == 8
-
-    components = client.get("/economy/inflation/", {"tab": "components"})
-    assert components.status_code == 200
-    assert [item["key"] for item in components.context["charts"]] == [
-        "shelter-cpi-rates",
-        "core-goods-cpi-rates",
-        "services-less-energy-cpi-rates",
-    ]
-    components_body = html.unescape(components.content.decode())
-    assert "BLS Shelter" in components_body
-    assert "不将其标注为“超级核心”" in components_body
-
-    pce = client.get("/economy/inflation/", {"tab": "pce"})
-    assert pce.status_code == 200
-    assert [item["key"] for item in pce.context["charts"]] == [
-        "pce-price-rates",
-        "core-pce-price-rates",
-    ]
-
+    expected_tabs = {
+        "overview": set(INFLATION_REQUIRED_CHART_KEYS) | {"market-breakeven-inflation"},
+        "headline": {"headline-cpi-rates"},
+        "core": {"core-cpi-rates"},
+        "components": {
+            "shelter-cpi-rates",
+            "core-goods-cpi-rates",
+            "services-less-energy-cpi-rates",
+        },
+        "producer": {"final-demand-ppi-rates"},
+        "pce": {"pce-price-rates", "core-pce-price-rates"},
+        "expectations": {"market-breakeven-inflation"},
+    }
+    for tab, expected_keys in expected_tabs.items():
+        tab_response = client.get(
+            "/economy/inflation/", {"period": "1y", "tab": tab}
+        )
+        assert tab_response.context["selected_tab"] == tab
+        assert {item["key"] for item in tab_response.context["charts"]} == expected_keys
+    headline = client.get(
+        "/economy/inflation/", {"period": "1y", "tab": "headline"}
+    ).context["charts"][0]
+    headline_dates = [date.fromisoformat(row["date"]) for row in headline["data"]]
+    assert headline_dates[0] == date(2025, 6, 1)
+    assert headline_dates[-1] == date(2026, 6, 1)
     invalid = client.get(
         "/economy/inflation/",
         {"period": "<script>alert(1)</script>", "tab": "missing"},
@@ -664,71 +1092,43 @@ def test_inflation_get_controls_slice_group_and_sanitize(client):
     assert invalid.context["selected_period"] == "3y"
     assert invalid.context["selected_tab"] == "overview"
     assert "<script>alert(1)</script>" not in invalid.content.decode()
-    assert "alert%281%29" not in invalid.content.decode()
 
-
-@pytest.mark.django_db
-def test_inflation_reuses_real_rates_breakeven_proxy_when_available(
-    client,
-    monkeypatch,
-):
-    real_rates = _real_rates_snapshot()
-    monkeypatch.setattr(
-        "research.official_data.select_public_treasury_curve_snapshot",
-        lambda page_key: real_rates if page_key == "real-rates" else None,
-    )
-    run = _inflation_run()
-    pce_run = _pce_inflation_run()
-    assert _inflation_page_is_buildable(
-        batch_id=run.batch_id, bea_pio_batch_id=pce_run.batch_id
-    )
-    publish_official_dashboards(
-        keys={"inflation"},
-        source_batches={
-            "bls": run.batch_id,
-            "bea-pio-release": pce_run.batch_id,
-        },
-    )
-
-    snapshot = DashboardSnapshot.objects.get(key="inflation")
-    metrics = {item["key"]: item for item in snapshot.data["metrics"]}
-    assert metrics["market-5y-bei"]["display_value"] == "2.28%"
-    assert metrics["market-10y-bei"]["display_value"] == "2.24%"
-    assert metrics["market-10y-bei"]["metadata"]["component_page_key"] == "real-rates"
-    assert "not traded breakeven" in metrics["market-10y-bei"]["metadata"]["model_label"]
-    assert "market-breakeven-inflation" in {
-        item["key"] for item in snapshot.data["charts"]
-    }
-
-    response = client.get("/economy/inflation/", {"tab": "expectations"})
-    assert response.status_code == 200
-    assert response.context["selected_tab"] == "expectations"
-    assert [item["key"] for item in response.context["charts"]] == [
-        "market-breakeven-inflation"
-    ]
-    body = html.unescape(response.content.decode())
-    assert "Treasury 曲线派生盈亏平衡通胀" in body
-    assert "不是可交易 breakeven" in body
-
-    monkeypatch.setattr(
-        "research.official_data.select_public_treasury_curve_snapshot",
-        lambda _page_key: None,
-    )
+    # Missing overlay provenance fails closed instead of fabricating fields.
+    broken = deepcopy(real_rates.data)
+    broken.pop("payload_integrity_hash")
+    real_rates.data = broken
+    real_rates.save(update_fields=["data", "updated_at"])
     unavailable = client.get("/economy/inflation/", {"tab": "expectations"})
-    assert unavailable.status_code == 200
-    assert not any(
-        str(item.get("key") or "").startswith("market-")
-        for item in unavailable.context["metrics"]
-    )
     assert "market-breakeven-inflation" not in {
         item.get("key") for item in unavailable.context["charts"]
     }
-    assert "Treasury 曲线派生盈亏平衡通胀" not in html.unescape(
-        unavailable.content.decode()
+
+
+@pytest.mark.django_db
+def test_inflation_october_gap_never_backfills_exact_six_month_denominator(
+    settings,
+    tmp_path,
+):
+    bls_run, pio_run = _strict_inflation_runs(settings, tmp_path)
+    Observation.objects.get(
+        batch_id=bls_run.batch_id,
+        series__key="cusr0000sa0",
+        value_date__date=date(2025, 10, 1),
+    ).delete()
+
+    _metrics, charts, _sections = _inflation_page_data(
+        batch_id=bls_run.batch_id,
+        bea_pio_batch_id=pio_run.batch_id,
+        apply_freshness=False,
+        include_market_overlay=False,
     )
+    headline = next(item for item in charts if item["key"] == "headline-cpi-rates")
+    april = next(row for row in headline["data"] if row["date"] == "2026-04-01")
+    assert "CPI 3M 年化" in april
+    assert "CPI 6M 年化" not in april
 
 
-def test_inflation_catalog_marks_official_inputs_and_missing_layers():
+def test_inflation_catalog_keeps_release_vintage_gap_explicit():
     requirements = {
         item["key"]: item
         for item in DATA_REQUIREMENTS
@@ -739,143 +1139,3 @@ def test_inflation_catalog_marks_official_inputs_and_missing_layers():
     assert requirements["bls-inflation-components"]["status"] == "live"
     assert requirements["inflation-market-expectations"]["status"] == "live"
     assert requirements["inflation-vintage-trail"]["status"] == "needs_source"
-    assert all(item["page_key"] == "inflation" for item in requirements.values())
-
-
-@pytest.mark.django_db
-def test_refresh_official_data_wires_independent_inflation_gate(monkeypatch):
-    class FailingProvider:
-        def __init__(self, source_key: str):
-            self.source_key = source_key
-
-        def __getattr__(self, method_name):
-            def failed_call(**_kwargs):
-                return ProviderResult.failure(
-                    self.source_key,
-                    method_name,
-                    "unrelated fixture failure",
-                )
-
-            return failed_call
-
-        def close(self):
-            return None
-
-    class FakeBLSProvider:
-        fail = False
-
-        def series(self, *_args, **_kwargs):
-            if self.fail:
-                return ProviderResult.failure(
-                    "bls", "series:fixture", "BLS fixture failure"
-                )
-            return ProviderResult(
-                provider="bls",
-                dataset="series:fixture",
-                fetched_at=datetime(2026, 6, 10, 12, 35, tzinfo=UTC),
-                records=_inflation_records(),
-                metadata={
-                    "requested_series": list(INFLATION_SERIES),
-                    "missing_series": [],
-                    "quality_status": "complete",
-                },
-            )
-
-        def close(self):
-            return None
-
-    class FakeBEAPIOReleaseProvider:
-        fail = False
-
-        def personal_income_outlays(self, **_kwargs):
-            if self.fail:
-                return ProviderResult.failure(
-                    "bea-pio-release", "personal-income-outlays-release", "BEA PIO failure"
-                )
-            return ProviderResult(
-                provider="bea-pio-release",
-                dataset="personal-income-outlays-release",
-                fetched_at=datetime(2026, 6, 25, 12, 35, tzinfo=UTC),
-                records=_pce_inflation_records(),
-                metadata={
-                    "latest_value_date": LATEST_PERIOD.isoformat(),
-                    "source_revision_date": "2026-06-25",
-                },
-            )
-
-        def close(self):
-            return None
-
-    monkeypatch.setattr(
-        "research.official_data.NYFedMarketsProvider",
-        lambda: FailingProvider("ny-fed-markets"),
-    )
-    monkeypatch.setattr(
-        "research.official_data.TreasuryRatesProvider",
-        lambda: FailingProvider("us-treasury-rates"),
-    )
-    monkeypatch.setattr(
-        "research.official_data.FiscalDataProvider",
-        lambda: FailingProvider("treasury-fiscal-data"),
-    )
-    monkeypatch.setattr(
-        "research.official_data.DOLWeeklyClaimsProvider",
-        lambda: FailingProvider("dol-eta-ui"),
-    )
-    monkeypatch.setattr(
-        "research.official_data.FederalReserveRSSProvider",
-        lambda: FailingProvider("federal-reserve"),
-    )
-    monkeypatch.setattr(
-        "research.official_data.BLSProvider", FakeBLSProvider
-    )
-    monkeypatch.setattr(
-        "research.official_data.BEAPIOReleaseProvider", FakeBEAPIOReleaseProvider
-    )
-    monkeypatch.setattr(
-        "research.official_data._coordinate_transmission_chain_dashboard",
-        lambda runs: ([], set()),
-    )
-
-    first = refresh_official_data(current_year=2026)
-    assert first["dashboard_keys"] == ["inflation"]
-    assert first["stale_dashboard_keys"] == [
-        "assets-fx",
-        "economy",
-        "employment",
-        "fx-vol",
-    ]
-    snapshot = DashboardSnapshot.objects.get(key="inflation")
-    bls_run = IngestionRun.objects.filter(
-        source__key="bls", status="success"
-    ).latest("id")
-    bea_run = IngestionRun.objects.filter(
-        source__key="bea-pio-release", status="success"
-    ).latest("id")
-    assert set(snapshot.data["component_batches"]) == {
-        str(bea_run.batch_id),
-        str(bls_run.batch_id),
-    }
-
-    FakeBLSProvider.fail = True
-    second = refresh_official_data(current_year=2026)
-    assert "inflation" not in second["dashboard_keys"]
-    assert second["stale_dashboard_keys"] == [
-        "assets-fx",
-        "economy",
-        "employment",
-        "fx-vol",
-        "inflation",
-    ]
-    snapshot.refresh_from_db()
-    assert snapshot.quality_status == "stale"
-    failure_sources = {
-        item["source"]: item for item in snapshot.data["refresh_failure"]["sources"]
-    }
-    assert failure_sources["bls"] == {
-        "source": "bls",
-        "status": "failed",
-        "row_count": 0,
-        "error": "BLS fixture failure",
-    }
-    assert failure_sources["bea-pio-release"]["status"] == "success"

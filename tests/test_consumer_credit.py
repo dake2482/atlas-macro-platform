@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -13,8 +14,9 @@ from research.consumer_credit import (
     FederalReserveG19Provider,
     NYFedHouseholdDebtProvider,
 )
-from research.models import RawArtifact
-from research.official_data import _store_release_workbook_observations
+from research.models import IngestionRun, Observation, RawArtifact
+from research.official_data import _store_consumer_credit_observations_v2
+from research.raw_evidence import parse_evidence_bundle
 from research.services import record_provider_result
 
 
@@ -61,10 +63,18 @@ def _g19_client(csv_payload: bytes | None = None) -> httpx.Client:
         assert request.url.params["series"] == "test-package"
         return httpx.Response(200, content=payload, headers={"content-type": "text/csv"})
 
-    return httpx.Client(base_url="https://example.test", transport=httpx.MockTransport(handler))
+    return httpx.Client(
+        base_url="https://www.federalreserve.gov",
+        transport=httpx.MockTransport(handler),
+    )
 
 
-def _hhdc_workbook(*, latest_quarter: str = "26:Q1") -> bytes:
+def _hhdc_workbook(
+    *,
+    latest_quarter: str = "26:Q1",
+    balance_unit: str = "Trillions of $",
+    delinquency_unit: str = "Percent",
+) -> bytes:
     workbook = Workbook()
     contents = workbook.active
     contents.title = "TABLE OF CONTENTS"
@@ -72,7 +82,7 @@ def _hhdc_workbook(*, latest_quarter: str = "26:Q1") -> bytes:
 
     balances = workbook.create_sheet("Page 3 Data")
     balances.append(["Total Debt Balance and Its Composition"])
-    balances.append(["Trillions of $"])
+    balances.append([balance_unit])
     balances.append(["Return to Table of Contents"])
     balances.append(
         [None, "Mortgage", "HE Revolving", "Auto Loan", "Credit Card", "Student Loan", "Other", "Total"]
@@ -82,7 +92,7 @@ def _hhdc_workbook(*, latest_quarter: str = "26:Q1") -> bytes:
 
     delinquencies = workbook.create_sheet("Page 12 Data")
     delinquencies.append(["Percent of Balance 90+ Days Delinquent by Loan Type"])
-    delinquencies.append(["Percent"])
+    delinquencies.append([delinquency_unit])
     delinquencies.append(["Return to Table of Contents"])
     delinquencies.append(
         [None, "MORTGAGE", "HELOC", "AUTO", "CC", "STUDENT LOAN", "OTHER", "ALL"]
@@ -112,7 +122,10 @@ def _hhdc_client(workbook: bytes, *, filename_quarter: str = "2026q1") -> httpx.
             },
         )
 
-    return httpx.Client(base_url="https://example.test", transport=httpx.MockTransport(handler))
+    return httpx.Client(
+        base_url="https://www.newyorkfed.org",
+        transport=httpx.MockTransport(handler),
+    )
 
 
 def test_g19_provider_discovers_package_and_normalizes_full_history():
@@ -124,6 +137,19 @@ def test_g19_provider_discovers_package_and_normalizes_full_history():
     assert result.metadata["release_date"] == "2026-07-08"
     assert result.metadata["latest_value_date"] == "2026-05-01"
     assert result.metadata["artifacts"][1]["sha256"] == hashlib.sha256(payload).hexdigest()
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="federal-reserve-g19",
+        expected_dataset="consumer-credit",
+    )
+    assert set(evidence.responses) == {"choose-page", "output-csv"}
+    assert evidence.responses["choose-page"] == _g19_page()
+    assert evidence.responses["output-csv"] == payload
+    replay_records, replay_metadata = FederalReserveG19Provider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["release_date"] == "2026-07-08"
     latest = {
         item["series_id"]: item
         for item in result.records
@@ -145,6 +171,27 @@ def test_g19_provider_fails_closed_when_required_column_is_missing():
     assert "required columns missing" in result.error
 
 
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (b"Unit:,Percent", b"Unit:,Currency"),
+        (b"Multiplier:,1,1,1", b"Multiplier:,2,1,1"),
+    ],
+)
+def test_g19_provider_rejects_wrong_declared_unit_or_multiplier(
+    original,
+    replacement,
+):
+    payload = _g19_csv().replace(original, replacement, 1)
+
+    result = FederalReserveG19Provider(
+        client=_g19_client(payload)
+    ).consumer_credit()
+
+    assert not result.ok
+    assert "source unit or multiplier is invalid" in result.error
+
+
 def test_nyfed_provider_discovers_latest_workbook_and_preserves_attribution():
     payload = _hhdc_workbook()
     result = NYFedHouseholdDebtProvider(
@@ -156,6 +203,21 @@ def test_nyfed_provider_discovers_latest_workbook_and_preserves_attribution():
     assert result.metadata["latest_value_date"] == "2026-03-31"
     assert result.metadata["attribution"] == "New York Fed Consumer Credit Panel / Equifax"
     assert result.metadata["artifacts"][1]["sha256"] == hashlib.sha256(payload).hexdigest()
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="ny-fed-household-credit",
+        expected_dataset="household-debt-credit",
+    )
+    assert set(evidence.responses) == {
+        "databank-page",
+        "household-debt-workbook",
+    }
+    assert evidence.responses["household-debt-workbook"] == payload
+    replay_records, replay_metadata = NYFedHouseholdDebtProvider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["latest_value_date"] == "2026-03-31"
     latest = {
         item["series_id"]: item
         for item in result.records
@@ -174,19 +236,110 @@ def test_nyfed_provider_rejects_filename_and_workbook_period_mismatch():
     assert "does not match filename" in result.error
 
 
+@pytest.mark.parametrize(
+    "workbook",
+    [
+        _hhdc_workbook(balance_unit="USD millions"),
+        _hhdc_workbook(delinquency_unit="Basis points"),
+    ],
+)
+def test_nyfed_provider_rejects_wrong_declared_workbook_units(workbook):
+    result = NYFedHouseholdDebtProvider(
+        client=_hhdc_client(workbook)
+    ).household_debt()
+
+    assert not result.ok
+    assert "declared unit is invalid" in result.error
+
+
 @pytest.mark.django_db
-def test_consumer_credit_ingestion_persists_both_raw_artifacts_per_source():
+def test_consumer_credit_v2_persists_private_append_only_evidence(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
     g19 = FederalReserveG19Provider(client=_g19_client()).consumer_credit()
     household = NYFedHouseholdDebtProvider(
         client=_hhdc_client(_hhdc_workbook())
     ).household_debt()
 
-    g19_run = record_provider_result(g19, persist=_store_release_workbook_observations)
+    g19_run = record_provider_result(
+        g19,
+        persist=_store_consumer_credit_observations_v2,
+    )
     household_run = record_provider_result(
-        household, persist=_store_release_workbook_observations
+        household,
+        persist=_store_consumer_credit_observations_v2,
     )
 
-    assert g19_run.status == "success"
-    assert household_run.status == "success"
-    assert RawArtifact.objects.filter(run=g19_run).count() == 2
-    assert RawArtifact.objects.filter(run=household_run).count() == 2
+    assert g19_run.status == IngestionRun.Status.SUCCESS
+    assert household_run.status == IngestionRun.Status.SUCCESS
+    assert RawArtifact.objects.filter(run=g19_run).count() == 1
+    assert RawArtifact.objects.filter(run=household_run).count() == 1
+    for run, result in ((g19_run, g19), (household_run, household)):
+        artifact = RawArtifact.objects.get(run=run)
+        assert artifact.uri.startswith(f"private://{run.source.key}/")
+        path = (
+            Path(settings.RAW_ARTIFACT_ROOT)
+            / artifact.sha256[:2]
+            / f"{artifact.sha256}.bin"
+        )
+        assert path.read_bytes() == result.raw_bytes
+        assert Observation.objects.filter(batch_id=run.batch_id).count() == len(
+            result.records
+        )
+
+    first_g19_rows = list(
+        Observation.objects.filter(batch_id=g19_run.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    )
+    repeated_result = FederalReserveG19Provider(
+        client=_g19_client()
+    ).consumer_credit()
+    repeated = record_provider_result(
+        repeated_result,
+        persist=_store_consumer_credit_observations_v2,
+    )
+    assert repeated.status == IngestionRun.Status.SUCCESS
+    assert repeated.batch_id != g19_run.batch_id
+    assert Observation.objects.filter(batch_id=repeated.batch_id).count() == len(
+        repeated_result.records
+    )
+    assert list(
+        Observation.objects.filter(batch_id=g19_run.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    ) == first_g19_rows
+
+
+@pytest.mark.django_db
+def test_consumer_credit_v2_rejects_normalized_and_metadata_tamper(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    g19 = FederalReserveG19Provider(client=_g19_client()).consumer_credit()
+    g19.records[0]["value"] = Decimal("999")
+    g19_run = record_provider_result(
+        g19,
+        persist=_store_consumer_credit_observations_v2,
+    )
+    assert g19_run.status == IngestionRun.Status.FAILED
+    assert "normalized observations" in g19_run.error
+
+    household = NYFedHouseholdDebtProvider(
+        client=_hhdc_client(_hhdc_workbook())
+    ).household_debt()
+    household.metadata["workbook_url"] = "https://www.newyorkfed.org/forged.xlsx"
+    household_run = record_provider_result(
+        household,
+        persist=_store_consumer_credit_observations_v2,
+    )
+    assert household_run.status == IngestionRun.Status.FAILED
+    assert "replay metadata" in household_run.error
+
+    assert not Observation.objects.filter(
+        batch_id__in=(g19_run.batch_id, household_run.batch_id)
+    )
+    assert not RawArtifact.objects.filter(run__in=(g19_run, household_run))

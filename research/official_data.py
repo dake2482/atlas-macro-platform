@@ -11,6 +11,9 @@ import calendar
 import hashlib
 import io
 import json
+import logging
+import os
+import re
 import uuid
 import zipfile
 from collections import defaultdict
@@ -31,7 +34,13 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .calculations import yield_spread
-from .consumer_credit import FederalReserveG19Provider, NYFedHouseholdDebtProvider
+from .consumer_credit import (
+    G19_SERIES,
+    HHDC_BALANCE_SERIES,
+    HHDC_DELINQUENCY_SERIES,
+    FederalReserveG19Provider,
+    NYFedHouseholdDebtProvider,
+)
 from .credit_contract import (
     CREDIT_CONTRACT_VERSION,  # noqa: F401 - public strict-contract re-export
     CREDIT_FORMULA_VERSION,  # noqa: F401 - public strict-contract re-export
@@ -50,6 +59,12 @@ from .credit_contract import (
     select_public_credit_stress_snapshot,  # noqa: F401 - view/test re-export
 )
 from .credit_official import FederalReserveSLOOSProvider, TreasuryHQMProvider
+from .employment_contract import (
+    EMPLOYMENT_BLS_REQUEST_SERIES,
+    EMPLOYMENT_REQUIRED_METRIC_KEYS,
+    coordinate_employment_dashboard,
+    select_public_employment_snapshot,
+)
 from .fed_h8 import (
     H8_RELEASE_FRESHNESS_DAYS,
     H8_RELEASE_FUTURE_TOLERANCE,
@@ -68,6 +83,11 @@ from .fed_h41 import (
     validate_h41_release_time,
 )
 from .fed_prates import FederalReservePRATESProvider
+from .inflation_contract import (
+    INFLATION_REQUIRED_METRIC_KEYS,
+    coordinate_inflation_dashboard,
+    select_public_inflation_snapshot,
+)
 from .labor_official import (
     CONTINUED_4WK,
     CONTINUED_SA,
@@ -79,6 +99,7 @@ from .labor_official import (
 from .labor_official import (
     REQUIRED_SERIES as DOL_REQUIRED_SERIES,
 )
+from .macro_contract import coordinate_gdp_dashboard, select_public_gdp_snapshot
 from .macro_official import CensusMARTSProvider
 from .macro_releases import (
     BEAGDPReleaseProvider,
@@ -105,10 +126,15 @@ from .providers import (
     ProviderResult,
     TreasuryRatesProvider,
 )
+from .raw_evidence import (
+    EVIDENCE_BUNDLE_CONTENT_TYPE,
+    parse_evidence_bundle,
+)
 from .services import (
     begin_ingestion,
     current_display_source_key_sets,
     ensure_source,
+    finish_ingestion,
     persist_private_raw_artifact,
     public_display_license_q,
     public_source_notices,
@@ -124,32 +150,9 @@ from .volatility_contract import (
     coordinate_fx_vol_dashboard,
 )
 
-BLS_SERIES = (
-    "CES0000000001",
-    "LNS14000000",
-    "LNS11300000",
-    "CES0500000003",
-    "JTS000000000000000JOL",
-    "JTS000000000000000JOR",
-    "JTS000000000000000HIL",
-    "JTS000000000000000HIR",
-    "JTS000000000000000QUL",
-    "JTS000000000000000QUR",
-    "JTS000000000000000LDL",
-    "JTS000000000000000LDR",
-    "CUSR0000SA0",
-    "CUUR0000SA0",
-    "CUSR0000SA0L1E",
-    "CUUR0000SA0L1E",
-    "CUSR0000SAH1",
-    "CUUR0000SAH1",
-    "CUSR0000SACL1E",
-    "CUUR0000SACL1E",
-    "CUSR0000SASLE",
-    "CUUR0000SASLE",
-    "WPSFD4",
-    "WPUFD4",
-)
+logger = logging.getLogger(__name__)
+
+BLS_SERIES = EMPLOYMENT_BLS_REQUEST_SERIES
 
 FRESHNESS_DAYS = {
     "intraday": 1,
@@ -334,16 +337,10 @@ OPERATIONS_FORMULAS = {
     "treasury-purchase-latest": (
         "sum(totalParAmtAccepted) on latest official purchase operation date"
     ),
-    "treasury-purchases-30d": (
-        "sum(TREASURY-PURCHASES[d]) for d in [latest-29d, latest]"
-    ),
-    "onrrp-non-small-value-total": (
-        "ONRRP - ONRRP-SMALL-VALUE-TOTAL"
-    ),
+    "treasury-purchases-30d": ("sum(TREASURY-PURCHASES[d]) for d in [latest-29d, latest]"),
+    "onrrp-non-small-value-total": ("ONRRP - ONRRP-SMALL-VALUE-TOTAL"),
     "srf-non-small-value-total": "SRP - SRP-SMALL-VALUE-TOTAL",
-    "srf-active-days-30d": (
-        "sum(1[daily non-small-value accepted > 0]) over [latest-29d,latest]"
-    ),
+    "srf-active-days-30d": ("sum(1[daily non-small-value accepted > 0]) over [latest-29d,latest]"),
     "soma-weekly-change": "SOMA-TOTAL(t) - SOMA-TOTAL(t-1 official release)",
 }
 ASSETS_FX_CONTRACT_VERSION = 1
@@ -593,16 +590,13 @@ GLOBAL_DOLLAR_PAYLOAD_KEYS = frozenset(
 )
 GLOBAL_DOLLAR_REFRESH_FAILURE_REASONS = {
     "latest-attempt-incomplete": (
-        "Latest H.10 and NY Fed USD-swap attempts do not form two successful "
-        "exact components."
+        "Latest H.10 and NY Fed USD-swap attempts do not form two successful exact components."
     ),
     "candidate-validation": (
         "Global-dollar exact batches, search coverage, artifacts, formulas, "
         "tables, licences or lineage failed validation."
     ),
-    "candidate-regression": (
-        "Global-dollar candidate data regressed; retained prior snapshot."
-    ),
+    "candidate-regression": ("Global-dollar candidate data regressed; retained prior snapshot."),
     "publication-postcondition": (
         "Global-dollar v1 publication postcondition failed; retained the "
         "previous fully audited snapshot."
@@ -704,12 +698,9 @@ TRANSMISSION_CHAIN_METRIC_MAP = {
         "fxswap-usd-outstanding-non-small-value",
     ),
 }
-TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS = frozenset(
-    TRANSMISSION_CHAIN_METRIC_MAP
-)
+TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS = frozenset(TRANSMISSION_CHAIN_METRIC_MAP)
 TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS = frozenset(
-    str(component["chart_key"])
-    for component in TRANSMISSION_CHAIN_COMPONENTS.values()
+    str(component["chart_key"]) for component in TRANSMISSION_CHAIN_COMPONENTS.values()
 )
 TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS = frozenset(
     {
@@ -748,23 +739,15 @@ TRANSMISSION_CHAIN_SHARED_INPUT_FIELDS = {
 }
 TRANSMISSION_CHAIN_FORMULAS = {
     "balance-sheet-net-liquidity": FED_BALANCE_SHEET_NET_FORMULA,
-    "operations-onrrp-regular": OPERATIONS_FORMULAS[
-        "onrrp-non-small-value-total"
-    ],
-    "operations-srf-regular": OPERATIONS_FORMULAS[
-        "srf-non-small-value-total"
-    ],
+    "operations-onrrp-regular": OPERATIONS_FORMULAS["onrrp-non-small-value-total"],
+    "operations-srf-regular": OPERATIONS_FORMULAS["srf-non-small-value-total"],
     "money-market-sofr-iorb": "100 * (SOFR - IORB)",
-    "money-market-sofr-tbill": (
-        "100 * (SOFR - 13-week T-bill Coupon Equivalent)"
-    ),
+    "money-market-sofr-tbill": ("100 * (SOFR - 13-week T-bill Coupon Equivalent)"),
     "repo-tail-p99-iorb": SUBSURFACE_FORMULAS["sofr-p99-minus-iorb"],
     "repo-volume-z60": SUBSURFACE_FORMULAS["sofr-volume-z60"],
     "bank-reserve-coverage": "100 * WRBWFRBL / H8-B1151NCBA",
     "bank-reserve-8w-change": "ratio(t) - ratio(t-56 calendar days)",
-    "global-dollar-5d-change": GLOBAL_DOLLAR_FORMULAS[
-        "h10-broad-dollar-5d-change-pct"
-    ],
+    "global-dollar-5d-change": GLOBAL_DOLLAR_FORMULAS["h10-broad-dollar-5d-change-pct"],
     "global-swap-regular-outstanding": GLOBAL_DOLLAR_FORMULAS[
         "fxswap-usd-outstanding-non-small-value"
     ],
@@ -832,6 +815,9 @@ INDEPENDENT_PUBLICATION_KEYS = frozenset(
         "yield-curve",
         "real-rates",
         "rates",
+        "gdp",
+        "employment",
+        "inflation",
         *FX_VOL_PUBLICATION_KEYS,
     }
 )
@@ -851,6 +837,9 @@ APPEND_ONLY_PUBLICATION_KEYS = frozenset(
         "yield-curve",
         "real-rates",
         "rates",
+        "gdp",
+        "employment",
+        "inflation",
         *FX_VOL_PUBLICATION_KEYS,
     }
 )
@@ -881,9 +870,7 @@ TREASURY_CURVE_MIN_HISTORY_POINTS = 1000
 TREASURY_CURVE_MAX_GAP_DAYS = 10
 TREASURY_CURVE_START_TOLERANCE_DAYS = 14
 TREASURY_CURVE_PAGE_KEYS = frozenset({"yield-curve", "real-rates"})
-TREASURY_RATE_PUBLICATION_KEYS = frozenset(
-    {"yield-curve", "real-rates", "rates"}
-)
+TREASURY_RATE_PUBLICATION_KEYS = frozenset({"yield-curve", "real-rates", "rates"})
 TREASURY_YIELD_TITLE = "收益率曲线"
 TREASURY_YIELD_SUMMARY = (
     "财政部名义 Par Yield 曲线按不可变年度 XML 批次组合；当前、1 周、"
@@ -932,15 +919,9 @@ TREASURY_CURVE_DATASET_PREFIXES = {
 YIELD_CURVE_REQUIRED_METRIC_KEYS = frozenset(
     {"ust-2y", "ust-5y", "ust-10y", "ust-30y", "2s10s", "3m10s", "5s30s"}
 )
-REAL_RATES_REQUIRED_METRIC_KEYS = frozenset(
-    {"tips-5y", "tips-10y", "5y-bei", "10y-bei"}
-)
-YIELD_CURVE_REQUIRED_CHART_KEYS = frozenset(
-    {"nominal-curve-comparison", "curve-spreads-history"}
-)
-REAL_RATES_REQUIRED_CHART_KEYS = frozenset(
-    {"nominal-real-breakeven-history"}
-)
+REAL_RATES_REQUIRED_METRIC_KEYS = frozenset({"tips-5y", "tips-10y", "5y-bei", "10y-bei"})
+YIELD_CURVE_REQUIRED_CHART_KEYS = frozenset({"nominal-curve-comparison", "curve-spreads-history"})
+REAL_RATES_REQUIRED_CHART_KEYS = frozenset({"nominal-real-breakeven-history"})
 YIELD_CURVE_REQUIRED_SECTION_KEYS = frozenset({"current-nominal-par-curve"})
 REAL_RATES_REQUIRED_SECTION_KEYS = frozenset({"current-real-par-curve"})
 H41_PUBLICATION_KEYS = frozenset()
@@ -1008,9 +989,7 @@ RRP_TGA_DATASETS = {
     "tga": LIQUIDITY_DATASETS["tga"],
     "auctions": AUCTION_DATASET,
 }
-LIQUIDITY_FED_FUNDS_METRIC_KEYS = frozenset(
-    {"sofr", "iorb", "sofr-effr", "sofr-iorb"}
-)
+LIQUIDITY_FED_FUNDS_METRIC_KEYS = frozenset({"sofr", "iorb", "sofr-effr", "sofr-iorb"})
 LIQUIDITY_REQUIRED_METRIC_KEYS = frozenset(
     {
         "net-liquidity",
@@ -1039,9 +1018,7 @@ RESERVES_REQUIRED_METRIC_KEYS = frozenset(
         "reserve-ratio-8w-zscore",
     }
 )
-RESERVES_REQUIRED_CHART_KEYS = frozenset(
-    {"reserves-assets-history", "reserve-ratio-history"}
-)
+RESERVES_REQUIRED_CHART_KEYS = frozenset({"reserves-assets-history", "reserve-ratio-history"})
 RESERVES_HISTORY_POINTS = 260
 RESERVES_ZSCORE_MAX_SAMPLES = 156
 RESERVES_ZSCORE_MIN_SAMPLES = 52
@@ -1049,8 +1026,7 @@ RESERVES_CHANGE_LAG = timedelta(weeks=8)
 RESERVES_CHANGE_FORMULA = "ratio(t) - ratio(t-56 calendar days)"
 RESERVES_CHANGE_SAMPLE_WINDOW = "exact 56 calendar days"
 RESERVES_ZSCORE_SAMPLE_WINDOW = (
-    "Recent three-year window: minimum 52 and maximum 156 strict "
-    "56-calendar-day change samples."
+    "Recent three-year window: minimum 52 and maximum 156 strict 56-calendar-day change samples."
 )
 RESERVES_RATE_SPREADS_CONTRACT_VERSION = 1
 RESERVES_RATE_SPREADS_DATASETS = {
@@ -1084,9 +1060,7 @@ RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS = frozenset(
 )
 RESERVES_RATE_SPREADS_HISTORY_DAYS = 60
 RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS = 30
-RESERVES_RATE_SPREADS_QUOTE_CONVENTION = (
-    TreasuryRatesProvider.BILL_13W_QUOTE_CONVENTION
-)
+RESERVES_RATE_SPREADS_QUOTE_CONVENTION = TreasuryRatesProvider.BILL_13W_QUOTE_CONVENTION
 ECONOMY_CONTRACT_VERSION = 1
 ECONOMY_COMPONENTS = {
     "gdp": {
@@ -1114,60 +1088,7 @@ ECONOMY_COMPONENTS = {
         "tab": "consumer",
     },
 }
-ECONOMY_REQUIRED_METRIC_KEYS = frozenset(
-    item["metric_key"] for item in ECONOMY_COMPONENTS.values()
-)
-EMPLOYMENT_REQUIRED_METRIC_KEYS = frozenset(
-    {
-        "nonfarm-payroll-change",
-        "nonfarm-payroll-change-3m",
-        "average-hourly-earnings-yoy",
-        "lns14000000",
-        "lns11300000",
-        "jts000000000000000jol",
-        "jts000000000000000qur",
-        INITIAL_SA.lower(),
-        INITIAL_4WK.lower(),
-        CONTINUED_SA.lower(),
-        IUR_SA.lower(),
-    }
-)
-INFLATION_REQUIRED_METRIC_KEYS = frozenset(
-    {
-        "headline-cpi-mom",
-        "headline-cpi-yoy",
-        "headline-cpi-3m-annualized",
-        "headline-cpi-6m-annualized",
-        "core-cpi-mom",
-        "core-cpi-yoy",
-        "core-cpi-3m-annualized",
-        "core-cpi-6m-annualized",
-        "final-demand-ppi-mom",
-        "final-demand-ppi-yoy",
-        "final-demand-ppi-3m-annualized",
-        "final-demand-ppi-6m-annualized",
-        "pce-price-index-mom",
-        "pce-price-index-yoy",
-        "pce-price-index-3m-annualized",
-        "pce-price-index-6m-annualized",
-        "core-pce-price-index-mom",
-        "core-pce-price-index-yoy",
-        "core-pce-price-index-3m-annualized",
-        "core-pce-price-index-6m-annualized",
-        "shelter-cpi-mom",
-        "shelter-cpi-yoy",
-        "shelter-cpi-3m-annualized",
-        "shelter-cpi-6m-annualized",
-        "core-goods-cpi-mom",
-        "core-goods-cpi-yoy",
-        "core-goods-cpi-3m-annualized",
-        "core-goods-cpi-6m-annualized",
-        "services-less-energy-cpi-mom",
-        "services-less-energy-cpi-yoy",
-        "services-less-energy-cpi-3m-annualized",
-        "services-less-energy-cpi-6m-annualized",
-    }
-)
+ECONOMY_REQUIRED_METRIC_KEYS = frozenset(item["metric_key"] for item in ECONOMY_COMPONENTS.values())
 MACRO_REQUIRED_SERIES = {
     "employment": {
         "bls": frozenset(
@@ -1283,8 +1204,7 @@ def _has_publishable_run(runs: Iterable[IngestionRun]) -> bool:
 
     completed = list(runs)
     return bool(completed) and all(
-        run.status == IngestionRun.Status.SUCCESS and run.row_count > 0
-        for run in completed
+        run.status == IngestionRun.Status.SUCCESS and run.row_count > 0 for run in completed
     )
 
 
@@ -1301,8 +1221,7 @@ def _publishable_keys_for_source_groups(
         page_key
         for page_key, required_sources in groups.items()
         if all(
-            len(by_source.get(source_key, [])) == 1
-            and _has_publishable_run(by_source[source_key])
+            len(by_source.get(source_key, [])) == 1 and _has_publishable_run(by_source[source_key])
             for source_key in required_sources
         )
     }
@@ -1337,17 +1256,12 @@ def _keys_with_current_required_batches(
                     series_key,
                     source_key=source_key,
                 ).first()
-                if (
-                    observation is None
-                    or str(observation.batch_id) != expected_batch
-                ):
+                if observation is None or str(observation.batch_id) != expected_batch:
                     page_is_current = False
                     break
             if not page_is_current:
                 break
-        for source_key, series_keys in MACRO_REQUIRED_VINTAGE_SERIES.get(
-            page_key, {}
-        ).items():
+        for source_key, series_keys in MACRO_REQUIRED_VINTAGE_SERIES.get(page_key, {}).items():
             run = run_by_source.get(source_key)
             if run is None:
                 page_is_current = False
@@ -1434,17 +1348,13 @@ def _fresh_until(observation: Observation) -> datetime:
     release_date = (observation.metadata or {}).get("source_release_time") or (
         observation.metadata or {}
     ).get("source_revision_date")
-    release_freshness_days = (observation.metadata or {}).get(
-        "release_freshness_days"
-    )
+    release_freshness_days = (observation.metadata or {}).get("release_freshness_days")
     if release_date and release_freshness_days:
         try:
             released_at = datetime.fromisoformat(str(release_date))
             if released_at.tzinfo is None:
                 released_at = released_at.replace(tzinfo=UTC)
-            release_deadline = released_at + timedelta(
-                days=int(release_freshness_days)
-            )
+            release_deadline = released_at + timedelta(days=int(release_freshness_days))
         except (TypeError, ValueError, OverflowError):
             release_deadline = None
         if release_deadline is not None:
@@ -1459,9 +1369,7 @@ def _fresh_until(observation: Observation) -> datetime:
     elif frequency == "annual":
         period_end = value_date.replace(month=12, day=31)
     elif frequency == "daily":
-        deadline_date = value_date.date() + timedelta(
-            days=FRESHNESS_DAYS["daily"]
-        )
+        deadline_date = value_date.date() + timedelta(days=FRESHNESS_DAYS["daily"])
         return datetime.combine(
             deadline_date,
             time(hour=10),
@@ -1568,6 +1476,7 @@ def _metric(
     aligned_with: Iterable[str] = (),
     source_key: str | None = None,
     batch_id: uuid.UUID | str | None = None,
+    apply_freshness: bool = True,
 ) -> dict[str, Any] | None:
     alignment_keys = tuple(dict.fromkeys(aligned_with))
     if alignment_keys:
@@ -1583,19 +1492,13 @@ def _metric(
             }
             for key in (series_key, *alignment_keys)
         }
-        common_dates = set.intersection(
-            *(set(items) for items in observations_by_key.values())
-        )
-        today_et = timezone.now().astimezone(
-            ZoneInfo("America/New_York")
-        ).date()
+        common_dates = set.intersection(*(set(items) for items in observations_by_key.values()))
+        today_et = timezone.now().astimezone(ZoneInfo("America/New_York")).date()
         periods = sorted(
             (period for period in common_dates if period <= today_et),
             reverse=True,
         )
-        observations = [
-            observations_by_key[series_key][period] for period in periods[:2]
-        ]
+        observations = [observations_by_key[series_key][period] for period in periods[:2]]
     else:
         observations = _latest_observations_by_value_date(
             series_key,
@@ -1611,7 +1514,11 @@ def _metric(
     change = value - previous if previous is not None else None
     fresh_until = _fresh_until(latest)
     quality_status = latest.quality_status
-    if timezone.now() > fresh_until and quality_status == Observation.Quality.FRESH:
+    if (
+        apply_freshness
+        and timezone.now() > fresh_until
+        and quality_status == Observation.Quality.FRESH
+    ):
         quality_status = Observation.Quality.STALE
     source_keys = sorted(_observation_source_keys(latest))
     return {
@@ -1630,9 +1537,7 @@ def _metric(
         ),
         "source_key": latest.source.key,
         "source_keys": source_keys,
-        "fallback_source": (
-            latest.fallback_source.key if latest.fallback_source_id else None
-        ),
+        "fallback_source": (latest.fallback_source.key if latest.fallback_source_id else None),
         "as_of": latest.as_of.isoformat(),
         "value_date": latest.value_date.isoformat(),
         "fetched_at": latest.fetched_at.isoformat(),
@@ -1671,8 +1576,7 @@ def _derived_metric(
     common_dates = {
         period
         for period in set(left_by_date) & set(right_by_date)
-        if period
-        <= timezone.now().astimezone(ZoneInfo("America/New_York")).date()
+        if period <= timezone.now().astimezone(ZoneInfo("America/New_York")).date()
     }
     if not common_dates:
         return None
@@ -1684,9 +1588,7 @@ def _derived_metric(
     left_deadline = _fresh_until(left)
     right_deadline = _fresh_until(right)
     fresh_until = min(left_deadline, right_deadline)
-    source_keys = sorted(
-        _observation_source_keys(left, right) | {"internal"}
-    )
+    source_keys = sorted(_observation_source_keys(left, right) | {"internal"})
     return {
         "key": key,
         "label": label,
@@ -1738,9 +1640,7 @@ def _linear_metric(
         ("+ " if coefficient > 0 and index else "- " if coefficient < 0 else "") + series_key
         for index, (coefficient, series_key) in enumerate(terms)
     )
-    input_source_keys = _observation_source_keys(
-        *(observation for _, observation in inputs)
-    )
+    input_source_keys = _observation_source_keys(*(observation for _, observation in inputs))
     return {
         "key": key,
         "label": label,
@@ -1808,9 +1708,7 @@ def _history_rows(
             if observation.fallback_source_id:
                 fallback_key = observation.fallback_source.key
                 source_keys.add(fallback_key)
-            row["_source_keys"] = sorted(
-                {*row["_source_keys"], *source_keys}
-            )
+            row["_source_keys"] = sorted({*row["_source_keys"], *source_keys})
             row["_lineage"][label] = {
                 "series_key": series_key.lower(),
                 "source_key": observation.source.key,
@@ -1826,14 +1724,11 @@ def _history_rows(
     rows = [by_date[day] for day in sorted(by_date)]
     if require_all:
         required_labels = set(series.values())
-        today_et = timezone.now().astimezone(
-            ZoneInfo("America/New_York")
-        ).date()
+        today_et = timezone.now().astimezone(ZoneInfo("America/New_York")).date()
         rows = [
             row
             for row in rows
-            if required_labels <= set(row)
-            and date.fromisoformat(row["date"]) <= today_et
+            if required_labels <= set(row) and date.fromisoformat(row["date"]) <= today_et
         ]
     return rows
 
@@ -1848,6 +1743,7 @@ def _history_chart(
     kind: str = "line",
     source_key: str | None = None,
     batch_id: uuid.UUID | str | None = None,
+    apply_freshness: bool = True,
 ) -> dict[str, Any] | None:
     """Build a chart contract with component-level source and freshness metadata."""
 
@@ -1875,7 +1771,9 @@ def _history_chart(
     quality_statuses = {observation.quality_status for observation in latest}
     if Observation.Quality.ERROR in quality_statuses:
         quality_status = Observation.Quality.ERROR
-    elif timezone.now() > min(deadlines) or Observation.Quality.STALE in quality_statuses:
+    elif (
+        apply_freshness and timezone.now() > min(deadlines)
+    ) or Observation.Quality.STALE in quality_statuses:
         quality_status = Observation.Quality.STALE
     elif Observation.Quality.FALLBACK in quality_statuses:
         quality_status = Observation.Quality.FALLBACK
@@ -1919,21 +1817,32 @@ def _previous_month(period: date) -> date:
 
 
 def _employment_observation_map(
-    series_key: str, *, limit: int = 84
+    series_key: str,
+    *,
+    batch_id: uuid.UUID | str | None,
+    limit: int = 84,
 ) -> dict[date, Observation]:
     return {
         observation.value_date.date().replace(day=1): observation
-        for observation in _latest_observations_by_value_date(series_key, limit=limit)
+        for observation in _latest_observations_by_value_date(
+            series_key,
+            limit=limit,
+            source_key="bls",
+            batch_id=batch_id,
+        )
     }
 
 
-def _derived_employment_quality(current: Observation) -> tuple[str, datetime]:
+def _derived_employment_quality(
+    current: Observation,
+    *,
+    apply_freshness: bool,
+) -> tuple[str, datetime]:
     fresh_until = _fresh_until(current)
     if current.quality_status == Observation.Quality.ERROR:
         return Observation.Quality.ERROR, fresh_until
-    if (
-        current.quality_status == Observation.Quality.STALE
-        or timezone.now() > fresh_until
+    if current.quality_status == Observation.Quality.STALE or (
+        apply_freshness and timezone.now() > fresh_until
     ):
         return Observation.Quality.STALE, fresh_until
     if current.quality_status == Observation.Quality.FALLBACK:
@@ -1951,9 +1860,13 @@ def _employment_derived_payload(
     formula: str,
     display_value: str,
     unit: str,
+    apply_freshness: bool,
 ) -> dict[str, Any]:
     input_list = list(inputs)
-    quality_status, fresh_until = _derived_employment_quality(current)
+    quality_status, fresh_until = _derived_employment_quality(
+        current,
+        apply_freshness=apply_freshness,
+    )
     input_source_keys = sorted(_observation_source_keys(*input_list))
     input_batch_ids = sorted({str(item.batch_id) for item in input_list})
     return {
@@ -1977,9 +1890,7 @@ def _employment_derived_payload(
             "input_series": sorted({item.series.key for item in input_list}),
             "source_keys": input_source_keys,
             "input_batch_ids": input_batch_ids,
-            "input_value_dates": sorted(
-                {item.value_date.isoformat() for item in input_list}
-            ),
+            "input_value_dates": sorted({item.value_date.isoformat() for item in input_list}),
             "input_lineage": [
                 {
                     "series_key": item.series.key,
@@ -1992,9 +1903,7 @@ def _employment_derived_payload(
                     "batch_id": str(item.batch_id),
                     "quality_status": item.quality_status,
                     "fallback_source": (
-                        item.fallback_source.key
-                        if item.fallback_source_id
-                        else None
+                        item.fallback_source.key if item.fallback_source_id else None
                     ),
                 }
                 for item in input_list
@@ -2004,13 +1913,21 @@ def _employment_derived_payload(
     }
 
 
-def _employment_derived_data() -> tuple[
-    list[dict[str, Any]], list[dict[str, Any]]
-]:
+def _employment_derived_data(
+    *,
+    bls_batch_id: uuid.UUID | str | None,
+    apply_freshness: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build exact-month employment metrics and chart rows from BLS levels."""
 
-    payroll = _employment_observation_map("CES0000000001")
-    earnings = _employment_observation_map("CES0500000003")
+    payroll = _employment_observation_map(
+        "CES0000000001",
+        batch_id=bls_batch_id,
+    )
+    earnings = _employment_observation_map(
+        "CES0500000003",
+        batch_id=bls_batch_id,
+    )
 
     changes: dict[date, tuple[Decimal, Observation, Observation]] = {}
     for period, current in payroll.items():
@@ -2039,6 +1956,7 @@ def _employment_derived_data() -> tuple[
             formula="CES0000000001_t - CES0000000001_t-1",
             display_value=f"{value:+,.0f}K",
             unit="K",
+            apply_freshness=apply_freshness,
         )
         row["_lineage"]["非农新增"] = {
             **change_payload["metadata"],
@@ -2063,9 +1981,7 @@ def _employment_derived_data() -> tuple[
         ]
         if all(point is not None for point in average_points):
             complete_points = [point for point in average_points if point is not None]
-            average = sum(
-                (point[0] for point in complete_points), Decimal("0")
-            ) / Decimal("3")
+            average = sum((point[0] for point in complete_points), Decimal("0")) / Decimal("3")
             average_inputs: list[Observation] = []
             for _, point_current, point_previous in complete_points:
                 average_inputs.extend((point_current, point_previous))
@@ -2078,6 +1994,7 @@ def _employment_derived_data() -> tuple[
                 formula="mean(最近 3 个自然月非农就业增量)",
                 display_value=f"{average:+,.0f}K",
                 unit="K",
+                apply_freshness=apply_freshness,
             )
             row["3M 均值"] = float(average)
             row["_lineage"]["3M 均值"] = {
@@ -2118,6 +2035,7 @@ def _employment_derived_data() -> tuple[
             formula="100 * (CES0500000003_t / CES0500000003_t-12 - 1)",
             display_value=f"{value:+,.2f}%",
             unit="%",
+            apply_freshness=apply_freshness,
         )
         wage_rows.append(
             {
@@ -2135,9 +2053,7 @@ def _employment_derived_data() -> tuple[
                         "fetched_at": payload["fetched_at"],
                         "batch_id": payload["batch_id"],
                         "quality_status": payload["quality_status"],
-                        "license_scope": (
-                            "Original calculation from attributed BLS inputs"
-                        ),
+                        "license_scope": ("Original calculation from attributed BLS inputs"),
                         "fallback_source": None,
                     }
                 },
@@ -2163,16 +2079,13 @@ def _derived_employment_chart(
     title: str,
     description: str,
     rows: list[dict[str, Any]],
+    bls_batch_id: uuid.UUID | str | None,
     series: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     if not rows:
         return None
     latest_lineage = next(
-        (
-            lineage
-            for lineage in rows[-1].get("_lineage", {}).values()
-            if isinstance(lineage, dict)
-        ),
+        (lineage for lineage in rows[-1].get("_lineage", {}).values() if isinstance(lineage, dict)),
         None,
     )
     if latest_lineage is None:
@@ -2200,9 +2113,17 @@ def _derived_employment_chart(
         "as_of": latest_lineage["as_of"],
         "fetched_at": latest_lineage["fetched_at"],
         "fresh_until": _fresh_until(
-            _real_observations("CES0000000001").first()
+            _real_observations(
+                "CES0000000001",
+                source_key="bls",
+                batch_id=bls_batch_id,
+            ).first()
             if key == "payroll-change"
-            else _real_observations("CES0500000003").first()
+            else _real_observations(
+                "CES0500000003",
+                source_key="bls",
+                batch_id=bls_batch_id,
+            ).first()
         ).isoformat(),
         "quality_status": latest_lineage["quality_status"],
         "batch_ids": list(latest_lineage.get("input_batch_ids", [])),
@@ -2212,22 +2133,60 @@ def _derived_employment_chart(
     }
 
 
-def _employment_page_data() -> tuple[
-    list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]
-]:
-    derived_metrics, (payroll_rows, wage_rows) = _employment_derived_data()
+def _employment_page_data(
+    *,
+    bls_batch_id: uuid.UUID | str | None = None,
+    dol_batch_id: uuid.UUID | str | None = None,
+    apply_freshness: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    derived_metrics, (payroll_rows, wage_rows) = _employment_derived_data(
+        bls_batch_id=bls_batch_id,
+        apply_freshness=apply_freshness,
+    )
     metrics = _existing(
         *derived_metrics,
-        _metric("LNS14000000", "失业率", suffix="%"),
-        _metric("LNS11300000", "劳动参与率", suffix="%"),
-        _metric("JTS000000000000000JOL", "职位空缺", decimals=0, suffix="K"),
-        _metric("JTS000000000000000QUR", "主动离职率", suffix="%"),
+        _metric(
+            "LNS14000000",
+            "失业率",
+            suffix="%",
+            source_key="bls",
+            batch_id=bls_batch_id,
+            apply_freshness=apply_freshness,
+        ),
+        _metric(
+            "LNS11300000",
+            "劳动参与率",
+            suffix="%",
+            source_key="bls",
+            batch_id=bls_batch_id,
+            apply_freshness=apply_freshness,
+        ),
+        _metric(
+            "JTS000000000000000JOL",
+            "职位空缺",
+            decimals=0,
+            suffix="K",
+            source_key="bls",
+            batch_id=bls_batch_id,
+            apply_freshness=apply_freshness,
+        ),
+        _metric(
+            "JTS000000000000000QUR",
+            "主动离职率",
+            suffix="%",
+            source_key="bls",
+            batch_id=bls_batch_id,
+            apply_freshness=apply_freshness,
+        ),
         _metric(
             INITIAL_SA,
             "初请失业金",
             decimals=0,
             scale=Decimal("0.001"),
             suffix="K",
+            source_key="dol-eta-ui",
+            batch_id=dol_batch_id,
+            apply_freshness=apply_freshness,
         ),
         _metric(
             INITIAL_4WK,
@@ -2235,6 +2194,9 @@ def _employment_page_data() -> tuple[
             decimals=0,
             scale=Decimal("0.001"),
             suffix="K",
+            source_key="dol-eta-ui",
+            batch_id=dol_batch_id,
+            apply_freshness=apply_freshness,
         ),
         _metric(
             CONTINUED_SA,
@@ -2242,8 +2204,18 @@ def _employment_page_data() -> tuple[
             decimals=0,
             scale=Decimal("0.001"),
             suffix="K",
+            source_key="dol-eta-ui",
+            batch_id=dol_batch_id,
+            apply_freshness=apply_freshness,
         ),
-        _metric(IUR_SA, "受保失业率", suffix="%"),
+        _metric(
+            IUR_SA,
+            "受保失业率",
+            suffix="%",
+            source_key="dol-eta-ui",
+            batch_id=dol_batch_id,
+            apply_freshness=apply_freshness,
+        ),
     )
     charts = _existing(
         _derived_employment_chart(
@@ -2251,6 +2223,7 @@ def _employment_page_data() -> tuple[
             title="非农月度增量与 3M 均值",
             description="由 BLS 总非农就业水平按相邻自然月差分，单位：千人。",
             rows=payroll_rows,
+            bls_batch_id=bls_batch_id,
             series=[
                 {"name": "非农新增", "type": "bar"},
                 {"name": "3M 均值", "type": "line", "smooth": True},
@@ -2261,6 +2234,7 @@ def _employment_page_data() -> tuple[
             title="平均时薪同比",
             description="总私营非农平均时薪与精确 t-12 自然月比较，单位：%。",
             rows=wage_rows,
+            bls_batch_id=bls_batch_id,
         ),
         _history_chart(
             key="labor-slack",
@@ -2268,6 +2242,9 @@ def _employment_page_data() -> tuple[
             description="BLS 家庭调查月度季调序列，单位：%。",
             series={"LNS14000000": "失业率", "LNS11300000": "劳动参与率"},
             limit=84,
+            source_key="bls",
+            batch_id=bls_batch_id,
+            apply_freshness=apply_freshness,
         ),
         _history_chart(
             key="jolts-rates",
@@ -2283,6 +2260,9 @@ def _employment_page_data() -> tuple[
                 "JTS000000000000000LDR": "裁员解雇率",
             },
             limit=84,
+            source_key="bls",
+            batch_id=bls_batch_id,
+            apply_freshness=apply_freshness,
         ),
         _history_chart(
             key="initial-claims",
@@ -2290,16 +2270,19 @@ def _employment_page_data() -> tuple[
             description="DOL 全国季调受保失业申领，单位：份。最新周为 advance。",
             series={INITIAL_SA: "初请", INITIAL_4WK: "4 周均值"},
             limit=320,
+            source_key="dol-eta-ui",
+            batch_id=dol_batch_id,
+            apply_freshness=apply_freshness,
         ),
         _history_chart(
             key="continued-claims",
             title="续请周数与官方 4 周均值",
-            description=(
-                "DOL 全国季调 continued weeks claimed，单位：周次；"
-                "不代表唯一领取人数。"
-            ),
+            description=("DOL 全国季调 continued weeks claimed，单位：周次；不代表唯一领取人数。"),
             series={CONTINUED_SA: "续请周数", CONTINUED_4WK: "4 周均值"},
             limit=320,
+            source_key="dol-eta-ui",
+            batch_id=dol_batch_id,
+            apply_freshness=apply_freshness,
         ),
     )
     tab_by_key = {
@@ -2316,17 +2299,31 @@ def _employment_page_data() -> tuple[
         if chart["key"] == "continued-claims":
             chart["panel_class"] = "lg:col-span-2"
     jolts_rows = _existing(
-        _metric("JTS000000000000000JOL", "职位空缺水平", decimals=0, suffix="K"),
-        _metric("JTS000000000000000JOR", "职位空缺率", suffix="%"),
-        _metric("JTS000000000000000HIL", "招聘水平", decimals=0, suffix="K"),
-        _metric("JTS000000000000000HIR", "招聘率", suffix="%"),
-        _metric("JTS000000000000000QUL", "主动离职水平", decimals=0, suffix="K"),
-        _metric("JTS000000000000000QUR", "主动离职率", suffix="%"),
-        _metric("JTS000000000000000LDL", "裁员与解雇水平", decimals=0, suffix="K"),
-        _metric("JTS000000000000000LDR", "裁员与解雇率", suffix="%"),
+        *(
+            _metric(
+                key,
+                label,
+                decimals=decimals,
+                suffix=suffix,
+                source_key="bls",
+                batch_id=bls_batch_id,
+                apply_freshness=apply_freshness,
+            )
+            for key, label, decimals, suffix in (
+                ("JTS000000000000000JOL", "职位空缺水平", 0, "K"),
+                ("JTS000000000000000JOR", "职位空缺率", 2, "%"),
+                ("JTS000000000000000HIL", "招聘水平", 0, "K"),
+                ("JTS000000000000000HIR", "招聘率", 2, "%"),
+                ("JTS000000000000000QUL", "主动离职水平", 0, "K"),
+                ("JTS000000000000000QUR", "主动离职率", 2, "%"),
+                ("JTS000000000000000LDL", "裁员与解雇水平", 0, "K"),
+                ("JTS000000000000000LDR", "裁员与解雇率", 2, "%"),
+            )
+        ),
     )
     sections = [
         {
+            "key": "jolts-official-levels",
             "title": "JOLTS 官方水平与比率",
             "description": (
                 "职位空缺是月末最后一个工作日的存量；招聘、主动离职和"
@@ -2336,6 +2333,7 @@ def _employment_page_data() -> tuple[
             "full_width": True,
         },
         {
+            "key": "employment-methodology",
             "title": "口径、修订与发布节奏",
             "body": (
                 "非农新增与时薪同比是 Atlas Macro 对 BLS 官方水平序列的"
@@ -2345,13 +2343,20 @@ def _employment_page_data() -> tuple[
                 "重叠尾部以新闻稿当前 vintage 为准。"
             ),
             "full_width": True,
-        }
+        },
     ]
     return metrics, charts, sections
 
 
-def _employment_page_is_buildable() -> bool:
-    metrics, charts, _ = _employment_page_data()
+def _employment_page_is_buildable(
+    *,
+    bls_batch_id: uuid.UUID | str | None = None,
+    dol_batch_id: uuid.UUID | str | None = None,
+) -> bool:
+    metrics, charts, _ = _employment_page_data(
+        bls_batch_id=bls_batch_id,
+        dol_batch_id=dol_batch_id,
+    )
     metric_keys = {str(item.get("key") or "") for item in metrics}
     chart_keys = {str(item.get("key") or "") for item in charts}
     return EMPLOYMENT_REQUIRED_METRIC_KEYS <= metric_keys and chart_keys == {
@@ -2383,8 +2388,7 @@ def _inflation_observation_map(
         return {}
     observations = _real_observations(series_key).filter(batch_id=batch_id)[:limit]
     return {
-        observation.value_date.date().replace(day=1): observation
-        for observation in observations
+        observation.value_date.date().replace(day=1): observation for observation in observations
     }
 
 
@@ -2412,7 +2416,10 @@ def _inflation_rate(
 
 
 def _derived_inflation_quality(
-    current: Observation, inputs: Iterable[Observation]
+    current: Observation,
+    inputs: Iterable[Observation],
+    *,
+    apply_freshness: bool = True,
 ) -> tuple[str, datetime]:
     """A derived rate is current-vintage estimated unless an input is degraded."""
 
@@ -2421,7 +2428,9 @@ def _derived_inflation_quality(
     fresh_until = _fresh_until(current)
     if Observation.Quality.ERROR in statuses:
         return Observation.Quality.ERROR, fresh_until
-    if Observation.Quality.STALE in statuses or timezone.now() > fresh_until:
+    if Observation.Quality.STALE in statuses or (
+        apply_freshness and timezone.now() > fresh_until
+    ):
         return Observation.Quality.STALE, fresh_until
     if Observation.Quality.FALLBACK in statuses:
         return Observation.Quality.FALLBACK, fresh_until
@@ -2438,9 +2447,14 @@ def _inflation_payload(
     formula: str,
     seasonal_basis: str,
     change: Decimal | None = None,
+    apply_freshness: bool = True,
 ) -> dict[str, Any]:
     input_list = list(inputs)
-    quality_status, fresh_until = _derived_inflation_quality(current, input_list)
+    quality_status, fresh_until = _derived_inflation_quality(
+        current,
+        input_list,
+        apply_freshness=apply_freshness,
+    )
     input_source_keys = sorted(_observation_source_keys(*input_list))
     input_batch_ids = sorted({str(item.batch_id) for item in input_list})
     return {
@@ -2465,9 +2479,7 @@ def _inflation_payload(
             "input_series": sorted({item.series.key for item in input_list}),
             "source_keys": input_source_keys,
             "input_batch_ids": input_batch_ids,
-            "input_value_dates": sorted(
-                {item.value_date.isoformat() for item in input_list}
-            ),
+            "input_value_dates": sorted({item.value_date.isoformat() for item in input_list}),
             "input_lineage": [
                 {
                     "series_key": item.series.key,
@@ -2480,16 +2492,13 @@ def _inflation_payload(
                     "batch_id": str(item.batch_id),
                     "quality_status": item.quality_status,
                     "fallback_source": (
-                        item.fallback_source.key
-                        if item.fallback_source_id
-                        else None
+                        item.fallback_source.key if item.fallback_source_id else None
                     ),
                 }
                 for item in input_list
             ],
             "preliminary": any(
-                bool((item.metadata or {}).get("preliminary"))
-                for item in input_list
+                bool((item.metadata or {}).get("preliminary")) for item in input_list
             ),
             "seasonal_basis": seasonal_basis,
             "calculation_owner": "Atlas Macro",
@@ -2522,16 +2531,13 @@ def _inflation_series_data(
     not_seasonally_adjusted_series: str | None,
     batch_id: uuid.UUID | str | None,
     input_source_key: str,
+    apply_freshness: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build exact-month inflation rates for one official price index."""
 
-    sa = _inflation_observation_map(
-        seasonally_adjusted_series, batch_id=batch_id
-    )
+    sa = _inflation_observation_map(seasonally_adjusted_series, batch_id=batch_id)
     nsa = (
-        _inflation_observation_map(
-            not_seasonally_adjusted_series, batch_id=batch_id
-        )
+        _inflation_observation_map(not_seasonally_adjusted_series, batch_id=batch_id)
         if not_seasonally_adjusted_series
         else sa
     )
@@ -2539,9 +2545,7 @@ def _inflation_series_data(
         return [], []
     yoy_series = not_seasonally_adjusted_series or seasonally_adjusted_series
     yoy_basis = (
-        "not_seasonally_adjusted"
-        if not_seasonally_adjusted_series
-        else "seasonally_adjusted"
+        "not_seasonally_adjusted" if not_seasonally_adjusted_series else "seasonally_adjusted"
     )
 
     rate_specs = (
@@ -2553,10 +2557,7 @@ def _inflation_series_data(
             False,
             True,
             "seasonally_adjusted",
-            (
-                f"100 * ({seasonally_adjusted_series}_t / "
-                f"{seasonally_adjusted_series}_t-1 - 1)"
-            ),
+            (f"100 * ({seasonally_adjusted_series}_t / {seasonally_adjusted_series}_t-1 - 1)"),
         ),
         (
             "3m-annualized",
@@ -2566,10 +2567,7 @@ def _inflation_series_data(
             True,
             True,
             "seasonally_adjusted",
-            (
-                f"100 * (({seasonally_adjusted_series}_t / "
-                f"{seasonally_adjusted_series}_t-3)^4 - 1)"
-            ),
+            (f"100 * (({seasonally_adjusted_series}_t / {seasonally_adjusted_series}_t-3)^4 - 1)"),
         ),
         (
             "6m-annualized",
@@ -2579,10 +2577,7 @@ def _inflation_series_data(
             True,
             True,
             "seasonally_adjusted",
-            (
-                f"100 * (({seasonally_adjusted_series}_t / "
-                f"{seasonally_adjusted_series}_t-6)^2 - 1)"
-            ),
+            (f"100 * (({seasonally_adjusted_series}_t / {seasonally_adjusted_series}_t-6)^2 - 1)"),
         ),
         (
             "yoy",
@@ -2592,10 +2587,7 @@ def _inflation_series_data(
             False,
             False,
             yoy_basis,
-            (
-                f"100 * ({yoy_series}_t / "
-                f"{yoy_series}_t-12 - 1)"
-            ),
+            (f"100 * ({yoy_series}_t / {yoy_series}_t-12 - 1)"),
         ),
     )
     payloads: dict[tuple[date, str], dict[str, Any]] = {}
@@ -2636,6 +2628,7 @@ def _inflation_series_data(
                 inputs=inputs,
                 formula=formula,
                 seasonal_basis=seasonal_basis,
+                apply_freshness=apply_freshness,
             )
             row[rate_label] = float(value)
             row["_lineage"][rate_label] = _inflation_lineage(payload)
@@ -2652,9 +2645,7 @@ def _inflation_series_data(
             continue
         previous_value = values.get((_month_offset(latest_period, 1), rate_key))
         if previous_value is not None:
-            payload["change"] = round(
-                payload["value"] - float(previous_value), 2
-            )
+            payload["change"] = round(payload["value"] - float(previous_value), 2)
         metrics.append(payload)
     return metrics, rows
 
@@ -2674,11 +2665,7 @@ def _select_lineage_chart_rows(
                 "date": row["date"],
                 **values,
                 "_source_keys": list(row.get("_source_keys") or []),
-                "_lineage": {
-                    field: lineage[field]
-                    for field in values
-                    if field in lineage
-                },
+                "_lineage": {field: lineage[field] for field in values if field in lineage},
             }
         )
     return selected
@@ -2690,15 +2677,25 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
     """Reuse the audited real-rates Treasury/TIPS snapshot for inflation BEI."""
 
     snapshot = select_public_treasury_curve_snapshot("real-rates")
-    if snapshot is None:
+    if (
+        snapshot is None
+        or getattr(snapshot, "treasury_publication_state", None)
+        != "current_candidate"
+    ):
         return [], [], []
     data = dict(snapshot.data or {})
     if (
         snapshot.source.key == "demo-market"
         or data.get("demo") is not False
         or data.get("refresh_failure")
-        or snapshot.quality_status
-        in {Observation.Quality.ERROR, Observation.Quality.STALE}
+        or snapshot.quality_status in {Observation.Quality.ERROR, Observation.Quality.STALE}
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or data.get("contract_version") != TREASURY_CURVE_CONTRACT_VERSION
+        or data.get("formula_version") != TREASURY_CURVE_FORMULA_VERSION
+        or len(str(data.get("fingerprint") or "")) != 64
+        or len(str(data.get("payload_integrity_hash") or "")) != 64
+        or not isinstance(data.get("annual_runs"), list)
+        or not data.get("annual_runs")
     ):
         return [], [], []
     fresh_until_raw = data.get("fresh_until")
@@ -2723,6 +2720,37 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
     ]
     if any(metric is None for metric in source_metrics):
         return [], [], []
+
+    def component_is_current(item: Any) -> bool:
+        if not isinstance(item, dict) or item.get("quality_status") in {
+            Observation.Quality.ERROR,
+            Observation.Quality.STALE,
+        }:
+            return False
+        try:
+            deadline = datetime.fromisoformat(str(item["fresh_until"]))
+        except (KeyError, TypeError, ValueError):
+            return False
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=UTC)
+        return timezone.now() <= deadline
+
+    if not all(component_is_current(metric) for metric in source_metrics):
+        return [], [], []
+    component_reference = {
+        "component_page_key": "real-rates",
+        "component_snapshot_id": snapshot.pk,
+        "component_publication_batch_id": str(snapshot.batch_id),
+        "component_fingerprint": data["fingerprint"],
+        "component_payload_integrity_hash": data["payload_integrity_hash"],
+        "component_contract_version": data["contract_version"],
+        "component_formula_version": data["formula_version"],
+        "component_roles": {
+            "nominal": "us-treasury-rates",
+            "real": "us-treasury-rates",
+        },
+        "source_roles": deepcopy(data["annual_runs"]),
+    }
     metrics: list[dict[str, Any]] = []
     for source_metric in source_metrics:
         metric = deepcopy(source_metric)
@@ -2730,15 +2758,13 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
         metric["label"] = f"{metric['label']}（Treasury 曲线代理）"
         metric["metadata"] = {
             **dict(metric.get("metadata") or {}),
-            "component_page_key": "real-rates",
-            "component_snapshot_id": snapshot.pk,
-            "component_publication_batch_id": str(snapshot.batch_id),
-            "component_fingerprint": data.get("fingerprint"),
+            **component_reference,
             "model_label": (
                 "Treasury nominal minus TIPS par curve approximation; "
                 "not traded breakeven inflation or 5Y5Y"
             ),
         }
+        metric["component_reference"] = component_reference
         metric["source"] = "Atlas Macro 计算：Treasury 名义曲线 - TIPS 实际曲线"
         metric["source_keys"] = sorted(
             {*metric.get("source_keys", []), "internal", "us-treasury-rates"}
@@ -2749,11 +2775,16 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
         (
             item
             for item in data.get("charts", [])
-            if item.get("key") == "nominal-real-breakeven-history"
+            if isinstance(item, dict)
+            and item.get("key") == "nominal-real-breakeven-history"
         ),
         None,
     )
-    if not source_chart:
+    if not source_chart or not component_is_current(source_chart):
+        return [], [], []
+    if not isinstance(source_chart.get("data"), list) or not all(
+        isinstance(row, dict) for row in source_chart["data"]
+    ):
         return [], [], []
     rows = []
     for row in source_chart.get("data", []):
@@ -2779,6 +2810,7 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
         "source_keys": sorted(
             {*source_chart.get("source_keys", []), "internal", "us-treasury-rates"}
         ),
+        "component_reference": component_reference,
     }
     sections = [
         {
@@ -2790,7 +2822,9 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
                 "曲线派生代理，不是实时交易 breakeven、远期 5Y5Y 或终端报价。"
             ),
             "status": Observation.Quality.ESTIMATED,
+            "quality_status": Observation.Quality.ESTIMATED,
             "fresh_until": data.get("fresh_until"),
+            "component_reference": component_reference,
             "full_width": True,
         }
     ]
@@ -2853,11 +2887,7 @@ def _lineage_chart(
 
     def lineage_license_scopes(value: Any) -> set[str]:
         if isinstance(value, dict):
-            scopes = (
-                {str(value["license_scope"])}
-                if value.get("license_scope")
-                else set()
-            )
+            scopes = {str(value["license_scope"])} if value.get("license_scope") else set()
             for nested in value.values():
                 scopes.update(lineage_license_scopes(nested))
             return scopes
@@ -2873,9 +2903,7 @@ def _lineage_chart(
         rendered_rows = []
         for row in chart_rows:
             compact_row = {
-                key: value
-                for key, value in row.items()
-                if key not in {"_lineage", "_source_keys"}
+                key: value for key, value in row.items() if key not in {"_lineage", "_source_keys"}
             }
             revision_indicators = {
                 field: lineage["revision_indicator"]
@@ -2899,18 +2927,10 @@ def _lineage_chart(
         "description": description,
         "kind": "line",
         "data": rendered_rows,
-        "lineage_mode": (
-            "series-batch" if compact_point_lineage else "per-point"
-        ),
-        "series_lineage": (
-            latest_lineage_by_field if compact_point_lineage else {}
-        ),
+        "lineage_mode": ("series-batch" if compact_point_lineage else "per-point"),
+        "series_lineage": (latest_lineage_by_field if compact_point_lineage else {}),
         "source_keys": sorted(
-            {
-                source_key
-                for item in latest_lineages
-                for source_key in item.get("source_keys", [])
-            }
+            {source_key for item in latest_lineages for source_key in item.get("source_keys", [])}
             | ({"internal"} if include_internal else set())
         ),
         "as_of": min(item["as_of"] for item in latest_lineages),
@@ -2918,22 +2938,12 @@ def _lineage_chart(
         "fresh_until": min(item["fresh_until"] for item in latest_lineages),
         "quality_status": quality_status,
         "batch_ids": sorted(
-            {
-                batch_id
-                for item in latest_lineages
-                for batch_id in lineage_batch_ids(item)
-            }
+            {batch_id for item in latest_lineages for batch_id in lineage_batch_ids(item)}
         ),
         "license_scopes": sorted(
-            {
-                scope
-                for item in latest_lineages
-                for scope in lineage_license_scopes(item)
-            }
+            {scope for item in latest_lineages for scope in lineage_license_scopes(item)}
         ),
-        "fallback_sources": sorted(
-            _payload_fallback_source_keys(latest_lineages)
-        ),
+        "fallback_sources": sorted(_payload_fallback_source_keys(latest_lineages)),
         "frequency": frequency,
         "time_axis": "date",
         "tab": tab,
@@ -3017,9 +3027,9 @@ def _validate_treasury_curve_run(run: IngestionRun) -> SimpleNamespace:
     if (
         endpoint.scheme != "https"
         or endpoint.netloc.lower() != "home.treasury.gov"
-        or endpoint.path
-        != "/resource-center/data-chart-center/interest-rates/pages/xml"
-        or parse_qs(endpoint.query) != {
+        or endpoint.path != "/resource-center/data-chart-center/interest-rates/pages/xml"
+        or parse_qs(endpoint.query)
+        != {
             "data": [curve],
             "field_tdr_date_value": [str(requested_year)],
         }
@@ -3079,9 +3089,7 @@ def _validate_treasury_curve_run(run: IngestionRun) -> SimpleNamespace:
         and row.quality_status == Observation.Quality.FRESH
         and row.fallback_source_id is None
     ]
-    replay_contract = [
-        _treasury_curve_record_contract(record) for record in replayed
-    ]
+    replay_contract = [_treasury_curve_record_contract(record) for record in replayed]
     if (
         len(rows) != run.row_count
         or len(stored_contract) != len(rows)
@@ -3117,9 +3125,7 @@ def _treasury_run_witness(run: IngestionRun) -> dict[str, Any]:
         "refresh_cycle_id": str((run.metadata or {}).get("refresh_cycle_id") or ""),
         "fetched_at": evidence.fetched_at.isoformat(),
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
-        "feed_updated_time": (
-            evidence.feed_updated.isoformat() if evidence.feed_updated else None
-        ),
+        "feed_updated_time": (evidence.feed_updated.isoformat() if evidence.feed_updated else None),
         "latest_value_date": evidence.latest_date.isoformat(),
         "artifact": {
             "artifact_id": evidence.artifact.pk,
@@ -3139,10 +3145,7 @@ def _latest_treasury_attempt(component: str, year: int) -> IngestionRun | None:
             source__key="us-treasury-rates",
             dataset=_treasury_dataset(component, year),
         )
-        .filter(
-            Q(metadata__publication_intent=True)
-            | ~Q(metadata__has_key="publication_intent")
-        )
+        .filter(Q(metadata__publication_intent=True) | ~Q(metadata__has_key="publication_intent"))
         .order_by("-started_at", "-id")
         .first()
     )
@@ -3165,9 +3168,7 @@ def _treasury_run_state(
         "ingestion_run_id": run.pk if run is not None else None,
         "batch_id": str(run.batch_id) if run is not None else None,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run is not None
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run is not None else ""
         ),
         "reason": (
             reason
@@ -3209,11 +3210,7 @@ def _select_treasury_curve_runs(
     for year in range(end_year - TREASURY_CURVE_HISTORY_YEARS, end_year + 1):
         for component in TREASURY_CURVE_DATASET_PREFIXES:
             run = _latest_treasury_attempt(component, year)
-            if (
-                run is None
-                or run.status != IngestionRun.Status.SUCCESS
-                or run.row_count <= 0
-            ):
+            if run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0:
                 states.append(
                     _treasury_run_state(
                         component,
@@ -3239,9 +3236,7 @@ def _select_treasury_curve_runs(
             selected[(component, year)] = run
             states.append(_treasury_run_state(component, year, run))
 
-    expected_count = (TREASURY_CURVE_HISTORY_YEARS + 1) * len(
-        TREASURY_CURVE_DATASET_PREFIXES
-    )
+    expected_count = (TREASURY_CURVE_HISTORY_YEARS + 1) * len(TREASURY_CURVE_DATASET_PREFIXES)
     current_runs = [selected.get((component, end_year)) for component in ("nominal", "real")]
     current_cycles = {
         str((run.metadata or {}).get("refresh_cycle_id") or "")
@@ -3251,14 +3246,13 @@ def _select_treasury_curve_runs(
     current_trigger_batches = {
         str(run.batch_id)
         for run in treasury_triggers
-        if run.dataset in {
+        if run.dataset
+        in {
             _treasury_dataset("nominal", end_year),
             _treasury_dataset("real", end_year),
         }
     }
-    selected_current_batches = {
-        str(run.batch_id) for run in current_runs if run is not None
-    }
+    selected_current_batches = {str(run.batch_id) for run in current_runs if run is not None}
     if (
         len(selected) != expected_count
         or any(run is None for run in current_runs)
@@ -3300,8 +3294,7 @@ def _treasury_observation_maps(
     selected_runs: dict[tuple[str, int], IngestionRun],
 ) -> tuple[dict[str, dict[date, Observation]] | None, list[dict[str, Any]]]:
     expected_batches = {
-        (component, year): str(run.batch_id)
-        for (component, year), run in selected_runs.items()
+        (component, year): str(run.batch_id) for (component, year), run in selected_runs.items()
     }
     batch_ids = [run.batch_id for run in selected_runs.values()]
     series_keys = {*TREASURY_NOMINAL_SERIES, *TREASURY_REAL_SERIES}
@@ -3468,19 +3461,15 @@ def _treasury_derived_metric(
         current_value *= Decimal("100")
         previous_value *= Decimal("100")
     current_lineage = [
-        _treasury_direct_lineage(item, fresh_until=fresh_until)
-        for item in current_inputs
+        _treasury_direct_lineage(item, fresh_until=fresh_until) for item in current_inputs
     ]
     previous_lineage = [
-        _treasury_direct_lineage(item, fresh_until=fresh_until)
-        for item in previous_inputs
+        _treasury_direct_lineage(item, fresh_until=fresh_until) for item in previous_inputs
     ]
     input_batches = sorted({str(item.batch_id) for item in current_inputs})
     source_keys = sorted(_observation_source_keys(*current_inputs) | {"internal"})
     unit = "bp" if basis_points else "%"
-    display_value = (
-        f"{current_value:+.0f}bp" if basis_points else f"{current_value:.2f}%"
-    )
+    display_value = f"{current_value:+.0f}bp" if basis_points else f"{current_value:.2f}%"
     change = (
         current_value - previous_value
         if basis_points
@@ -3509,9 +3498,7 @@ def _treasury_derived_metric(
             "calculation_owner": "Atlas Macro",
             "input_series": [item.series.key for item in current_inputs],
             "input_batch_ids": input_batches,
-            "input_value_dates": sorted(
-                {item.value_date.isoformat() for item in current_inputs}
-            ),
+            "input_value_dates": sorted({item.value_date.isoformat() for item in current_inputs}),
             "input_lineage": current_lineage,
             "previous_value": float(previous_value),
             "previous_value_date": previous_inputs[0].value_date.isoformat(),
@@ -3598,9 +3585,7 @@ def _treasury_chart(
         "fetched_at": max(item.fetched_at for item in current_inputs).isoformat(),
         "fresh_until": fresh_until.isoformat(),
         "quality_status": (
-            Observation.Quality.ESTIMATED
-            if estimated
-            else Observation.Quality.FRESH
+            Observation.Quality.ESTIMATED if estimated else Observation.Quality.FRESH
         ),
         "batch_ids": batch_ids,
         "frequency": "daily",
@@ -3640,18 +3625,12 @@ def _treasury_curve_page_data(
             }
         ]
 
-    nominal_curve_dates = set.intersection(
-        *(set(maps[key]) for key in TREASURY_NOMINAL_SERIES)
-    )
-    real_curve_dates = set.intersection(
-        *(set(maps[key]) for key in TREASURY_REAL_SERIES)
-    )
+    nominal_curve_dates = set.intersection(*(set(maps[key]) for key in TREASURY_NOMINAL_SERIES))
+    real_curve_dates = set.intersection(*(set(maps[key]) for key in TREASURY_REAL_SERIES))
     nominal_history_dates = set.intersection(
         *(set(maps[key]) for key in TREASURY_NOMINAL_HISTORY_SERIES)
     )
-    real_history_dates = set.intersection(
-        *(set(maps[key]) for key in TREASURY_REAL_HISTORY_SERIES)
-    )
+    real_history_dates = set.intersection(*(set(maps[key]) for key in TREASURY_REAL_HISTORY_SERIES))
     common_dates = sorted(nominal_history_dates & real_history_dates)
     if len(common_dates) < 2:
         return None, [
@@ -3679,9 +3658,7 @@ def _treasury_curve_page_data(
                 "reason": "latest common date does not contain every current curve tenor",
             }
         ]
-    all_latest_dates = {
-        max(by_date) for by_date in maps.values() if by_date
-    }
+    all_latest_dates = {max(by_date) for by_date in maps.values() if by_date}
     if all_latest_dates != {current_date}:
         return None, [
             {
@@ -3697,8 +3674,7 @@ def _treasury_curve_page_data(
     window_dates = [period for period in common_dates if period >= window_start]
     if (
         len(window_dates) < TREASURY_CURVE_MIN_HISTORY_POINTS
-        or window_dates[0]
-        > window_start + timedelta(days=TREASURY_CURVE_START_TOLERANCE_DAYS)
+        or window_dates[0] > window_start + timedelta(days=TREASURY_CURVE_START_TOLERANCE_DAYS)
         or any(
             (right - left).days > TREASURY_CURVE_MAX_GAP_DAYS
             for left, right in zip(window_dates, window_dates[1:], strict=False)
@@ -3714,7 +3690,9 @@ def _treasury_curve_page_data(
             }
         ]
 
-    current_inputs = [maps[key][current_date] for key in (*TREASURY_NOMINAL_SERIES, *TREASURY_REAL_SERIES)]
+    current_inputs = [
+        maps[key][current_date] for key in (*TREASURY_NOMINAL_SERIES, *TREASURY_REAL_SERIES)
+    ]
     fresh_until = min(_fresh_until(item) for item in current_inputs)
     if not allow_expired and timezone.now() > fresh_until:
         return None, [
@@ -3735,9 +3713,7 @@ def _treasury_curve_page_data(
     }
     comparison_dates: dict[str, date] = {}
     for label, target in comparison_targets.items():
-        candidates = [
-            period for period in nominal_curve_dates if period <= target
-        ]
+        candidates = [period for period in nominal_curve_dates if period <= target]
         if not candidates or (target - max(candidates)).days > 10:
             return None, [
                 {
@@ -3750,12 +3726,8 @@ def _treasury_curve_page_data(
             ]
         comparison_dates[label] = max(candidates)
 
-    nominal_current = {
-        key: maps[key][current_date] for key in TREASURY_NOMINAL_SERIES
-    }
-    nominal_previous = {
-        key: maps[key][previous_date] for key in TREASURY_NOMINAL_SERIES
-    }
+    nominal_current = {key: maps[key][current_date] for key in TREASURY_NOMINAL_SERIES}
+    nominal_previous = {key: maps[key][previous_date] for key in TREASURY_NOMINAL_SERIES}
     real_current = {key: maps[key][current_date] for key in TREASURY_REAL_SERIES}
     real_previous = {key: maps[key][previous_date] for key in TREASURY_REAL_SERIES}
 
@@ -3838,18 +3810,23 @@ def _treasury_curve_page_data(
     spread_rows: list[dict[str, Any]] = []
     real_rows: list[dict[str, Any]] = []
     for period in window_dates:
-        period_nominal = {
-            key: maps[key][period] for key in TREASURY_NOMINAL_HISTORY_SERIES
-        }
-        period_real = {
-            key: maps[key][period] for key in TREASURY_REAL_HISTORY_SERIES
-        }
+        period_nominal = {key: maps[key][period] for key in TREASURY_NOMINAL_HISTORY_SERIES}
+        period_real = {key: maps[key][period] for key in TREASURY_REAL_HISTORY_SERIES}
         spread_rows.append(
             {
                 "date": period.isoformat(),
-                "2s10s": float((period_nominal["ust-10y"].value - period_nominal["ust-2y"].value) * Decimal("100")),
-                "3m10s": float((period_nominal["ust-10y"].value - period_nominal["ust-3m"].value) * Decimal("100")),
-                "5s30s": float((period_nominal["ust-30y"].value - period_nominal["ust-5y"].value) * Decimal("100")),
+                "2s10s": float(
+                    (period_nominal["ust-10y"].value - period_nominal["ust-2y"].value)
+                    * Decimal("100")
+                ),
+                "3m10s": float(
+                    (period_nominal["ust-10y"].value - period_nominal["ust-3m"].value)
+                    * Decimal("100")
+                ),
+                "5s30s": float(
+                    (period_nominal["ust-30y"].value - period_nominal["ust-5y"].value)
+                    * Decimal("100")
+                ),
                 "_batch_ids": sorted({str(item.batch_id) for item in period_nominal.values()}),
                 "_source_keys": ["us-treasury-rates", "internal"],
             }
@@ -3863,7 +3840,12 @@ def _treasury_curve_page_data(
                 "10Y 名义": float(period_nominal["ust-10y"].value),
                 "10Y 实际": float(period_real["tips-10y"].value),
                 "10Y BEI": float(period_nominal["ust-10y"].value - period_real["tips-10y"].value),
-                "_batch_ids": sorted({str(item.batch_id) for item in (*period_nominal.values(), *period_real.values())}),
+                "_batch_ids": sorted(
+                    {
+                        str(item.batch_id)
+                        for item in (*period_nominal.values(), *period_real.values())
+                    }
+                ),
                 "_source_keys": ["us-treasury-rates", "internal"],
             }
         )
@@ -3952,8 +3934,7 @@ def _treasury_curve_page_data(
         for tenor in TREASURY_REAL_TENORS
     ]
     annual_run_witnesses = [
-        _treasury_run_witness(run)
-        for (_component, _year), run in sorted(selected_runs.items())
+        _treasury_run_witness(run) for (_component, _year), run in sorted(selected_runs.items())
     ]
     common_extra = {
         "contract_version": TREASURY_CURVE_CONTRACT_VERSION,
@@ -3990,9 +3971,7 @@ def _treasury_curve_page_data(
                 **common_extra,
                 "curve_scope": "nominal",
                 "annual_runs": [
-                    item
-                    for item in annual_run_witnesses
-                    if item["component"] == "nominal"
+                    item for item in annual_run_witnesses if item["component"] == "nominal"
                 ],
                 "all_annual_runs": annual_run_witnesses,
                 "required_metric_keys": sorted(YIELD_CURVE_REQUIRED_METRIC_KEYS),
@@ -4033,6 +4012,8 @@ def _inflation_page_data(
     *,
     batch_id: uuid.UUID | str | None,
     bea_pio_batch_id: uuid.UUID | str | None = None,
+    apply_freshness: bool = True,
+    include_market_overlay: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     headline_metrics, headline_rows = _inflation_series_data(
         key_prefix="headline-cpi",
@@ -4041,6 +4022,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series="CUUR0000SA0",
         batch_id=batch_id,
         input_source_key="bls",
+        apply_freshness=apply_freshness,
     )
     core_metrics, core_rows = _inflation_series_data(
         key_prefix="core-cpi",
@@ -4049,6 +4031,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series="CUUR0000SA0L1E",
         batch_id=batch_id,
         input_source_key="bls",
+        apply_freshness=apply_freshness,
     )
     shelter_metrics, shelter_rows = _inflation_series_data(
         key_prefix="shelter-cpi",
@@ -4057,6 +4040,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series="CUUR0000SAH1",
         batch_id=batch_id,
         input_source_key="bls",
+        apply_freshness=apply_freshness,
     )
     core_goods_metrics, core_goods_rows = _inflation_series_data(
         key_prefix="core-goods-cpi",
@@ -4065,6 +4049,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series="CUUR0000SACL1E",
         batch_id=batch_id,
         input_source_key="bls",
+        apply_freshness=apply_freshness,
     )
     services_metrics, services_rows = _inflation_series_data(
         key_prefix="services-less-energy-cpi",
@@ -4073,6 +4058,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series="CUUR0000SASLE",
         batch_id=batch_id,
         input_source_key="bls",
+        apply_freshness=apply_freshness,
     )
     producer_metrics, producer_rows = _inflation_series_data(
         key_prefix="final-demand-ppi",
@@ -4081,6 +4067,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series="WPUFD4",
         batch_id=batch_id,
         input_source_key="bls",
+        apply_freshness=apply_freshness,
     )
     pce_metrics, pce_rows = _inflation_series_data(
         key_prefix="pce-price-index",
@@ -4089,6 +4076,7 @@ def _inflation_page_data(
         not_seasonally_adjusted_series=None,
         batch_id=bea_pio_batch_id,
         input_source_key="bea-pio-release",
+        apply_freshness=apply_freshness,
     )
     core_pce_metrics, core_pce_rows = _inflation_series_data(
         key_prefix="core-pce-price-index",
@@ -4097,17 +4085,19 @@ def _inflation_page_data(
         not_seasonally_adjusted_series=None,
         batch_id=bea_pio_batch_id,
         input_source_key="bea-pio-release",
+        apply_freshness=apply_freshness,
     )
     expectation_metrics, expectation_charts, expectation_sections = (
         _inflation_market_expectations_from_real_rates()
+        if include_market_overlay
+        else ([], [], [])
     )
     charts = _existing(
         _lineage_chart(
             key="headline-cpi-rates",
             title="总体 CPI 通胀率与短周期动能",
             description=(
-                "环比与 3M/6M 几何年化使用 BLS 季调指数；"
-                "12 个月同比使用未季调指数，单位：%。"
+                "环比与 3M/6M 几何年化使用 BLS 季调指数；12 个月同比使用未季调指数，单位：%。"
             ),
             rows=headline_rows,
             fields=["CPI 环比", "CPI 同比", "CPI 3M 年化", "CPI 6M 年化"],
@@ -4116,9 +4106,7 @@ def _inflation_page_data(
         _lineage_chart(
             key="core-cpi-rates",
             title="核心 CPI 通胀率与短周期动能",
-            description=(
-                "剔除食品和能源；环比与动能用季调指数，同比用未季调指数。"
-            ),
+            description=("剔除食品和能源；环比与动能用季调指数，同比用未季调指数。"),
             rows=core_rows,
             fields=[
                 "核心 CPI 环比",
@@ -4131,10 +4119,7 @@ def _inflation_page_data(
         _lineage_chart(
             key="shelter-cpi-rates",
             title="住房成本 CPI（Shelter）通胀率与短周期动能",
-            description=(
-                "BLS Shelter 官方聚合项；环比与动能用季调指数，"
-                "同比用未季调指数。"
-            ),
+            description=("BLS Shelter 官方聚合项；环比与动能用季调指数，同比用未季调指数。"),
             rows=shelter_rows,
             fields=[
                 "住房成本 CPI（Shelter） 环比",
@@ -4179,9 +4164,7 @@ def _inflation_page_data(
         _lineage_chart(
             key="final-demand-ppi-rates",
             title="最终需求 PPI 通胀率与短周期动能",
-            description=(
-                "环比与动能用季调指数，同比用未季调指数；最近四个月可修订。"
-            ),
+            description=("环比与动能用季调指数，同比用未季调指数；最近四个月可修订。"),
             rows=producer_rows,
             fields=[
                 "最终需求 PPI 环比",
@@ -4227,6 +4210,7 @@ def _inflation_page_data(
     )
     sections = [
         {
+            "key": "inflation-methodology",
             "title": "口径、公式与修订",
             "body": (
                 "CPI/PPI 环比与 3M/6M 年化只使用季调指数，同比只使用未季调指数。"
@@ -4239,6 +4223,7 @@ def _inflation_page_data(
             "full_width": True,
         },
         {
+            "key": "inflation-coverage-gaps",
             "title": "尚未接入的通胀层",
             "body": (
                 "真实交易 breakeven、5Y5Y 和完整发布 vintage "
@@ -4248,17 +4233,21 @@ def _inflation_page_data(
         },
         *expectation_sections,
     ]
-    return [
-        *headline_metrics,
-        *core_metrics,
-        *shelter_metrics,
-        *core_goods_metrics,
-        *services_metrics,
-        *producer_metrics,
-        *pce_metrics,
-        *core_pce_metrics,
-        *expectation_metrics,
-    ], charts, sections
+    return (
+        [
+            *headline_metrics,
+            *core_metrics,
+            *shelter_metrics,
+            *core_goods_metrics,
+            *services_metrics,
+            *producer_metrics,
+            *pce_metrics,
+            *core_pce_metrics,
+            *expectation_metrics,
+        ],
+        charts,
+        sections,
+    )
 
 
 def _inflation_page_is_buildable(
@@ -4266,8 +4255,11 @@ def _inflation_page_is_buildable(
     batch_id: uuid.UUID | str | None,
     bea_pio_batch_id: uuid.UUID | str | None = None,
 ) -> bool:
-    metrics, charts, _ = _inflation_page_data(
-        batch_id=batch_id, bea_pio_batch_id=bea_pio_batch_id
+    metrics, charts, sections = _inflation_page_data(
+        batch_id=batch_id,
+        bea_pio_batch_id=bea_pio_batch_id,
+        apply_freshness=False,
+        include_market_overlay=False,
     )
     metric_keys = {str(item.get("key") or "") for item in metrics}
     chart_by_key = {str(item.get("key") or ""): item for item in charts}
@@ -4281,11 +4273,11 @@ def _inflation_page_is_buildable(
         "pce-price-rates",
         "core-pce-price-rates",
     }
-    allowed_chart_keys = {*expected_chart_keys, "market-breakeven-inflation"}
     if (
-        not INFLATION_REQUIRED_METRIC_KEYS <= metric_keys
-        or not expected_chart_keys <= set(chart_by_key)
-        or not set(chart_by_key) <= allowed_chart_keys
+        metric_keys != INFLATION_REQUIRED_METRIC_KEYS
+        or set(chart_by_key) != expected_chart_keys
+        or {str(item.get("key") or "") for item in sections}
+        != {"inflation-methodology", "inflation-coverage-gaps"}
     ):
         return False
     required_latest_fields = {
@@ -4384,12 +4376,8 @@ def _fed_funds_input_lineage(
             "fetched_at": item.fetched_at.isoformat(),
             "batch_id": str(item.batch_id),
             "quality_status": item.quality_status,
-            "fallback_source": (
-                item.fallback_source.key if item.fallback_source_id else None
-            ),
-            "revision_indicator": (item.metadata or {}).get(
-                "revisionIndicator"
-            ),
+            "fallback_source": (item.fallback_source.key if item.fallback_source_id else None),
+            "revision_indicator": (item.metadata or {}).get("revisionIndicator"),
             "footnote_id": (item.metadata or {}).get("footnoteId"),
             "prates_status": (item.metadata or {}).get("prates_status"),
         }
@@ -4431,9 +4419,7 @@ def _fed_funds_payload(
     source_field: str | None = None,
 ) -> dict[str, Any]:
     input_list = list(inputs)
-    quality_status, fresh_until = _fed_funds_quality(
-        current, input_list, derived=derived
-    )
+    quality_status, fresh_until = _fed_funds_quality(current, input_list, derived=derived)
     input_source_keys = sorted(_observation_source_keys(*input_list))
     input_batch_ids = sorted({str(item.batch_id) for item in input_list})
     if unit == "bp":
@@ -4445,8 +4431,7 @@ def _fed_funds_payload(
     source = (
         "Atlas Macro 计算：" + str(formula)
         if derived
-        else current.source.name
-        + (f" · {source_field}" if source_field else "")
+        else current.source.name + (f" · {source_field}" if source_field else "")
     )
     return {
         "key": key,
@@ -4459,9 +4444,7 @@ def _fed_funds_payload(
         "quality_status": quality_status,
         "source": source,
         "source_key": "internal" if derived else current.source.key,
-        "source_keys": sorted(
-            {*input_source_keys, *({"internal"} if derived else set())}
-        ),
+        "source_keys": sorted({*input_source_keys, *({"internal"} if derived else set())}),
         "as_of": current.as_of.isoformat(),
         "value_date": current.value_date.isoformat(),
         "fetched_at": max(item.fetched_at for item in input_list).isoformat(),
@@ -4474,13 +4457,9 @@ def _fed_funds_payload(
             "input_series": sorted({item.series.key for item in input_list}),
             "source_keys": input_source_keys,
             "input_batch_ids": input_batch_ids,
-            "input_value_dates": sorted(
-                {item.value_date.isoformat() for item in input_list}
-            ),
+            "input_value_dates": sorted({item.value_date.isoformat() for item in input_list}),
             "input_lineage": _fed_funds_input_lineage(input_list),
-            "revision_indicator": (current.metadata or {}).get(
-                "revisionIndicator"
-            ),
+            "revision_indicator": (current.metadata or {}).get("revisionIndicator"),
             "footnote_id": (current.metadata or {}).get("footnoteId"),
             "prates_status": (current.metadata or {}).get("prates_status"),
             "calculation_owner": "Atlas Macro" if derived else None,
@@ -4511,11 +4490,7 @@ def _fed_funds_period_payloads(
     }
     if any(value is None for value in metadata_values.values()):
         return {}
-    values = {
-        key: value
-        for key, value in metadata_values.items()
-        if value is not None
-    }
+    values = {key: value for key, value in metadata_values.items() if value is not None}
     target_width = values["target-upper"] - values["target-lower"]
     if (
         target_width <= 0
@@ -4644,11 +4619,7 @@ def _fed_funds_period_payloads(
         (
             "effr-corridor-position",
             "EFFR 走廊位置",
-            (
-                (effr.value - values["target-lower"])
-                / target_width
-                * Decimal("100")
-            ),
+            ((effr.value - values["target-lower"]) / target_width * Decimal("100")),
             (effr,),
             "100 * (EFFR - target_lower) / (target_upper - target_lower)",
             "%",
@@ -4717,9 +4688,7 @@ def _fed_funds_chart_row(
         payload = payloads[payload_key]
         row[label] = payload["value"]
         row["_lineage"][label] = _fed_funds_lineage(payload)
-        row["_source_keys"] = sorted(
-            {*row["_source_keys"], *payload["source_keys"]}
-        )
+        row["_source_keys"] = sorted({*row["_source_keys"], *payload["source_keys"]})
     return row
 
 
@@ -4738,9 +4707,7 @@ def _fed_funds_page_data(
     }
     if any(not values for values in observations.values()):
         return [], [], []
-    today_et = timezone.now().astimezone(
-        ZoneInfo("America/New_York")
-    ).date()
+    today_et = timezone.now().astimezone(ZoneInfo("America/New_York")).date()
     market_dates = {
         period
         for period in set(observations["sofr"]) & set(observations["effr"])
@@ -4757,9 +4724,7 @@ def _fed_funds_page_data(
         iorb=latest_iorb,
     ):
         return [], [], []
-    periods = sorted(
-        period for period in market_dates if period in observations["iorb"]
-    )
+    periods = sorted(period for period in market_dates if period in observations["iorb"])
     period_payloads: dict[date, dict[str, dict[str, Any]]] = {}
     corridor_rows = []
     effr_rows = []
@@ -4844,21 +4809,20 @@ def _fed_funds_page_data(
         key = metric["key"]
         if previous and key in previous:
             factor = Decimal("100") if key in rate_keys else Decimal("1")
-            change = (
-                Decimal(str(metric["value"]))
-                - Decimal(str(previous[key]["value"]))
-            ) * factor
+            change = (Decimal(str(metric["value"])) - Decimal(str(previous[key]["value"]))) * factor
             metric["change"] = round(float(change), 2)
             metric["change_unit"] = (
-                " USD bn" if key in volume_keys else "bp" if key != "effr-corridor-position" else "pp"
+                " USD bn"
+                if key in volume_keys
+                else "bp"
+                if key != "effr-corridor-position"
+                else "pp"
             )
     charts = _existing(
         _lineage_chart(
             key="policy-corridor",
             title="政策走廊与隔夜市场利率",
-            description=(
-                "EFFR、SOFR 与 IORB 严格对齐到共同有效日；目标区间来自 NY Fed。单位：%。"
-            ),
+            description=("EFFR、SOFR 与 IORB 严格对齐到共同有效日；目标区间来自 NY Fed。单位：%。"),
             rows=corridor_rows,
             fields=["目标下限", "目标上限", "IORB", "EFFR", "SOFR"],
             tab="corridor",
@@ -4910,8 +4874,7 @@ def _fed_funds_page_data(
         {
             "title": f"{latest_period.isoformat()} 官方分布与成交量",
             "description": (
-                "分位与成交量直接取 NY Fed reference-rate 响应；"
-                "成交量单位为十亿美元。"
+                "分位与成交量直接取 NY Fed reference-rate 响应；成交量单位为十亿美元。"
             ),
             "rows": latest_distribution,
             "full_width": True,
@@ -4940,8 +4903,7 @@ def _fed_funds_page_contract_is_buildable(
     }
     if (
         not FED_FUNDS_REQUIRED_METRIC_KEYS <= metric_keys
-        or {str(item.get("key") or "") for item in charts}
-        != expected_chart_keys
+        or {str(item.get("key") or "") for item in charts} != expected_chart_keys
     ):
         return False
     value_dates = {item.get("value_date") for item in metrics}
@@ -4971,9 +4933,7 @@ def _fed_funds_page_contract_is_buildable(
     return True
 
 
-def _fed_funds_page_is_buildable(
-    *, dataset_batches: dict[str, uuid.UUID | str] | None
-) -> bool:
+def _fed_funds_page_is_buildable(*, dataset_batches: dict[str, uuid.UUID | str] | None) -> bool:
     metrics, charts, _ = _fed_funds_page_data(dataset_batches=dataset_batches)
     return _fed_funds_page_contract_is_buildable(metrics, charts)
 
@@ -4994,9 +4954,7 @@ def _latest_fed_funds_attempt(identity: str) -> IngestionRun | None:
     )
 
 
-def _fed_funds_run_state(
-    identity: str, run: IngestionRun | None
-) -> dict[str, Any]:
+def _fed_funds_run_state(identity: str, run: IngestionRun | None) -> dict[str, Any]:
     source_key, dataset = FED_FUNDS_DATASETS[identity]
     return {
         "component": identity,
@@ -5007,9 +4965,7 @@ def _fed_funds_run_state(
         "error": (run.error if run else "required dataset run missing")[:240],
         "batch_id": str(run.batch_id) if run else None,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
     }
 
@@ -5017,9 +4973,7 @@ def _fed_funds_run_state(
 def _select_fed_funds_runs(
     trigger_runs: Iterable[IngestionRun],
 ) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
-    relevant: dict[str, list[IngestionRun]] = {
-        key: [] for key in FED_FUNDS_DATASETS
-    }
+    relevant: dict[str, list[IngestionRun]] = {key: [] for key in FED_FUNDS_DATASETS}
     for run in trigger_runs:
         identity = _fed_funds_run_identity(run)
         if identity:
@@ -5032,9 +4986,7 @@ def _select_fed_funds_runs(
         if not runs:
             continue
         latest_attempt = _latest_fed_funds_attempt(identity)
-        if latest_attempt is None or any(
-            run.pk != latest_attempt.pk for run in runs
-        ):
+        if latest_attempt is None or any(run.pk != latest_attempt.pk for run in runs):
             return None, [], False
 
     ny_fed_triggered = bool(relevant["sofr"] or relevant["effr"])
@@ -5044,42 +4996,25 @@ def _select_fed_funds_runs(
         if (identity in {"sofr", "effr"} and ny_fed_triggered) or (
             identity == "iorb" and prates_triggered
         ):
-            selected[identity] = (
-                relevant[identity][0]
-                if len(relevant[identity]) == 1
-                else None
-            )
+            selected[identity] = relevant[identity][0] if len(relevant[identity]) == 1 else None
         else:
             selected[identity] = _latest_fed_funds_attempt(identity)
 
-    states = [
-        _fed_funds_run_state(identity, selected[identity])
-        for identity in FED_FUNDS_DATASETS
-    ]
+    states = [_fed_funds_run_state(identity, selected[identity]) for identity in FED_FUNDS_DATASETS]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in selected.values()
     ):
         return None, states, True
-    sofr_cycle = str(
-        (selected["sofr"].metadata or {}).get("refresh_cycle_id") or ""
-    )
-    effr_cycle = str(
-        (selected["effr"].metadata or {}).get("refresh_cycle_id") or ""
-    )
+    sofr_cycle = str((selected["sofr"].metadata or {}).get("refresh_cycle_id") or "")
+    effr_cycle = str((selected["effr"].metadata or {}).get("refresh_cycle_id") or "")
     if not sofr_cycle or sofr_cycle != effr_cycle:
         return None, states, True
-    complete = {
-        key: run for key, run in selected.items() if run is not None
-    }
+    complete = {key: run for key, run in selected.items() if run is not None}
     return complete, states, True
 
 
-def _mark_fed_funds_stale(
-    states: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_fed_funds_stale(states: list[dict[str, Any]], *, reason: str) -> None:
     checked_at = datetime.now(UTC).isoformat()
     with transaction.atomic():
         latest = (
@@ -5180,12 +5115,8 @@ def _coordinate_fed_funds_dashboard(
             ),
         )
         return [], _fed_funds_stale_dashboard_keys()
-    dataset_batches = {
-        key: run.batch_id for key, run in selected.items()
-    }
-    prepared_page_data = _fed_funds_page_data(
-        dataset_batches=dataset_batches
-    )
+    dataset_batches = {key: run.batch_id for key, run in selected.items()}
+    prepared_page_data = _fed_funds_page_data(dataset_batches=dataset_batches)
     metrics, charts, _ = prepared_page_data
     if not _fed_funds_page_contract_is_buildable(metrics, charts):
         _mark_fed_funds_stale(
@@ -5196,21 +5127,14 @@ def _coordinate_fed_funds_dashboard(
             ),
         )
         return [], _fed_funds_stale_dashboard_keys()
-    candidate_date = date.fromisoformat(
-        str(metrics[0]["metadata"]["common_effective_date"])
-    )
+    candidate_date = date.fromisoformat(str(metrics[0]["metadata"]["common_effective_date"]))
     latest_snapshot = _latest_fed_funds_snapshot()
-    if (
-        latest_snapshot is not None
-        and candidate_date
-        < _fed_funds_snapshot_effective_date(latest_snapshot)
+    if latest_snapshot is not None and candidate_date < _fed_funds_snapshot_effective_date(
+        latest_snapshot
     ):
         _mark_fed_funds_stale(
             states,
-            reason=(
-                "本批次最新共同有效日早于当前已发布快照，拒绝回退并继续"
-                "保留上一版完整数据。"
-            ),
+            reason=("本批次最新共同有效日早于当前已发布快照，拒绝回退并继续保留上一版完整数据。"),
         )
         return [], _fed_funds_stale_dashboard_keys()
     dashboards = publish_official_dashboards(
@@ -5222,21 +5146,15 @@ def _coordinate_fed_funds_dashboard(
     expected_batches = {str(item) for item in dataset_batches.values()}
     if (
         latest_snapshot is None
-        or set((latest_snapshot.data or {}).get("component_batches", []))
-        != expected_batches
+        or set((latest_snapshot.data or {}).get("component_batches", [])) != expected_batches
         or (latest_snapshot.data or {}).get("refresh_failure")
     ):
         _mark_fed_funds_stale(
             states,
-            reason=(
-                "Fed Funds 发布后置条件未满足，继续保留上一版完整快照并"
-                "等待下一次双源刷新。"
-            ),
+            reason=("Fed Funds 发布后置条件未满足，继续保留上一版完整快照并等待下一次双源刷新。"),
         )
         return [], _fed_funds_stale_dashboard_keys()
-    rates_dashboards, rates_stale = (
-        _rebuild_treasury_rates_parent_from_latest_components()
-    )
+    rates_dashboards, rates_stale = _rebuild_treasury_rates_parent_from_latest_components()
     return [*dashboards, *rates_dashboards], rates_stale
 
 
@@ -5263,13 +5181,13 @@ def _economy_component_state(
         "status": status,
         "reason": reason[:320],
         "snapshot_id": snapshot.pk if snapshot is not None else None,
-        "publication_batch_id": (
-            str(snapshot.batch_id) if snapshot is not None else None
-        ),
-        "snapshot_quality_status": (
-            snapshot.quality_status if snapshot is not None else None
-        ),
+        "publication_batch_id": (str(snapshot.batch_id) if snapshot is not None else None),
+        "snapshot_quality_status": (snapshot.quality_status if snapshot is not None else None),
         "fingerprint": data.get("fingerprint"),
+        "payload_integrity_hash": data.get("payload_integrity_hash"),
+        "contract_version": data.get("contract_version"),
+        "formula_version": data.get("formula_version"),
+        "component_roles": deepcopy(data.get("component_roles")),
     }
 
 
@@ -5289,13 +5207,75 @@ def _economy_component_payload(
     *,
     now: datetime,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | dict[str, Any]:
-    snapshot = _latest_economy_component_snapshot(page_key)
+    snapshot = (
+        select_public_gdp_snapshot()
+        if page_key == "gdp"
+        else (
+            select_public_employment_snapshot()
+            if page_key == "employment"
+            else (
+                select_public_inflation_snapshot()
+                if page_key == "inflation"
+                else _latest_economy_component_snapshot(page_key)
+            )
+        )
+    )
     if snapshot is None:
+        latest = _latest_economy_component_snapshot(page_key)
         return _economy_component_state(
             page_key,
+            latest,
+            reason=(
+                f"{page_key} strict selector found no replayable current component"
+                if page_key in {"gdp", "employment", "inflation"} and latest is not None
+                else "latest published component snapshot is missing"
+            ),
+            status="invalid" if latest is not None else "missing",
+        )
+    if (
+        page_key == "gdp"
+        and getattr(
+            snapshot,
+            "gdp_publication_state",
             None,
-            reason="latest published component snapshot is missing",
-            status="missing",
+        )
+        != "current_candidate"
+    ):
+        return _economy_component_state(
+            page_key,
+            snapshot,
+            reason="GDP strict child is not in current_candidate state",
+            status=str(getattr(snapshot, "gdp_publication_state", "invalid")),
+        )
+    if (
+        page_key == "employment"
+        and getattr(
+            snapshot,
+            "employment_publication_state",
+            None,
+        )
+        != "current_candidate"
+    ):
+        return _economy_component_state(
+            page_key,
+            snapshot,
+            reason="Employment strict child is not in current_candidate state",
+            status=str(getattr(snapshot, "employment_publication_state", "invalid")),
+        )
+    if (
+        page_key == "inflation"
+        and getattr(
+            snapshot,
+            "inflation_publication_state",
+            None,
+        )
+        != "current_candidate"
+    ):
+        return _economy_component_state(
+            page_key,
+            snapshot,
+            reason="Inflation strict child is not in current_candidate state",
+            status=str(getattr(snapshot, "inflation_publication_state", "invalid")),
         )
     data = dict(snapshot.data or {})
     if snapshot.source.key == "demo-market" or data.get("demo") is not False:
@@ -5397,8 +5377,7 @@ def _economy_component_payload(
         )
     chart_rows = chart.get("data")
     if not isinstance(chart_rows, list) or any(
-        not isinstance(row, dict)
-        or _parse_payload_datetime(row.get("date")) is None
+        not isinstance(row, dict) or _parse_payload_datetime(row.get("date")) is None
         for row in chart_rows
     ):
         return _economy_component_state(
@@ -5407,9 +5386,7 @@ def _economy_component_payload(
             reason=f"required chart {chart_key} has a non-date observation axis",
         )
 
-    component_batches = {
-        str(item) for item in data.get("component_batches", []) if item
-    }
+    component_batches = {str(item) for item in data.get("component_batches", []) if item}
     metric_batches = _payload_batch_ids(metric)
     chart_batches = _payload_batch_ids(chart)
     if (
@@ -5427,22 +5404,21 @@ def _economy_component_payload(
     source_keys = _payload_source_keys([metric, chart])
     missing_current_batches = []
     selected_batches = metric_batches | chart_batches
-    for source_key in sorted(source_keys - {"internal"}):
-        latest_successful_batch = _latest_successful_source_batch(source_key)
-        if (
-            latest_successful_batch is not None
-            and str(latest_successful_batch) not in selected_batches
-        ):
-            missing_current_batches.append(
-                {
-                    "source": source_key,
-                    "latest_batch_id": str(latest_successful_batch),
-                }
-            )
+    if page_key not in {"employment", "inflation"}:
+        for source_key in sorted(source_keys - {"internal"}):
+            latest_successful_batch = _latest_successful_source_batch(source_key)
+            if (
+                latest_successful_batch is not None
+                and str(latest_successful_batch) not in selected_batches
+            ):
+                missing_current_batches.append(
+                    {
+                        "source": source_key,
+                        "latest_batch_id": str(latest_successful_batch),
+                    }
+                )
     if missing_current_batches:
-        missing_sources = ", ".join(
-            item["source"] for item in missing_current_batches
-        )
+        missing_sources = ", ".join(item["source"] for item in missing_current_batches)
         return _economy_component_state(
             page_key,
             snapshot,
@@ -5477,9 +5453,7 @@ def _economy_component_payload(
             and state.get("status") != IngestionRun.Status.SUCCESS
         ]
         if failed_relevant_sources:
-            failed_names = ", ".join(
-                str(item.get("source")) for item in failed_relevant_sources
-            )
+            failed_names = ", ".join(str(item.get("source")) for item in failed_relevant_sources)
             return _economy_component_state(
                 page_key,
                 snapshot,
@@ -5487,10 +5461,14 @@ def _economy_component_payload(
                 status=Observation.Quality.STALE,
             )
 
-    metric_snapshot = MetricSnapshot.objects.filter(
-        key=f"{page_key}-{metric_key}",
-        batch_id=snapshot.batch_id,
-    ).select_related("source", "fallback_source").first()
+    metric_snapshot = (
+        MetricSnapshot.objects.filter(
+            key=f"{page_key}-{metric_key}",
+            batch_id=snapshot.batch_id,
+        )
+        .select_related("source", "fallback_source")
+        .first()
+    )
     if metric_snapshot is None:
         return _economy_component_state(
             page_key,
@@ -5504,24 +5482,18 @@ def _economy_component_payload(
             reason="selected normalized metric has no numeric value",
         )
     try:
-        payload_value = Decimal(str(metric["value"])).quantize(
-            Decimal("0.00000001")
-        )
+        payload_value = Decimal(str(metric["value"])).quantize(Decimal("0.00000001"))
     except (ArithmeticError, TypeError, ValueError):
         return _economy_component_state(
             page_key,
             snapshot,
             reason="selected metric value is not a valid decimal",
         )
-    metric_value_date = _parse_payload_datetime(
-        metric.get("value_date") or metric.get("as_of")
-    )
+    metric_value_date = _parse_payload_datetime(metric.get("value_date") or metric.get("as_of"))
     metric_as_of = _parse_payload_datetime(metric.get("as_of"))
     metric_fetched_at = _parse_payload_datetime(metric.get("fetched_at"))
     fallback_key = (
-        metric_snapshot.fallback_source.key
-        if metric_snapshot.fallback_source_id
-        else None
+        metric_snapshot.fallback_source.key if metric_snapshot.fallback_source_id else None
     )
     if any(
         (
@@ -5557,15 +5529,9 @@ def _economy_component_payload(
     )
     normalized_metric_sources = {
         metric_snapshot.source.key,
-        *(
-            [metric_snapshot.fallback_source.key]
-            if metric_snapshot.fallback_source_id
-            else []
-        ),
+        *([metric_snapshot.fallback_source.key] if metric_snapshot.fallback_source_id else []),
     }
-    normalized_metric_sources.update(
-        _payload_source_keys(metric_snapshot.metadata)
-    )
+    normalized_metric_sources.update(_payload_source_keys(metric_snapshot.metadata))
     if (
         metric_batches != normalized_metric_batches
         or _payload_source_keys(metric) != normalized_metric_sources
@@ -5589,6 +5555,10 @@ def _economy_component_payload(
             "component_snapshot_id": snapshot.pk,
             "component_publication_batch_id": str(snapshot.batch_id),
             "component_fingerprint": fingerprint,
+            "component_payload_integrity_hash": data.get("payload_integrity_hash"),
+            "component_contract_version": data.get("contract_version"),
+            "component_formula_version": data.get("formula_version"),
+            "component_roles": deepcopy(data.get("component_roles")),
             "component_metric_snapshot_id": metric_snapshot.pk,
             "component_metric_snapshot_key": metric_snapshot.key,
             "component_metric_snapshot_batch_id": str(metric_snapshot.batch_id),
@@ -5606,14 +5576,29 @@ def _economy_component_payload(
             "component_snapshot_id": snapshot.pk,
             "component_publication_batch_id": str(snapshot.batch_id),
             "component_fingerprint": fingerprint,
+            "component_payload_integrity_hash": data.get("payload_integrity_hash"),
+            "component_contract_version": data.get("contract_version"),
+            "component_formula_version": data.get("formula_version"),
+            "component_roles": deepcopy(data.get("component_roles")),
         }
     )
+    input_runs = data.get("input_runs")
+    source_roles = {
+        str(item.get("role")): str(item.get("source_key"))
+        for item in input_runs
+        if isinstance(item, dict) and item.get("role") and item.get("source_key")
+    } if isinstance(input_runs, list) else {}
     component_reference = {
         "page_key": page_key,
         "snapshot_id": snapshot.pk,
         "snapshot_batch_id": str(snapshot.batch_id),
         "publication_batch_id": str(snapshot.batch_id),
         "fingerprint": fingerprint,
+        "payload_integrity_hash": data.get("payload_integrity_hash"),
+        "contract_version": data.get("contract_version"),
+        "formula_version": data.get("formula_version"),
+        "component_roles": deepcopy(data.get("component_roles")),
+        "source_roles": source_roles,
         "snapshot_quality_status": snapshot.quality_status,
         "selected_metric_key": metric_key,
         "selected_chart_key": chart_key,
@@ -5685,9 +5670,7 @@ def _latest_economy_snapshot() -> DashboardSnapshot | None:
     )
 
 
-def _mark_economy_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_economy_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -5709,11 +5692,7 @@ def _mark_economy_stale(
         )
         for item in components
     )
-    public_reason = (
-        f"{reason} 失败组件：{component_summary}"
-        if component_summary
-        else reason
-    )
+    public_reason = f"{reason} 失败组件：{component_summary}" if component_summary else reason
     data = dict(latest.data or {})
     data["refresh_failure"] = {
         "checked_at": timezone.now().isoformat(),
@@ -5726,24 +5705,17 @@ def _mark_economy_stale(
 
 
 @transaction.atomic
-def _coordinate_economy_dashboard() -> tuple[
-    list[DashboardSnapshot], set[str]
-]:
+def _coordinate_economy_dashboard() -> tuple[list[DashboardSnapshot], set[str]]:
     internal = ensure_source("internal")
     Source.objects.select_for_update().get(pk=internal.pk)
     prepared_data, failures = _economy_page_data()
     if prepared_data is None:
         _mark_economy_stale(
             failures,
-            reason=(
-                "四个必需经济组件未形成完整、有效且许可可公开的组合；"
-                "继续保留上一版完整总览。"
-            ),
+            reason=("四个必需经济组件未形成完整、有效且许可可公开的组合；继续保留上一版完整总览。"),
         )
         return [], {"economy"}
-    expected_chart_keys = {
-        component["chart_key"] for component in ECONOMY_COMPONENTS.values()
-    }
+    expected_chart_keys = {component["chart_key"] for component in ECONOMY_COMPONENTS.values()}
     previous = _latest_economy_snapshot()
     try:
         with transaction.atomic():
@@ -5754,21 +5726,13 @@ def _coordinate_economy_dashboard() -> tuple[
             latest = _latest_economy_snapshot()
             postcondition_failed = (
                 latest is None
-                or {
-                    str(item.get("key") or "")
-                    for item in (latest.data or {}).get("metrics", [])
-                }
+                or {str(item.get("key") or "") for item in (latest.data or {}).get("metrics", [])}
                 != set(ECONOMY_REQUIRED_METRIC_KEYS)
-                or {
-                    str(item.get("key") or "")
-                    for item in (latest.data or {}).get("charts", [])
-                }
+                or {str(item.get("key") or "") for item in (latest.data or {}).get("charts", [])}
                 != expected_chart_keys
                 or {
                     str(item.get("page_key") or "")
-                    for item in (latest.data or {}).get(
-                        "component_snapshots", []
-                    )
+                    for item in (latest.data or {}).get("component_snapshots", [])
                 }
                 != set(ECONOMY_COMPONENTS)
                 or (latest.data or {}).get("refresh_failure")
@@ -5784,10 +5748,7 @@ def _coordinate_economy_dashboard() -> tuple[
                     reason="publication postcondition failed",
                 )
             ],
-            reason=(
-                "经济总览发布后置条件未满足；继续保留快照并等待下一次"
-                "完整组件协调。"
-            ),
+            reason=("经济总览发布后置条件未满足；继续保留快照并等待下一次完整组件协调。"),
         )
         return [], {"economy"}
     return dashboards, set()
@@ -5834,29 +5795,19 @@ def _reserves_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            resolved_reason or "required exact dataset attempt is missing"
-        )[:320],
+        "reason": (resolved_reason or "required exact dataset attempt is missing")[:320],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
-        "refresh_id": (
-            str((run.metadata or {}).get("reserves_refresh_id") or "")
-            if run
-            else ""
-        ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "refresh_id": (str((run.metadata or {}).get("reserves_refresh_id") or "") if run else ""),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
 def _select_reserves_runs(
     trigger_runs: Iterable[IngestionRun],
 ) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
-    relevant: dict[str, list[IngestionRun]] = {
-        identity: [] for identity in RESERVES_DATASETS
-    }
+    relevant: dict[str, list[IngestionRun]] = {identity: [] for identity in RESERVES_DATASETS}
     for run in trigger_runs:
         identity = _reserves_run_identity(run)
         if identity:
@@ -5864,14 +5815,8 @@ def _select_reserves_runs(
     if not any(relevant.values()):
         return None, [], False
 
-    selected = {
-        identity: _latest_reserves_attempt(identity)
-        for identity in RESERVES_DATASETS
-    }
-    states = [
-        _reserves_run_state(identity, selected[identity])
-        for identity in RESERVES_DATASETS
-    ]
+    selected = {identity: _latest_reserves_attempt(identity) for identity in RESERVES_DATASETS}
+    states = [_reserves_run_state(identity, selected[identity]) for identity in RESERVES_DATASETS]
     for identity, trigger_group in relevant.items():
         if not trigger_group:
             continue
@@ -5895,9 +5840,7 @@ def _select_reserves_runs(
             # replay is not a new refresh failure and must not rewrite the snapshot.
             return None, [], False
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in selected.values()
     ):
         return None, states, True
@@ -5929,9 +5872,7 @@ def _reserves_unit_multiplier(observation: Observation) -> Decimal | None:
     raw_multiplier = (observation.metadata or {}).get("unit_multiplier")
     if raw_multiplier in (None, ""):
         raw_multiplier = (
-            "1000000"
-            if observation.series.key == RESERVES_SERIES["h41"]
-            else "1000000"
+            "1000000" if observation.series.key == RESERVES_SERIES["h41"] else "1000000"
         )
     try:
         multiplier = Decimal(str(raw_multiplier))
@@ -5975,8 +5916,7 @@ def _reserves_release_deadline(
     if (
         identity == "h41"
         and enforce_release_lag
-        and (released_at.date() - observation.value_date.date()).days
-        > H41_MAX_RELEASE_LAG_DAYS
+        and (released_at.date() - observation.value_date.date()).days > H41_MAX_RELEASE_LAG_DAYS
     ):
         return None
     return released_at + timedelta(days=freshness_days)
@@ -5998,15 +5938,10 @@ def _reserves_input_lineage(
         source_status_label = (observation.metadata or {}).get("h8_status_label")
     return {
         "series_key": observation.series.key,
-        "source_series_id": str(
-            (observation.metadata or {}).get("board_series_id") or ""
-        ),
+        "source_series_id": str((observation.metadata or {}).get("board_series_id") or ""),
         "dataset": dataset,
         "value": str(observation.value),
-        "raw_value": str(
-            (observation.metadata or {}).get("raw_value")
-            or observation.value
-        ),
+        "raw_value": str((observation.metadata or {}).get("raw_value") or observation.value),
         "value_usd_tn": str(value_usd_tn) if value_usd_tn is not None else None,
         "unit_multiplier": str(multiplier) if multiplier is not None else None,
         "source_status": source_status,
@@ -6017,9 +5952,7 @@ def _reserves_input_lineage(
         "license_scope": license_scope
         or (
             licence.scope
-            if (licence := _effective_source_license(
-                observation.source, require_public=True
-            ))
+            if (licence := _effective_source_license(observation.source, require_public=True))
             else ""
         ),
         "value_date": observation.value_date.isoformat(),
@@ -6027,18 +5960,12 @@ def _reserves_input_lineage(
         "fetched_at": observation.fetched_at.isoformat(),
         "fresh_until": page_fresh_until.isoformat(),
         "observation_period_fresh_until": _fresh_until(observation).isoformat(),
-        "source_release_time": (observation.metadata or {}).get(
-            "source_release_time"
-        ),
-        "release_freshness_days": (observation.metadata or {}).get(
-            "release_freshness_days"
-        ),
+        "source_release_time": (observation.metadata or {}).get("source_release_time"),
+        "release_freshness_days": (observation.metadata or {}).get("release_freshness_days"),
         "batch_id": str(observation.batch_id),
         "quality_status": observation.quality_status,
         "fallback_source": (
-            observation.fallback_source.key
-            if observation.fallback_source_id
-            else None
+            observation.fallback_source.key if observation.fallback_source_id else None
         ),
     }
 
@@ -6081,11 +6008,7 @@ def _reserves_internal_lineage(
     source_keys = sorted(
         {
             "internal",
-            *(
-                source_key
-                for item in all_inputs
-                for source_key in item.get("source_keys", [])
-            ),
+            *(source_key for item in all_inputs for source_key in item.get("source_keys", [])),
         }
     )
     internal = ensure_source("internal")
@@ -6199,11 +6122,7 @@ def _reserves_derived_metric(
     source_keys = sorted(
         {
             "internal",
-            *(
-                source_key
-                for item in all_inputs
-                for source_key in item.get("source_keys", [])
-            ),
+            *(source_key for item in all_inputs for source_key in item.get("source_keys", [])),
         }
     )
     current_date_value = datetime.combine(current_date, time.min, tzinfo=UTC)
@@ -6215,9 +6134,7 @@ def _reserves_derived_metric(
         "key": key,
         "label": label,
         "value": float(value),
-        "display_value": (
-            f"{value:,.3f}%" if unit == "%" else f"{value:,.3f} {unit}"
-        ),
+        "display_value": (f"{value:,.3f}%" if unit == "%" else f"{value:,.3f} {unit}"),
         "change": None,
         "change_unit": unit,
         "unit": unit,
@@ -6246,9 +6163,7 @@ def _reserves_derived_metric(
             "calculation_owner": "Atlas Macro",
             "input_series": sorted({str(item["series_key"]) for item in all_inputs}),
             "input_batch_ids": batch_ids,
-            "input_value_dates": sorted(
-                {str(item["value_date"]) for item in all_inputs}
-            ),
+            "input_value_dates": sorted({str(item["value_date"]) for item in all_inputs}),
             "input_lineage": current_inputs,
             "previous_input_lineage": previous_inputs or [],
             "coverage_proxy": (
@@ -6317,17 +6232,13 @@ def _reserves_page_data(
     now = timezone.now()
     today_et = now.astimezone(ZoneInfo("America/New_York")).date()
     expected_batches = {
-        identity: str(selected_runs[identity].batch_id)
-        for identity in RESERVES_DATASETS
+        identity: str(selected_runs[identity].batch_id) for identity in RESERVES_DATASETS
     }
     for identity, run in selected_runs.items():
-        run_fetched_at = _parse_payload_datetime(
-            (run.metadata or {}).get("fetched_at")
-        )
+        run_fetched_at = _parse_payload_datetime((run.metadata or {}).get("fetched_at"))
         verifiable_run_times = [run.started_at, run.completed_at, run_fetched_at]
         if run_fetched_at is None or any(
-            candidate is not None and candidate > now
-            for candidate in verifiable_run_times
+            candidate is not None and candidate > now for candidate in verifiable_run_times
         ):
             return None, [
                 _reserves_failure(
@@ -6395,10 +6306,7 @@ def _reserves_page_data(
     public_sources, derived_sources = current_display_source_key_sets(
         {"federal-reserve", "internal"}
     )
-    if (
-        public_sources != {"federal-reserve", "internal"}
-        or derived_sources != public_sources
-    ):
+    if public_sources != {"federal-reserve", "internal"} or derived_sources != public_sources:
         return None, [
             _reserves_failure(
                 "licence",
@@ -6457,9 +6365,7 @@ def _reserves_page_data(
             )
         ]
     page_fresh_until = min(
-        deadline
-        for deadline in common_date_deadlines.values()
-        if deadline is not None
+        deadline for deadline in common_date_deadlines.values() if deadline is not None
     )
     displayed_dates = common_dates[-RESERVES_HISTORY_POINTS:]
     for period in displayed_dates:
@@ -6478,9 +6384,7 @@ def _reserves_page_data(
                 or _reserves_value_usd_tn(item) is None
                 or historical_deadline is None
                 or (
-                    (item.metadata or {}).get(
-                        "h41_status" if identity == "h41" else "h8_status"
-                    )
+                    (item.metadata or {}).get("h41_status" if identity == "h41" else "h8_status")
                     not in {None, "", "A"}
                 )
             ):
@@ -6507,9 +6411,7 @@ def _reserves_page_data(
         ratio = _reserves_ratio_from_lineage(inputs)
         if ratio is None:
             return None, [
-                _reserves_failure(
-                    "ratio", f"ratio is not calculable for {period.isoformat()}"
-                )
+                _reserves_failure("ratio", f"ratio is not calculable for {period.isoformat()}")
             ]
         direct_lineage[period] = inputs
         ratios[period] = ratio
@@ -6541,9 +6443,7 @@ def _reserves_page_data(
         ]
     sample_floor = current_date - relativedelta(years=3)
     sample = [
-        item
-        for item in changes
-        if date.fromisoformat(str(item["value_date"])) >= sample_floor
+        item for item in changes if date.fromisoformat(str(item["value_date"])) >= sample_floor
     ][-RESERVES_ZSCORE_MAX_SAMPLES:]
     if len(sample) < RESERVES_ZSCORE_MIN_SAMPLES:
         return None, [
@@ -6631,10 +6531,7 @@ def _reserves_page_data(
                 current_inputs=current_inputs,
                 previous_inputs=lagged_inputs,
                 page_fresh_until=page_fresh_until,
-                formula=(
-                    "(current_8w_change_pp - population_mean_pp) "
-                    "/ population_std_pp"
-                ),
+                formula=("(current_8w_change_pp - population_mean_pp) / population_std_pp"),
                 extra_metadata={
                     "sample_window": RESERVES_ZSCORE_SAMPLE_WINDOW,
                     "lag_calendar_days": RESERVES_CHANGE_LAG.days,
@@ -6659,12 +6556,8 @@ def _reserves_page_data(
         level_rows.append(
             {
                 "date": period.isoformat(),
-                "Reserve balances": float(
-                    _reserves_value_usd_tn(observations["h41"][period])
-                ),
-                "Commercial bank assets": float(
-                    _reserves_value_usd_tn(observations["h8"][period])
-                ),
+                "Reserve balances": float(_reserves_value_usd_tn(observations["h41"][period])),
+                "Commercial bank assets": float(_reserves_value_usd_tn(observations["h8"][period])),
                 "_source_keys": ["federal-reserve"],
                 "_lineage": {
                     "Reserve balances": reserve_lineage,
@@ -6705,9 +6598,7 @@ def _reserves_page_data(
     level_chart = _lineage_chart(
         key="reserves-assets-history",
         title="准备金与商业银行资产",
-        description=(
-            "两个官方周度序列只在共同周三对齐，统一换算为 USD tn。"
-        ),
+        description=("两个官方周度序列只在共同周三对齐，统一换算为 USD tn。"),
         rows=level_rows,
         fields=("Reserve balances", "Commercial bank assets"),
         tab="levels",
@@ -6718,8 +6609,7 @@ def _reserves_page_data(
         key="reserve-ratio-history",
         title="覆盖近似比率与 8 周变化",
         description=(
-            "准备金余额（所有存款机构）/美国商业银行总资产的"
-            "覆盖近似；不是 Fed 官方指标或监管结论。"
+            "准备金余额（所有存款机构）/美国商业银行总资产的覆盖近似；不是 Fed 官方指标或监管结论。"
         ),
         rows=ratio_rows,
         fields=("Coverage proxy ratio", "8-week change"),
@@ -6798,8 +6688,7 @@ def _reserves_page_data(
             "fallback_source": None,
             "as_of": observations["h41"][recent_reserve_periods[-1]].as_of.isoformat(),
             "fetched_at": max(
-                observations["h41"][period].fetched_at
-                for period in recent_reserve_periods
+                observations["h41"][period].fetched_at for period in recent_reserve_periods
             ).isoformat(),
             "fresh_until": page_fresh_until.isoformat(),
             "batch_id": expected_batches["h41"],
@@ -6850,9 +6739,7 @@ def _reserves_page_data(
         metrics, [level_chart, ratio_chart], extra_data, sections=sections
     ):
         return None, [
-            _reserves_failure(
-                "reserves", "prepared page failed the reserves v1 contract validator"
-            )
+            _reserves_failure("reserves", "prepared page failed the reserves v1 contract validator")
         ]
     return prepared, []
 
@@ -6868,15 +6755,9 @@ def _reserves_page_contract_is_buildable(
 
     if extra_data.get("contract_version") != RESERVES_CONTRACT_VERSION:
         return False
-    resolved_sections = (
-        sections
-        if sections is not None
-        else list(extra_data.get("sections") or [])
-    )
+    resolved_sections = sections if sections is not None else list(extra_data.get("sections") or [])
     sections_by_key = {
-        str(item.get("key") or ""): item
-        for item in resolved_sections
-        if isinstance(item, dict)
+        str(item.get("key") or ""): item for item in resolved_sections if isinstance(item, dict)
     }
     section_keys = set(sections_by_key)
     if section_keys not in (
@@ -6888,16 +6769,8 @@ def _reserves_page_contract_is_buildable(
         },
     ):
         return False
-    metric_by_key = {
-        str(item.get("key") or ""): item
-        for item in metrics
-        if isinstance(item, dict)
-    }
-    chart_by_key = {
-        str(item.get("key") or ""): item
-        for item in charts
-        if isinstance(item, dict)
-    }
+    metric_by_key = {str(item.get("key") or ""): item for item in metrics if isinstance(item, dict)}
+    chart_by_key = {str(item.get("key") or ""): item for item in charts if isinstance(item, dict)}
     if set(metric_by_key) != set(RESERVES_REQUIRED_METRIC_KEYS):
         return False
     if set(chart_by_key) != set(RESERVES_REQUIRED_CHART_KEYS):
@@ -6906,15 +6779,11 @@ def _reserves_page_contract_is_buildable(
     if not isinstance(input_datasets, list) or len(input_datasets) != 2:
         return False
     inputs_by_component = {
-        str(item.get("component") or ""): item
-        for item in input_datasets
-        if isinstance(item, dict)
+        str(item.get("component") or ""): item for item in input_datasets if isinstance(item, dict)
     }
     if set(inputs_by_component) != set(RESERVES_DATASETS):
         return False
-    expected_batches = {
-        str(item.get("batch_id") or "") for item in input_datasets
-    }
+    expected_batches = {str(item.get("batch_id") or "") for item in input_datasets}
     if "" in expected_batches or len(expected_batches) != 2:
         return False
     for identity, item in inputs_by_component.items():
@@ -6932,8 +6801,7 @@ def _reserves_page_contract_is_buildable(
         for item in component_runs
         if isinstance(item, dict)
     } != {
-        (identity, str(inputs_by_component[identity]["batch_id"]))
-        for identity in RESERVES_DATASETS
+        (identity, str(inputs_by_component[identity]["batch_id"])) for identity in RESERVES_DATASETS
     }:
         return False
     if any(
@@ -6951,8 +6819,7 @@ def _reserves_page_contract_is_buildable(
     validation_now = timezone.now()
     if (
         parsed_common_date.weekday() != 2
-        or parsed_common_date
-        > validation_now.astimezone(ZoneInfo("America/New_York")).date()
+        or parsed_common_date > validation_now.astimezone(ZoneInfo("America/New_York")).date()
     ):
         return False
 
@@ -6998,21 +6865,13 @@ def _reserves_page_contract_is_buildable(
             return False
         fetched_at = _parse_payload_datetime(item.get("fetched_at"))
         value_date = _parse_payload_datetime(item.get("value_date"))
-        source_release_time = _parse_payload_datetime(
-            item.get("source_release_time")
-        )
-        observation_deadline = _parse_payload_datetime(
-            item.get("observation_period_fresh_until")
-        )
+        source_release_time = _parse_payload_datetime(item.get("source_release_time"))
+        observation_deadline = _parse_payload_datetime(item.get("observation_period_fresh_until"))
         freshness_days = (
-            H41_RELEASE_FRESHNESS_DAYS
-            if component == "h41"
-            else H8_RELEASE_FRESHNESS_DAYS
+            H41_RELEASE_FRESHNESS_DAYS if component == "h41" else H8_RELEASE_FRESHNESS_DAYS
         )
         future_tolerance = (
-            H41_RELEASE_FUTURE_TOLERANCE
-            if component == "h41"
-            else H8_RELEASE_FUTURE_TOLERANCE
+            H41_RELEASE_FUTURE_TOLERANCE if component == "h41" else H8_RELEASE_FUTURE_TOLERANCE
         )
         return bool(
             item.get("source_key") == "federal-reserve"
@@ -7028,8 +6887,7 @@ def _reserves_page_contract_is_buildable(
             and source_release_time.date() >= value_date.date()
             and source_release_time <= fetched_at + future_tolerance
             and item.get("release_freshness_days") == freshness_days
-            and observation_deadline
-            == source_release_time + timedelta(days=freshness_days)
+            and observation_deadline == source_release_time + timedelta(days=freshness_days)
             and _parse_payload_datetime(item.get("fresh_until")) is not None
             and item.get("quality_status") == Observation.Quality.FRESH
             and item.get("fallback_source") is None
@@ -7060,9 +6918,7 @@ def _reserves_page_contract_is_buildable(
         if not safe_pair(lineage):
             return None
         raw_dates = {
-            str(item.get("value_date") or "")[:10]
-            for item in lineage
-            if isinstance(item, dict)
+            str(item.get("value_date") or "")[:10] for item in lineage if isinstance(item, dict)
         }
         if len(raw_dates) != 1:
             return None
@@ -7105,9 +6961,7 @@ def _reserves_page_contract_is_buildable(
             or not same(metric.get("value"), lineage[0].get("value_usd_tn"))
             or not isinstance(previous_lineage, list)
             or len(previous_lineage) != 1
-            or not safe_direct_lineage(
-                previous_lineage[0], expected_series=series_key
-            )
+            or not safe_direct_lineage(previous_lineage[0], expected_series=series_key)
             or str(metadata.get("previous_value_date") or "")
             != str(previous_lineage[0].get("value_date") or "")
             or not same(
@@ -7119,8 +6973,7 @@ def _reserves_page_contract_is_buildable(
                 Decimal(str(lineage[0]["value_usd_tn"]))
                 - Decimal(str(previous_lineage[0]["value_usd_tn"])),
             )
-            or set(metadata.get("input_batch_ids") or [])
-            != {str(lineage[0]["batch_id"])}
+            or set(metadata.get("input_batch_ids") or []) != {str(lineage[0]["batch_id"])}
         ):
             return False
 
@@ -7128,9 +6981,7 @@ def _reserves_page_contract_is_buildable(
     ratio_metadata = ratio_metric.get("metadata") or {}
     ratio_inputs = ratio_metadata.get("input_lineage")
     recomputed_ratio = (
-        _reserves_ratio_from_lineage(ratio_inputs)
-        if isinstance(ratio_inputs, list)
-        else None
+        _reserves_ratio_from_lineage(ratio_inputs) if isinstance(ratio_inputs, list) else None
     )
     if (
         ratio_metric.get("source_key") != "internal"
@@ -7147,27 +6998,19 @@ def _reserves_page_contract_is_buildable(
     change_current = change_metadata.get("input_lineage")
     change_previous = change_metadata.get("previous_input_lineage")
     current_ratio = (
-        _reserves_ratio_from_lineage(change_current)
-        if isinstance(change_current, list)
-        else None
+        _reserves_ratio_from_lineage(change_current) if isinstance(change_current, list) else None
     )
     previous_ratio = (
-        _reserves_ratio_from_lineage(change_previous)
-        if isinstance(change_previous, list)
-        else None
+        _reserves_ratio_from_lineage(change_previous) if isinstance(change_previous, list) else None
     )
     expected_lagged_date = parsed_common_date - RESERVES_CHANGE_LAG
     if (
         change_metric.get("source_key") != "internal"
         or change_metadata.get("formula") != RESERVES_CHANGE_FORMULA
-        or change_metadata.get("sample_window")
-        != RESERVES_CHANGE_SAMPLE_WINDOW
-        or change_metadata.get("lag_calendar_days")
-        != RESERVES_CHANGE_LAG.days
+        or change_metadata.get("sample_window") != RESERVES_CHANGE_SAMPLE_WINDOW
+        or change_metadata.get("lag_calendar_days") != RESERVES_CHANGE_LAG.days
         or not safe_pair(change_current, expected_date=common_date)
-        or not safe_pair(
-            change_previous, expected_date=expected_lagged_date.isoformat()
-        )
+        or not safe_pair(change_previous, expected_date=expected_lagged_date.isoformat())
         or pair_date(change_current) != parsed_common_date
         or pair_date(change_previous) != expected_lagged_date
         or str(change_metadata.get("previous_value_date") or "")[:10]
@@ -7188,24 +7031,16 @@ def _reserves_page_contract_is_buildable(
         or zscore_metadata.get("formula")
         != "(current_8w_change_pp - population_mean_pp) / population_std_pp"
         or zscore_metadata.get("population_standard_deviation") is not True
-        or zscore_metadata.get("sample_window")
-        != RESERVES_ZSCORE_SAMPLE_WINDOW
-        or zscore_metadata.get("lag_calendar_days")
-        != RESERVES_CHANGE_LAG.days
-        or zscore_metadata.get("minimum_sample_count")
-        != RESERVES_ZSCORE_MIN_SAMPLES
-        or zscore_metadata.get("maximum_sample_count")
-        != RESERVES_ZSCORE_MAX_SAMPLES
+        or zscore_metadata.get("sample_window") != RESERVES_ZSCORE_SAMPLE_WINDOW
+        or zscore_metadata.get("lag_calendar_days") != RESERVES_CHANGE_LAG.days
+        or zscore_metadata.get("minimum_sample_count") != RESERVES_ZSCORE_MIN_SAMPLES
+        or zscore_metadata.get("maximum_sample_count") != RESERVES_ZSCORE_MAX_SAMPLES
         or not safe_pair(zscore_current, expected_date=common_date)
-        or not safe_pair(
-            zscore_previous, expected_date=expected_lagged_date.isoformat()
-        )
+        or not safe_pair(zscore_previous, expected_date=expected_lagged_date.isoformat())
         or pair_date(zscore_current) != parsed_common_date
         or pair_date(zscore_previous) != expected_lagged_date
         or not isinstance(sample, list)
-        or not RESERVES_ZSCORE_MIN_SAMPLES
-        <= len(sample)
-        <= RESERVES_ZSCORE_MAX_SAMPLES
+        or not RESERVES_ZSCORE_MIN_SAMPLES <= len(sample) <= RESERVES_ZSCORE_MAX_SAMPLES
         or zscore_metadata.get("sample_count") != len(sample)
     ):
         return False
@@ -7229,9 +7064,8 @@ def _reserves_page_contract_is_buildable(
             return False
         item_current = item.get("current_input_lineage")
         item_previous = item.get("previous_input_lineage")
-        if (
-            not safe_pair(item_current, expected_date=item_date)
-            or not safe_pair(item_previous, expected_date=lagged_date)
+        if not safe_pair(item_current, expected_date=item_date) or not safe_pair(
+            item_previous, expected_date=lagged_date
         ):
             return False
         item_current_ratio = _reserves_ratio_from_lineage(item_current)
@@ -7283,14 +7117,14 @@ def _reserves_page_contract_is_buildable(
         ):
             return False
         recent_dates = [str(row.get("label") or "") for row in recent_rows]
-        if recent_dates != sorted(recent_dates) or len(recent_dates) != len(
-            set(recent_dates)
-        ):
+        if recent_dates != sorted(recent_dates) or len(recent_dates) != len(set(recent_dates)):
             return False
         for row in recent_rows:
             row_metadata = row.get("metadata") or {}
             row_lineage = row_metadata.get("input_lineage")
-            lineage = row_lineage[0] if isinstance(row_lineage, list) and len(row_lineage) == 1 else None
+            lineage = (
+                row_lineage[0] if isinstance(row_lineage, list) and len(row_lineage) == 1 else None
+            )
             if (
                 str(row.get("value_date") or "")[:10] != row.get("label")
                 or row.get("source_key") != "federal-reserve"
@@ -7361,26 +7195,20 @@ def _reserves_page_contract_is_buildable(
 
     ratio_rows = chart_by_key["reserve-ratio-history"]["data"]
     ratio_row_dates = [str(row.get("date") or "") for row in ratio_rows]
-    if (
-        ratio_row_dates != sorted(ratio_row_dates)
-        or len(ratio_row_dates) != len(set(ratio_row_dates))
+    if ratio_row_dates != sorted(ratio_row_dates) or len(ratio_row_dates) != len(
+        set(ratio_row_dates)
     ):
         return False
     for row in ratio_rows:
         row_date = str(row.get("date") or "")
         lineage = row.get("_lineage") or {}
         ratio_lineage = lineage.get("Coverage proxy ratio") or {}
-        ratio_value = _reserves_ratio_from_lineage(
-            ratio_lineage.get("input_lineage") or []
-        )
+        ratio_value = _reserves_ratio_from_lineage(ratio_lineage.get("input_lineage") or [])
         if (
             "Coverage proxy ratio" not in row
             or ratio_lineage.get("source_key") != "internal"
-            or ratio_lineage.get("formula")
-            != "100 * WRBWFRBL / H8-B1151NCBA"
-            or not safe_pair(
-                ratio_lineage.get("input_lineage"), expected_date=row_date
-            )
+            or ratio_lineage.get("formula") != "100 * WRBWFRBL / H8-B1151NCBA"
+            or not safe_pair(ratio_lineage.get("input_lineage"), expected_date=row_date)
             or ratio_value is None
             or not same(row["Coverage proxy ratio"], ratio_value)
         ):
@@ -7389,12 +7217,8 @@ def _reserves_page_contract_is_buildable(
             change_lineage = lineage.get("8-week change") or {}
             change_current_inputs = change_lineage.get("input_lineage")
             change_previous_inputs = change_lineage.get("previous_input_lineage")
-            change_current_ratio = _reserves_ratio_from_lineage(
-                change_current_inputs or []
-            )
-            change_previous_ratio = _reserves_ratio_from_lineage(
-                change_previous_inputs or []
-            )
+            change_current_ratio = _reserves_ratio_from_lineage(change_current_inputs or [])
+            change_previous_ratio = _reserves_ratio_from_lineage(change_previous_inputs or [])
             current_lineage_date = pair_date(change_current_inputs)
             lagged_lineage_date = pair_date(change_previous_inputs)
             try:
@@ -7405,8 +7229,7 @@ def _reserves_page_contract_is_buildable(
                 change_lineage.get("formula") != RESERVES_CHANGE_FORMULA
                 or not safe_pair(change_current_inputs, expected_date=row_date)
                 or current_lineage_date != parsed_row_date
-                or lagged_lineage_date
-                != parsed_row_date - RESERVES_CHANGE_LAG
+                or lagged_lineage_date != parsed_row_date - RESERVES_CHANGE_LAG
                 or change_current_ratio is None
                 or change_previous_ratio is None
                 or not same(
@@ -7437,9 +7260,7 @@ def reserves_snapshot_is_publicly_displayable(
     """Guard the public route without rejecting a retained stale v1 snapshot."""
 
     data = dict(snapshot.data or {})
-    component_batches = {
-        str(item) for item in data.get("component_batches", []) if item
-    }
+    component_batches = {str(item) for item in data.get("component_batches", []) if item}
     if (
         snapshot.key != "reserves"
         or not snapshot.is_published
@@ -7447,11 +7268,9 @@ def reserves_snapshot_is_publicly_displayable(
         or snapshot.source.key == "demo-market"
         or data.get("demo") is True
         or data.get("contract_version") != RESERVES_CONTRACT_VERSION
-        or str(data.get("publication_batch_id") or "")
-        != str(snapshot.batch_id)
+        or str(data.get("publication_batch_id") or "") != str(snapshot.batch_id)
         or len(component_batches) != 2
-        or set(data.get("source_keys") or [])
-        != {"federal-reserve", "internal"}
+        or set(data.get("source_keys") or []) != {"federal-reserve", "internal"}
         or not _reserves_page_contract_is_buildable(
             list(data.get("metrics") or []),
             list(data.get("charts") or []),
@@ -7469,10 +7288,7 @@ def reserves_snapshot_is_publicly_displayable(
     public_sources, derived_sources = current_display_source_key_sets(
         {"federal-reserve", "internal"}
     )
-    return (
-        public_sources == {"federal-reserve", "internal"}
-        and derived_sources == public_sources
-    )
+    return public_sources == {"federal-reserve", "internal"} and derived_sources == public_sources
 
 
 def select_public_reserves_snapshot(
@@ -7499,16 +7315,12 @@ def select_public_reserves_snapshot(
 
 def _reserves_snapshot_effective_date(snapshot: DashboardSnapshot) -> date:
     try:
-        return date.fromisoformat(
-            str((snapshot.data or {}).get("common_effective_date") or "")
-        )
+        return date.fromisoformat(str((snapshot.data or {}).get("common_effective_date") or ""))
     except ValueError:
         return snapshot.as_of.date()
 
 
-def _mark_reserves_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_reserves_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -7555,22 +7367,20 @@ def _normalize_rebuilt_dashboard_contract(
         list[dict[str, Any]],
         dict[str, Any],
     ],
-) -> tuple[
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    dict[str, Any],
-] | None:
+) -> (
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None
+):
     """Apply the generic publisher's licence normalization to rebuilt data."""
 
     rebuilt_metrics = deepcopy(prepared[0])
-    metric_source_keys = {
-        str(item.get("source_key") or "") for item in rebuilt_metrics
-    }
-    metric_sources = {
-        item.key: item
-        for item in Source.objects.filter(key__in=metric_source_keys)
-    }
+    metric_source_keys = {str(item.get("source_key") or "") for item in rebuilt_metrics}
+    metric_sources = {item.key: item for item in Source.objects.filter(key__in=metric_source_keys)}
     if set(metric_sources) != metric_source_keys or "" in metric_source_keys:
         return None
     metric_scopes: dict[str, str] = {}
@@ -7589,8 +7399,7 @@ def _normalize_rebuilt_dashboard_contract(
         )
         chart["source_keys"] = sorted(chart_source_keys)
         chart_sources = {
-            item.key: item
-            for item in Source.objects.filter(key__in=chart_source_keys)
+            item.key: item for item in Source.objects.filter(key__in=chart_source_keys)
         }
         if set(chart_sources) != chart_source_keys:
             return None
@@ -7601,12 +7410,9 @@ def _normalize_rebuilt_dashboard_contract(
                 return None
             chart_scopes[source_key] = licence.scope
         chart["license_scopes"] = [
-            f"{chart_sources[key].name}: {chart_scopes[key]}"
-            for key in sorted(chart_sources)
+            f"{chart_sources[key].name}: {chart_scopes[key]}" for key in sorted(chart_sources)
         ]
-        chart["fallback_sources"] = sorted(
-            _payload_fallback_source_keys(chart)
-        )
+        chart["fallback_sources"] = sorted(_payload_fallback_source_keys(chart))
     return rebuilt_metrics, rebuilt_charts, deepcopy(prepared[2]), deepcopy(prepared[3])
 
 
@@ -7619,23 +7425,16 @@ def _reserves_snapshot_contract_is_valid(
     allow_expired: bool = False,
 ) -> bool:
     data = dict(snapshot.data or {})
-    allow_expired = (
-        allow_expired or allow_natural_expiry or allow_retained_stale
-    )
-    expected_batches = {
-        str(selected_runs[identity].batch_id) for identity in RESERVES_DATASETS
-    }
+    allow_expired = allow_expired or allow_natural_expiry or allow_retained_stale
+    expected_batches = {str(selected_runs[identity].batch_id) for identity in RESERVES_DATASETS}
     if allow_retained_stale:
         valid_publication_state = bool(
             snapshot.quality_status == Observation.Quality.STALE
-            and _fed_balance_sheet_refresh_failure_is_valid(
-                data.get("refresh_failure")
-            )
+            and _fed_balance_sheet_refresh_failure_is_valid(data.get("refresh_failure"))
         )
     elif allow_natural_expiry:
         valid_publication_state = bool(
-            snapshot.quality_status
-            in {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+            snapshot.quality_status in {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
             and "refresh_failure" not in data
         )
     else:
@@ -7651,8 +7450,7 @@ def _reserves_snapshot_contract_is_valid(
         or data.get("contract_version") != RESERVES_CONTRACT_VERSION
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or set(data.get("component_batches") or []) != expected_batches
-        or set(data.get("source_keys") or [])
-        != {"federal-reserve", "internal"}
+        or set(data.get("source_keys") or []) != {"federal-reserve", "internal"}
         or not _reserves_page_contract_is_buildable(
             list(data.get("metrics") or []),
             list(data.get("charts") or []),
@@ -7661,14 +7459,9 @@ def _reserves_snapshot_contract_is_valid(
     ):
         return False
     fresh_until = _parse_payload_datetime(data.get("fresh_until"))
-    if (
-        fresh_until is None
-        or (fresh_until < timezone.now() and not allow_expired)
-    ):
+    if fresh_until is None or (fresh_until < timezone.now() and not allow_expired):
         return False
-    allowed, derived = current_display_source_key_sets(
-        {"federal-reserve", "internal"}
-    )
+    allowed, derived = current_display_source_key_sets({"federal-reserve", "internal"})
     if allowed != {"federal-reserve", "internal"} or derived != allowed:
         return False
     rebuilt, _failures = _reserves_page_data(
@@ -7680,9 +7473,7 @@ def _reserves_snapshot_contract_is_valid(
     normalized_rebuild = _normalize_rebuilt_dashboard_contract(rebuilt)
     if normalized_rebuild is None:
         return False
-    rebuilt_metrics, rebuilt_charts, rebuilt_sections, rebuilt_extra = (
-        normalized_rebuild
-    )
+    rebuilt_metrics, rebuilt_charts, rebuilt_sections, rebuilt_extra = normalized_rebuild
     if (
         data.get("metrics") != rebuilt_metrics
         or data.get("charts") != rebuilt_charts
@@ -7712,9 +7503,7 @@ def _reserves_snapshot_contract_is_valid(
             stored,
             metric,
             fingerprint=str(data.get("fingerprint") or ""),
-            payload_integrity_hash=str(
-                data.get("payload_integrity_hash") or ""
-            ),
+            payload_integrity_hash=str(data.get("payload_integrity_hash") or ""),
         ):
             return False
     return True
@@ -7765,9 +7554,8 @@ def _coordinate_reserves_dashboard(
         return [], {"reserves"}
     candidate_date = date.fromisoformat(prepared[3]["common_effective_date"])
     previous_snapshot = _latest_reserves_snapshot()
-    if (
-        previous_snapshot is not None
-        and candidate_date < _reserves_snapshot_effective_date(previous_snapshot)
+    if previous_snapshot is not None and candidate_date < _reserves_snapshot_effective_date(
+        previous_snapshot
     ):
         _mark_reserves_stale(
             [
@@ -7807,10 +7595,7 @@ def _coordinate_reserves_dashboard(
                     snapshot=previous_snapshot,
                 )
             ],
-            reason=(
-                "reserves v1 发布后置条件未满足；新写入已回滚，"
-                "继续保留上一版完整快照。"
-            ),
+            reason=("reserves v1 发布后置条件未满足；新写入已回滚，继续保留上一版完整快照。"),
         )
         return [], {"reserves"}
     return dashboards, set()
@@ -7863,16 +7648,11 @@ def _reserves_rate_spreads_run_state(
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
         "row_count": run.row_count if run else 0,
-        "reason": (
-            reason
-            or (run.error if run else "required exact-dataset run is missing")
-        )[:320],
+        "reason": (reason or (run.error if run else "required exact-dataset run is missing"))[:320],
         "batch_id": str(run.batch_id) if run else None,
         "ingestion_run_id": run.pk if run else None,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
     }
 
@@ -7904,9 +7684,7 @@ def _select_reserves_rate_spreads_runs(
         for identity in RESERVES_RATE_SPREADS_DATASETS
     ]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in selected.values()
     ):
         return None, states, True
@@ -7949,9 +7727,7 @@ def _reserves_rate_spreads_input_lineage(
         "batch_id": str(observation.batch_id),
         "quality_status": observation.quality_status,
         "fallback_source": (
-            observation.fallback_source.key
-            if observation.fallback_source_id
-            else None
+            observation.fallback_source.key if observation.fallback_source_id else None
         ),
         "quote_convention": metadata.get("quote_convention"),
         "treasury_field": metadata.get("treasury_field"),
@@ -7974,9 +7750,7 @@ def _reserves_rate_spreads_derived_lineage(
     license_scope: str,
 ) -> dict[str, Any]:
     batch_ids = sorted({str(item["batch_id"]) for item in inputs})
-    source_keys = sorted(
-        {"internal", *(str(item["source_key"]) for item in inputs)}
-    )
+    source_keys = sorted({"internal", *(str(item["source_key"]) for item in inputs)})
     internal = ensure_source("internal")
     return {
         "series_key": series_key,
@@ -7986,9 +7760,7 @@ def _reserves_rate_spreads_derived_lineage(
         "source_keys": source_keys,
         "license_scope": license_scope,
         "value_date": datetime.combine(period, time.min, tzinfo=UTC).isoformat(),
-        "as_of": min(
-            _parse_payload_datetime(item["as_of"]) for item in inputs
-        ).isoformat(),
+        "as_of": min(_parse_payload_datetime(item["as_of"]) for item in inputs).isoformat(),
         "fetched_at": max(
             _parse_payload_datetime(item["fetched_at"]) for item in inputs
         ).isoformat(),
@@ -8027,35 +7799,17 @@ def _reserves_rate_spreads_metric(
         "key": key,
         "label": label,
         "value": float(value),
-        "display_value": (
-            f"{value:+,.2f}bp" if derived else f"{value:,.2f}%"
-        ),
+        "display_value": (f"{value:+,.2f}bp" if derived else f"{value:,.2f}%"),
         "change": None,
         "change_unit": "",
         "unit": unit,
-        "quality_status": (
-            Observation.Quality.ESTIMATED
-            if derived
-            else Observation.Quality.FRESH
-        ),
-        "source": (
-            f"Atlas Macro 计算：{formula}"
-            if derived
-            else str(primary["source_name"])
-        ),
+        "quality_status": (Observation.Quality.ESTIMATED if derived else Observation.Quality.FRESH),
+        "source": (f"Atlas Macro 计算：{formula}" if derived else str(primary["source_name"])),
         "source_key": "internal" if derived else str(primary["source_key"]),
-        "source_keys": sorted(
-            {*input_source_keys, *({"internal"} if derived else set())}
-        ),
-        "license_scope": (
-            internal_license_scope
-            if derived
-            else str(primary["license_scope"])
-        ),
+        "source_keys": sorted({*input_source_keys, *({"internal"} if derived else set())}),
+        "license_scope": (internal_license_scope if derived else str(primary["license_scope"])),
         "fallback_source": None,
-        "as_of": min(
-            _parse_payload_datetime(item["as_of"]) for item in inputs
-        ).isoformat(),
+        "as_of": min(_parse_payload_datetime(item["as_of"]) for item in inputs).isoformat(),
         "value_date": datetime.combine(period, time.min, tzinfo=UTC).isoformat(),
         "fetched_at": max(
             _parse_payload_datetime(item["fetched_at"]) for item in inputs
@@ -8073,8 +7827,7 @@ def _reserves_rate_spreads_metric(
             "quote_convention": (
                 RESERVES_RATE_SPREADS_QUOTE_CONVENTION
                 if any(
-                    item["series_key"] == RESERVES_RATE_SPREADS_SERIES["tbill"]
-                    for item in inputs
+                    item["series_key"] == RESERVES_RATE_SPREADS_SERIES["tbill"] for item in inputs
                 )
                 else None
             ),
@@ -8131,10 +7884,7 @@ def _reserves_rate_spreads_page_data(
                 status="unlicensed",
             )
         ]
-    sources_by_key = {
-        item.key: item
-        for item in Source.objects.filter(key__in=required_sources)
-    }
+    sources_by_key = {item.key: item for item in Source.objects.filter(key__in=required_sources)}
     licence_scopes: dict[str, str] = {}
     for source_key in required_sources:
         source = sources_by_key.get(source_key)
@@ -8245,10 +7995,7 @@ def _reserves_rate_spreads_page_data(
                 status="stalled-peer",
             )
         ]
-    current_inputs = [
-        observations[identity][common_date]
-        for identity in ("sofr", "tbill", "iorb")
-    ]
+    current_inputs = [observations[identity][common_date] for identity in ("sofr", "tbill", "iorb")]
     deadlines = [_fresh_until(item) for item in current_inputs]
     if not allow_expired and any(deadline < now for deadline in deadlines):
         return None, [
@@ -8259,15 +8006,11 @@ def _reserves_rate_spreads_page_data(
             )
         ]
     page_fresh_until = min(deadlines)
-    window_start = common_date - timedelta(
-        days=RESERVES_RATE_SPREADS_HISTORY_DAYS - 1
-    )
+    window_start = common_date - timedelta(days=RESERVES_RATE_SPREADS_HISTORY_DAYS - 1)
     history_dates = sorted(
         period
         for period in (
-            set(observations["sofr"])
-            & set(observations["tbill"])
-            & set(observations["iorb"])
+            set(observations["sofr"]) & set(observations["tbill"]) & set(observations["iorb"])
         )
         if window_start <= period <= common_date
     )
@@ -8292,9 +8035,7 @@ def _reserves_rate_spreads_page_data(
             identity: _reserves_rate_spreads_input_lineage(
                 observations[identity][period],
                 page_fresh_until=page_fresh_until,
-                license_scope=licence_scopes[
-                    RESERVES_RATE_SPREADS_DATASETS[identity][0]
-                ],
+                license_scope=licence_scopes[RESERVES_RATE_SPREADS_DATASETS[identity][0]],
             )
             for identity in ("sofr", "tbill", "iorb")
         }
@@ -8315,9 +8056,7 @@ def _reserves_rate_spreads_page_data(
                     "ny-fed-markets",
                     "us-treasury-rates",
                 ],
-                "_batch_ids": sorted(
-                    str(item["batch_id"]) for item in period_lineage.values()
-                ),
+                "_batch_ids": sorted(str(item["batch_id"]) for item in period_lineage.values()),
                 "_lineage": {
                     "SOFR": period_lineage["sofr"],
                     "13-week T-bill Coupon Equivalent": period_lineage["tbill"],
@@ -8473,9 +8212,7 @@ def _reserves_rate_spreads_page_data(
             "full_width": True,
         },
     ]
-    refresh_cycle_id = str(
-        (selected_runs["sofr"].metadata or {}).get("refresh_cycle_id") or ""
-    )
+    refresh_cycle_id = str((selected_runs["sofr"].metadata or {}).get("refresh_cycle_id") or "")
     extra_data = {
         "contract_version": RESERVES_RATE_SPREADS_CONTRACT_VERSION,
         "common_effective_date": common_date.isoformat(),
@@ -8505,9 +8242,7 @@ def _reserves_rate_spreads_page_data(
         ],
     }
     prepared = (metrics, charts, sections, extra_data)
-    if not _reserves_rate_spreads_page_contract_is_buildable(
-        metrics, charts, extra_data
-    ):
+    if not _reserves_rate_spreads_page_contract_is_buildable(metrics, charts, extra_data):
         return None, [
             _reserves_rate_spreads_failure(
                 "contract", "prepared rate-spread component failed its v1 validator"
@@ -8521,26 +8256,15 @@ def _reserves_rate_spreads_page_contract_is_buildable(
     charts: list[dict[str, Any]],
     extra_data: dict[str, Any],
 ) -> bool:
-    metric_by_key = {
-        str(item.get("key") or ""): item
-        for item in metrics
-        if isinstance(item, dict)
-    }
-    chart_by_key = {
-        str(item.get("key") or ""): item
-        for item in charts
-        if isinstance(item, dict)
-    }
+    metric_by_key = {str(item.get("key") or ""): item for item in metrics if isinstance(item, dict)}
+    chart_by_key = {str(item.get("key") or ""): item for item in charts if isinstance(item, dict)}
     if (
-        extra_data.get("contract_version")
-        != RESERVES_RATE_SPREADS_CONTRACT_VERSION
+        extra_data.get("contract_version") != RESERVES_RATE_SPREADS_CONTRACT_VERSION
         or set(metric_by_key) != set(RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS)
         or set(chart_by_key) != set(RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS)
-        or extra_data.get("history_window_calendar_days")
-        != RESERVES_RATE_SPREADS_HISTORY_DAYS
+        or extra_data.get("history_window_calendar_days") != RESERVES_RATE_SPREADS_HISTORY_DAYS
         or extra_data.get("no_forward_fill") is not True
-        or extra_data.get("quote_convention")
-        != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+        or extra_data.get("quote_convention") != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
     ):
         return False
     try:
@@ -8548,17 +8272,13 @@ def _reserves_rate_spreads_page_contract_is_buildable(
         history_start = date.fromisoformat(str(extra_data["history_start_date"]))
     except (KeyError, ValueError):
         return False
-    if history_start != common_date - timedelta(
-        days=RESERVES_RATE_SPREADS_HISTORY_DAYS - 1
-    ):
+    if history_start != common_date - timedelta(days=RESERVES_RATE_SPREADS_HISTORY_DAYS - 1):
         return False
     input_datasets = extra_data.get("input_datasets")
     if not isinstance(input_datasets, list) or len(input_datasets) != 3:
         return False
     inputs_by_component = {
-        str(item.get("component") or ""): item
-        for item in input_datasets
-        if isinstance(item, dict)
+        str(item.get("component") or ""): item for item in input_datasets if isinstance(item, dict)
     }
     if set(inputs_by_component) != set(RESERVES_RATE_SPREADS_DATASETS):
         return False
@@ -8577,17 +8297,13 @@ def _reserves_rate_spreads_page_contract_is_buildable(
         "internal",
     } or any(not scope for scope in license_scopes.values()):
         return False
-    expected_batches = {
-        str(item.get("batch_id") or "") for item in input_datasets
-    }
+    expected_batches = {str(item.get("batch_id") or "") for item in input_datasets}
     if "" in expected_batches or len(expected_batches) != 3:
         return False
     for identity, item in inputs_by_component.items():
-        if (
-            (item.get("source_key"), item.get("dataset"))
-            != RESERVES_RATE_SPREADS_DATASETS[identity]
-            or item.get("series_key") != RESERVES_RATE_SPREADS_SERIES[identity]
-        ):
+        if (item.get("source_key"), item.get("dataset")) != RESERVES_RATE_SPREADS_DATASETS[
+            identity
+        ] or item.get("series_key") != RESERVES_RATE_SPREADS_SERIES[identity]:
             return False
     component_runs = extra_data.get("component_runs")
     if (
@@ -8602,18 +8318,14 @@ def _reserves_rate_spreads_page_contract_is_buildable(
         )
     ):
         return False
-    runs_by_component = {
-        str(item.get("component") or ""): item for item in component_runs
-    }
+    runs_by_component = {str(item.get("component") or ""): item for item in component_runs}
     if set(runs_by_component) != set(RESERVES_RATE_SPREADS_DATASETS):
         return False
     for identity, item in runs_by_component.items():
         expected = inputs_by_component[identity]
-        if (
-            (item.get("source"), item.get("dataset"))
-            != RESERVES_RATE_SPREADS_DATASETS[identity]
-            or item.get("batch_id") != expected.get("batch_id")
-        ):
+        if (item.get("source"), item.get("dataset")) != RESERVES_RATE_SPREADS_DATASETS[
+            identity
+        ] or item.get("batch_id") != expected.get("batch_id"):
             return False
 
     def decimal_value(raw: Any) -> Decimal | None:
@@ -8655,8 +8367,7 @@ def _reserves_rate_spreads_page_contract_is_buildable(
             return False
         return identity != "tbill" or (
             item.get("quote_convention") == RESERVES_RATE_SPREADS_QUOTE_CONVENTION
-            and item.get("treasury_field")
-            == TreasuryRatesProvider.BILL_13W_COUPON_EQUIVALENT_FIELD
+            and item.get("treasury_field") == TreasuryRatesProvider.BILL_13W_COUPON_EQUIVALENT_FIELD
             and item.get("bank_discount_rate") not in {None, ""}
             and item.get("cusip")
             and item.get("maturity_date")
@@ -8698,9 +8409,7 @@ def _reserves_rate_spreads_page_contract_is_buildable(
         if not isinstance(lineage, list) or len(lineage) != 2:
             return False
         by_series = {
-            str(item.get("series_key") or ""): item
-            for item in lineage
-            if isinstance(item, dict)
+            str(item.get("series_key") or ""): item for item in lineage if isinstance(item, dict)
         }
         sofr_lineage = by_series.get(RESERVES_RATE_SPREADS_SERIES["sofr"])
         peer_lineage = by_series.get(RESERVES_RATE_SPREADS_SERIES[peer])
@@ -8714,26 +8423,22 @@ def _reserves_rate_spreads_page_contract_is_buildable(
             or not same(
                 metric.get("value"),
                 Decimal("100")
-                * (
-                    Decimal(str(sofr_lineage["value"]))
-                    - Decimal(str(peer_lineage["value"]))
-                ),
+                * (Decimal(str(sofr_lineage["value"])) - Decimal(str(peer_lineage["value"]))),
             )
         ):
             return False
-        if peer == "tbill" and metadata.get("quote_convention") != RESERVES_RATE_SPREADS_QUOTE_CONVENTION:
+        if (
+            peer == "tbill"
+            and metadata.get("quote_convention") != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+        ):
             return False
     chart_rows = {key: value.get("data") for key, value in chart_by_key.items()}
     if any(
-        not isinstance(rows, list)
-        or len(rows) < RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS
+        not isinstance(rows, list) or len(rows) < RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS
         for rows in chart_rows.values()
     ):
         return False
-    date_lists = [
-        [str(row.get("date") or "") for row in rows]
-        for rows in chart_rows.values()
-    ]
+    date_lists = [[str(row.get("date") or "") for row in rows] for rows in chart_rows.values()]
     if any(dates != date_lists[0] for dates in date_lists[1:]):
         return False
     try:
@@ -8786,8 +8491,7 @@ def _reserves_rate_spreads_page_contract_is_buildable(
                 or derived.get("license_scope") != license_scopes["internal"]
                 or not same(
                     row.get(field),
-                    Decimal("100")
-                    * (Decimal(str(sofr["value"])) - Decimal(str(peer["value"]))),
+                    Decimal("100") * (Decimal(str(sofr["value"])) - Decimal(str(peer["value"]))),
                 )
             ):
                 return False
@@ -8845,9 +8549,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
     }
     input_datasets = data.get("input_datasets") or []
     expected_batches = {
-        str(item.get("batch_id") or "")
-        for item in input_datasets
-        if isinstance(item, dict)
+        str(item.get("batch_id") or "") for item in input_datasets if isinstance(item, dict)
     }
     if (
         snapshot.key != "reserves-rate-spreads"
@@ -8879,9 +8581,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
         return False
     current_scopes: dict[str, str] = {}
     for source in Source.objects.filter(key__in=expected_sources):
-        licence = _effective_source_license(
-            source, require_public=True, require_derived=True
-        )
+        licence = _effective_source_license(source, require_public=True, require_derived=True)
         if licence is None:
             return False
         current_scopes[source.key] = licence.scope
@@ -8897,9 +8597,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
     }:
         return False
     fresh_until = _parse_payload_datetime(data.get("fresh_until"))
-    if fresh_until is None or (
-        fresh_until < timezone.now() and not allow_expired
-    ):
+    if fresh_until is None or (fresh_until < timezone.now() and not allow_expired):
         return False
     if selected_runs is not None:
         rebuilt, _failures = _reserves_rate_spreads_page_data(
@@ -8911,9 +8609,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
         normalized_rebuild = _normalize_rebuilt_dashboard_contract(rebuilt)
         if normalized_rebuild is None:
             return False
-        rebuilt_metrics, rebuilt_charts, rebuilt_sections, rebuilt_extra = (
-            normalized_rebuild
-        )
+        rebuilt_metrics, rebuilt_charts, rebuilt_sections, rebuilt_extra = normalized_rebuild
         if (
             data.get("metrics") != rebuilt_metrics
             or data.get("charts") != rebuilt_charts
@@ -8931,8 +8627,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
         ).select_related("source", "fallback_source")
     }
     expected_metric_rows = {
-        f"reserves-rate-spreads-{key}"
-        for key in RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS
+        f"reserves-rate-spreads-{key}" for key in RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS
     }
     if set(normalized) != expected_metric_rows:
         return False
@@ -8942,9 +8637,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
             stored,
             metric,
             fingerprint=str(data.get("fingerprint") or ""),
-            payload_integrity_hash=str(
-                data.get("payload_integrity_hash") or ""
-            ),
+            payload_integrity_hash=str(data.get("payload_integrity_hash") or ""),
         ):
             return False
     return True
@@ -8968,9 +8661,7 @@ def select_public_reserves_rate_spreads_snapshot(
 ) -> DashboardSnapshot | None:
     if candidates is None:
         candidates = (
-            DashboardSnapshot.objects.filter(
-                key="reserves-rate-spreads", is_published=True
-            )
+            DashboardSnapshot.objects.filter(key="reserves-rate-spreads", is_published=True)
             .exclude(source__key="demo-market")
             .select_related("source")
             .order_by("-created_at", "-id")[:50]
@@ -9008,10 +8699,7 @@ def _mark_reserves_rate_spreads_stale(
         "checked_at": timezone.now().isoformat(),
         "reason": reason,
         "components": components,
-        "sources": [
-            {**item, "error": str(item.get("reason") or "")}
-            for item in components
-        ],
+        "sources": [{**item, "error": str(item.get("reason") or "")} for item in components],
     }
     latest.data = data
     latest.quality_status = Observation.Quality.STALE
@@ -9084,8 +8772,7 @@ def _coordinate_reserves_rate_spreads_dashboard(
     candidate_date = date.fromisoformat(prepared[3]["common_effective_date"])
     if (
         previous_snapshot is not None
-        and candidate_date
-        < _reserves_rate_spreads_snapshot_effective_date(previous_snapshot)
+        and candidate_date < _reserves_rate_spreads_snapshot_effective_date(previous_snapshot)
     ):
         _mark_reserves_rate_spreads_stale(
             [
@@ -9139,10 +8826,7 @@ def _coordinate_reserves_rate_spreads_dashboard(
                     "publication postcondition or latest-attempt concurrency check failed",
                 )
             ],
-            reason=(
-                "日频利差 v1 发布后置条件未满足；新写入已回滚，"
-                "继续保留上一完整组件。"
-            ),
+            reason=("日频利差 v1 发布后置条件未满足；新写入已回滚，继续保留上一完整组件。"),
         )
         return [], {"reserves-rate-spreads"}
     return ([published] if published is not None else []), set()
@@ -9194,20 +8878,14 @@ def _fed_balance_sheet_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            reason or (run.error if run else "required dataset run missing")
-        )[:320],
+        "reason": (reason or (run.error if run else "required dataset run missing"))[:320],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
@@ -9219,9 +8897,7 @@ def _fed_balance_sheet_failure(
     run: IngestionRun | None = None,
 ) -> dict[str, Any]:
     if component in FED_BALANCE_SHEET_DATASETS:
-        return _fed_balance_sheet_run_state(
-            component, run, status=status, reason=reason
-        )
+        return _fed_balance_sheet_run_state(component, run, status=status, reason=reason)
     return {
         "component": component,
         "kind": "contract",
@@ -9249,11 +8925,7 @@ def _select_fed_balance_sheet_runs(
         if not identity_runs:
             continue
         latest = _latest_fed_balance_sheet_attempt(identity)
-        if (
-            latest is None
-            or len(identity_runs) != 1
-            or identity_runs[0].pk != latest.pk
-        ):
+        if latest is None or len(identity_runs) != 1 or identity_runs[0].pk != latest.pk:
             return None, [], False
 
     selected_optional = {
@@ -9265,23 +8937,13 @@ def _select_fed_balance_sheet_runs(
         for identity in FED_BALANCE_SHEET_DATASETS
     ]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in selected_optional.values()
     ):
         return None, states, True
-    selected = {
-        identity: run
-        for identity, run in selected_optional.items()
-        if run is not None
-    }
-    onrrp_cycle = str(
-        (selected["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
-    )
-    tga_cycle = str(
-        (selected["tga"].metadata or {}).get("refresh_cycle_id") or ""
-    )
+    selected = {identity: run for identity, run in selected_optional.items() if run is not None}
+    onrrp_cycle = str((selected["onrrp"].metadata or {}).get("refresh_cycle_id") or "")
+    tga_cycle = str((selected["tga"].metadata or {}).get("refresh_cycle_id") or "")
     if not onrrp_cycle or onrrp_cycle != tga_cycle:
         states = [
             (
@@ -9289,10 +8951,7 @@ def _select_fed_balance_sheet_runs(
                     identity,
                     run,
                     status="invalid-cycle",
-                    reason=(
-                        "ON RRP and TGA are not from the same non-empty "
-                        "refresh cycle"
-                    ),
+                    reason=("ON RRP and TGA are not from the same non-empty refresh cycle"),
                 )
                 if identity in {"onrrp", "tga"}
                 else _fed_balance_sheet_run_state(identity, run)
@@ -9307,8 +8966,7 @@ def _fed_balance_sheet_runs_still_latest(
     selected: dict[str, IngestionRun],
 ) -> bool:
     return all(
-        (latest := _latest_fed_balance_sheet_attempt(identity)) is not None
-        and latest.pk == run.pk
+        (latest := _latest_fed_balance_sheet_attempt(identity)) is not None and latest.pk == run.pk
         for identity, run in selected.items()
     )
 
@@ -9387,8 +9045,7 @@ def _fed_balance_sheet_exact_inputs(
     maps: dict[str, dict[date, Observation]] = {}
     component_deadlines: dict[str, datetime] = {}
     expected_source_by_component = {
-        identity: FED_BALANCE_SHEET_DATASETS[identity][0]
-        for identity in FED_BALANCE_SHEET_DATASETS
+        identity: FED_BALANCE_SHEET_DATASETS[identity][0] for identity in FED_BALANCE_SHEET_DATASETS
     }
     for identity, run in selected.items():
         expected_source = expected_source_by_component[identity]
@@ -9405,13 +9062,8 @@ def _fed_balance_sheet_exact_inputs(
                     run=run,
                 )
             ]
-        run_fetched_at = _parse_payload_datetime(
-            (run.metadata or {}).get("fetched_at")
-        )
-        if (
-            run_fetched_at is None
-            or run_fetched_at > now + timedelta(minutes=5)
-        ):
+        run_fetched_at = _parse_payload_datetime((run.metadata or {}).get("fetched_at"))
+        if run_fetched_at is None or run_fetched_at > now + timedelta(minutes=5):
             return None, [
                 _fed_balance_sheet_failure(
                     identity,
@@ -9422,13 +9074,8 @@ def _fed_balance_sheet_exact_inputs(
         exact_source_count = Observation.objects.filter(
             source=run.source, batch_id=run.batch_id
         ).count()
-        exact_total_count = Observation.objects.filter(
-            batch_id=run.batch_id
-        ).count()
-        if (
-            exact_source_count != run.row_count
-            or exact_total_count != run.row_count
-        ):
+        exact_total_count = Observation.objects.filter(batch_id=run.batch_id).count()
+        if exact_source_count != run.row_count or exact_total_count != run.row_count:
             return None, [
                 _fed_balance_sheet_failure(
                     identity,
@@ -9509,31 +9156,22 @@ def _fed_balance_sheet_exact_inputs(
                     ]
                 by_date[period] = observation
             maps[series_key] = by_date
-            component_deadlines[series_key] = _fresh_until(
-                by_date[max(by_date)]
-            )
+            component_deadlines[series_key] = _fresh_until(by_date[max(by_date)])
 
     expired_series = sorted(
-        series_key
-        for series_key, deadline in component_deadlines.items()
-        if deadline < now
+        series_key for series_key, deadline in component_deadlines.items() if deadline < now
     )
     if expired_series and not allow_expired:
         return None, [
             _fed_balance_sheet_failure(
                 "freshness",
-                "latest exact-batch component is stale: "
-                + ", ".join(expired_series),
+                "latest exact-batch component is stale: " + ", ".join(expired_series),
                 status=Observation.Quality.STALE,
             )
         ]
 
-    h41_date_sets = [
-        set(maps[series_key]) for series_key in FED_BALANCE_SHEET_SERIES["h41"]
-    ]
-    if not h41_date_sets or any(
-        dates != h41_date_sets[0] for dates in h41_date_sets[1:]
-    ):
+    h41_date_sets = [set(maps[series_key]) for series_key in FED_BALANCE_SHEET_SERIES["h41"]]
+    if not h41_date_sets or any(dates != h41_date_sets[0] for dates in h41_date_sets[1:]):
         return None, [
             _fed_balance_sheet_failure(
                 "h41",
@@ -9546,25 +9184,26 @@ def _fed_balance_sheet_exact_inputs(
 
     common_dates = sorted(
         set.intersection(
-            *(set(maps[series_key]) for series_key in (
-                "walcl",
-                "wshotsl",
-                "wshomcb",
-                "wrbwfrbl",
-                "onrrp",
-                "tga",
-            ))
+            *(
+                set(maps[series_key])
+                for series_key in (
+                    "walcl",
+                    "wshotsl",
+                    "wshomcb",
+                    "wrbwfrbl",
+                    "onrrp",
+                    "tga",
+                )
+            )
         )
     )
-    if (
-        len(common_dates) < FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS
-        or any(period > today_et or period.weekday() != 2 for period in common_dates)
+    if len(common_dates) < FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS or any(
+        period > today_et or period.weekday() != 2 for period in common_dates
     ):
         return None, [
             _fed_balance_sheet_failure(
                 "common-wednesdays",
-                "the six exact-batch series have fewer than 20 common non-future "
-                "Wednesdays",
+                "the six exact-batch series have fewer than 20 common non-future Wednesdays",
                 status="insufficient-sample",
             )
         ]
@@ -9573,9 +9212,7 @@ def _fed_balance_sheet_exact_inputs(
         "common_dates": common_dates,
         "page_fresh_until": min(component_deadlines.values()),
         "licence_scopes": licence_scopes,
-        "refresh_cycle_id": str(
-            (selected["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
-        ),
+        "refresh_cycle_id": str((selected["onrrp"].metadata or {}).get("refresh_cycle_id") or ""),
     }, []
 
 
@@ -9659,9 +9296,7 @@ def _fed_balance_sheet_net_lineage(
         "license_scope": licence_scopes["internal"],
         "value_date": period_inputs["walcl"].value_date.isoformat(),
         "as_of": min(period_inputs[key].as_of for key in input_keys).isoformat(),
-        "fetched_at": max(
-            period_inputs[key].fetched_at for key in input_keys
-        ).isoformat(),
+        "fetched_at": max(period_inputs[key].fetched_at for key in input_keys).isoformat(),
         "fresh_until": fresh_until.isoformat(),
         "batch_id": ",".join(input_batches),
         "input_batch_ids": input_batches,
@@ -9676,9 +9311,7 @@ def _fed_balance_sheet_net_value(
     period_inputs: dict[str, Observation],
 ) -> Decimal:
     return (
-        period_inputs["walcl"].value
-        - period_inputs["onrrp"].value
-        - period_inputs["tga"].value
+        period_inputs["walcl"].value - period_inputs["onrrp"].value - period_inputs["tga"].value
     ) * Decimal("0.000001")
 
 
@@ -9724,8 +9357,7 @@ def _fed_balance_sheet_net_metric(
             "formula": FED_BALANCE_SHEET_NET_FORMULA,
             "calculation_owner": "Atlas Macro",
             "model_label": (
-                "Atlas transparent proxy; not a Federal Reserve official "
-                "indicator or LPI composite"
+                "Atlas transparent proxy; not a Federal Reserve official indicator or LPI composite"
             ),
             "normalization": (
                 "subtract raw USD millions, then divide by 1,000,000 for USD trillions"
@@ -9828,9 +9460,7 @@ def _fed_balance_sheet_page_data(
             {
                 "date": period.isoformat(),
                 **{
-                    field: float(
-                        period_inputs[series_key].value * Decimal("0.000001")
-                    )
+                    field: float(period_inputs[series_key].value * Decimal("0.000001"))
                     for field, series_key in direct_fields.items()
                 },
                 "_source_keys": ["federal-reserve"],
@@ -9982,9 +9612,9 @@ def _fed_balance_sheet_page_data(
 
 def _fed_balance_sheet_decimal_equal(left: Any, right: Any) -> bool:
     try:
-        return Decimal(str(left)).quantize(Decimal("0.00000001")) == Decimal(
-            str(right)
-        ).quantize(Decimal("0.00000001"))
+        return Decimal(str(left)).quantize(Decimal("0.00000001")) == Decimal(str(right)).quantize(
+            Decimal("0.00000001")
+        )
     except (ArithmeticError, TypeError, ValueError):
         return False
 
@@ -10018,9 +9648,7 @@ def _fed_balance_sheet_net_from_lineage(
         return None
     if set(values) != {"walcl", "onrrp", "tga"}:
         return None
-    return (
-        values["walcl"] - values["onrrp"] - values["tga"]
-    ) * Decimal("0.000001")
+    return (values["walcl"] - values["onrrp"] - values["tga"]) * Decimal("0.000001")
 
 
 def _fed_balance_sheet_safe_direct_lineage(
@@ -10079,10 +9707,7 @@ def _fed_balance_sheet_safe_net_lineage(
         and lineage.get("fallback_source") is None
         and recomputed is not None
         and _fed_balance_sheet_decimal_equal(recomputed, expected_value)
-        and {
-            str(item.get("value_date") or "")[:10]
-            for item in lineage.get("input_lineage", [])
-        }
+        and {str(item.get("value_date") or "")[:10] for item in lineage.get("input_lineage", [])}
         == {expected_date}
         and all(
             _fed_balance_sheet_safe_direct_lineage(
@@ -10107,8 +9732,7 @@ def _fed_balance_sheet_page_contract_is_buildable(
     except (TypeError, ValueError):
         return False
     if (
-        extra_data.get("contract_version")
-        != FED_BALANCE_SHEET_CONTRACT_VERSION
+        extra_data.get("contract_version") != FED_BALANCE_SHEET_CONTRACT_VERSION
         or extra_data.get("formula") != FED_BALANCE_SHEET_NET_FORMULA
         or common_row_count < FED_BALANCE_SHEET_MINIMUM_COMMON_ROWS
         or not str(extra_data.get("refresh_cycle_id") or "")
@@ -10140,24 +9764,18 @@ def _fed_balance_sheet_page_contract_is_buildable(
         previous_date = str(metadata.get("previous_value_date") or "")[:10]
         current_raw = (
             _fed_balance_sheet_decimal_value(lineage[0].get("raw_value"))
-            if isinstance(lineage, list)
-            and len(lineage) == 1
-            and isinstance(lineage[0], dict)
+            if isinstance(lineage, list) and len(lineage) == 1 and isinstance(lineage[0], dict)
             else None
         )
         previous_raw = (
-            _fed_balance_sheet_decimal_value(
-                previous_lineage[0].get("raw_value")
-            )
+            _fed_balance_sheet_decimal_value(previous_lineage[0].get("raw_value"))
             if isinstance(previous_lineage, list)
             and len(previous_lineage) == 1
             and isinstance(previous_lineage[0], dict)
             else None
         )
         metric_value = _fed_balance_sheet_decimal_value(metric.get("value"))
-        previous_metric_value = _fed_balance_sheet_decimal_value(
-            metadata.get("previous_value")
-        )
+        previous_metric_value = _fed_balance_sheet_decimal_value(metadata.get("previous_value"))
         if (
             metric.get("quality_status") != Observation.Quality.FRESH
             or metric.get("fallback_source") is not None
@@ -10165,8 +9783,7 @@ def _fed_balance_sheet_page_contract_is_buildable(
             or len(lineage) != 1
             or not isinstance(lineage[0], dict)
             or metric.get("source_key") != lineage[0].get("source_key")
-            or set(metric.get("source_keys") or [])
-            != {str(lineage[0].get("source_key") or "")}
+            or set(metric.get("source_keys") or []) != {str(lineage[0].get("source_key") or "")}
             or metric.get("batch_id") != lineage[0].get("batch_id")
             or metric.get("license_scope") != lineage[0].get("license_scope")
             or not metric.get("license_scope")
@@ -10180,8 +9797,7 @@ def _fed_balance_sheet_page_contract_is_buildable(
             or previous_raw is None
             or metric_value is None
             or previous_metric_value is None
-            or metric.get("display_value")
-            != f"{metric_value:,.6f} USD tn"
+            or metric.get("display_value") != f"{metric_value:,.6f} USD tn"
             or not previous_date
             or previous_date >= common_date
             or not _fed_balance_sheet_safe_direct_lineage(
@@ -10205,19 +9821,11 @@ def _fed_balance_sheet_page_contract_is_buildable(
             return False
     net_metric = metric_by_key["net-liquidity"]
     net_metadata = net_metric.get("metadata") or {}
-    net_value = _fed_balance_sheet_net_from_lineage(
-        net_metadata.get("input_lineage")
-    )
-    previous_net = _fed_balance_sheet_net_from_lineage(
-        net_metadata.get("previous_input_lineage")
-    )
+    net_value = _fed_balance_sheet_net_from_lineage(net_metadata.get("input_lineage"))
+    previous_net = _fed_balance_sheet_net_from_lineage(net_metadata.get("previous_input_lineage"))
     net_lineage = list(net_metadata.get("input_lineage") or [])
-    previous_net_lineage = list(
-        net_metadata.get("previous_input_lineage") or []
-    )
-    previous_net_date = str(
-        net_metadata.get("previous_value_date") or ""
-    )[:10]
+    previous_net_lineage = list(net_metadata.get("previous_input_lineage") or [])
+    previous_net_date = str(net_metadata.get("previous_value_date") or "")[:10]
     if (
         net_metric.get("quality_status") != Observation.Quality.ESTIMATED
         or net_metric.get("source_key") != "internal"
@@ -10231,31 +9839,20 @@ def _fed_balance_sheet_page_contract_is_buildable(
         or net_metric.get("batch_id")
         != ",".join(
             sorted(
-                {
-                    str(item.get("batch_id") or "")
-                    for item in net_lineage
-                    if isinstance(item, dict)
-                }
+                {str(item.get("batch_id") or "") for item in net_lineage if isinstance(item, dict)}
             )
         )
         or set(net_metadata.get("input_batch_ids") or [])
-        != {
-            str(item.get("batch_id") or "")
-            for item in net_lineage
-            if isinstance(item, dict)
-        }
+        != {str(item.get("batch_id") or "") for item in net_lineage if isinstance(item, dict)}
         or net_metric.get("fallback_source") is not None
         or not net_metric.get("license_scope")
         or net_metadata.get("formula") != FED_BALANCE_SHEET_NET_FORMULA
         or str(net_metric.get("value_date") or "")[:10] != common_date
         or net_value is None
         or previous_net is None
-        or net_metric.get("display_value")
-        != f"{net_value:,.6f} USD tn"
+        or net_metric.get("display_value") != f"{net_value:,.6f} USD tn"
         or {
-            str(item.get("value_date") or "")[:10]
-            for item in net_lineage
-            if isinstance(item, dict)
+            str(item.get("value_date") or "")[:10] for item in net_lineage if isinstance(item, dict)
         }
         != {common_date}
         or not previous_net_date
@@ -10283,12 +9880,8 @@ def _fed_balance_sheet_page_contract_is_buildable(
             for item in previous_net_lineage
         )
         or not _fed_balance_sheet_decimal_equal(net_metric.get("value"), net_value)
-        or not _fed_balance_sheet_decimal_equal(
-            net_metadata.get("previous_value"), previous_net
-        )
-        or not _fed_balance_sheet_decimal_equal(
-            net_metric.get("change"), net_value - previous_net
-        )
+        or not _fed_balance_sheet_decimal_equal(net_metadata.get("previous_value"), previous_net)
+        or not _fed_balance_sheet_decimal_equal(net_metric.get("change"), net_value - previous_net)
     ):
         return False
 
@@ -10300,9 +9893,7 @@ def _fed_balance_sheet_page_contract_is_buildable(
     balance_dates = [str(row.get("date") or "") for row in balance_rows]
     net_dates = [str(row.get("date") or "") for row in net_rows]
     try:
-        parsed_balance_dates = [
-            date.fromisoformat(period) for period in balance_dates
-        ]
+        parsed_balance_dates = [date.fromisoformat(period) for period in balance_dates]
     except (TypeError, ValueError):
         return False
     if (
@@ -10341,29 +9932,26 @@ def _fed_balance_sheet_page_contract_is_buildable(
                 )
                 or not _fed_balance_sheet_decimal_equal(
                     row[field],
-                    Decimal(str(lineage[field].get("raw_value")))
-                    * Decimal("0.000001"),
+                    Decimal(str(lineage[field].get("raw_value"))) * Decimal("0.000001"),
                 )
             ):
                 return False
     for row in net_rows:
         period = str(row["date"])
         lineage = (row.get("_lineage") or {}).get("Net liquidity")
-        if (
-            set(row.get("_lineage") or {}) != {"Net liquidity"}
-            or not _fed_balance_sheet_safe_net_lineage(
-                lineage,
-                expected_date=period,
-                expected_value=row.get("Net liquidity"),
-            )
+        if set(row.get("_lineage") or {}) != {
+            "Net liquidity"
+        } or not _fed_balance_sheet_safe_net_lineage(
+            lineage,
+            expected_date=period,
+            expected_value=row.get("Net liquidity"),
         ):
             return False
 
     matching_sections = [
         item
         for item in (sections or [])
-        if isinstance(item, dict)
-        and item.get("key") == FED_BALANCE_SHEET_REQUIRED_SECTION_KEY
+        if isinstance(item, dict) and item.get("key") == FED_BALANCE_SHEET_REQUIRED_SECTION_KEY
     ]
     if len(matching_sections) != 1:
         return False
@@ -10379,8 +9967,7 @@ def _fed_balance_sheet_page_contract_is_buildable(
     table_rows = list(section.get("rows") or [])
     if (
         len(table_rows) != 20
-        or [str(row.get("date") or "") for row in table_rows]
-        != balance_dates[-20:]
+        or [str(row.get("date") or "") for row in table_rows] != balance_dates[-20:]
     ):
         return False
     balance_by_date = {str(row["date"]): row for row in balance_rows}
@@ -10409,12 +9996,9 @@ def _fed_balance_sheet_page_contract_is_buildable(
             return False
         if (
             row.get("cells_list") != expected_cells
-            or set(lineage)
-            != {"Total assets", "Treasuries", "MBS", "Net liquidity"}
+            or set(lineage) != {"Total assets", "Treasuries", "MBS", "Net liquidity"}
             or any(
-                not _fed_balance_sheet_decimal_equal(
-                    row[field], balance_by_date[period][field]
-                )
+                not _fed_balance_sheet_decimal_equal(row[field], balance_by_date[period][field])
                 for field in ("Total assets", "Treasuries", "MBS")
             )
             or not _fed_balance_sheet_decimal_equal(
@@ -10455,9 +10039,7 @@ def _fed_balance_sheet_snapshot_effective_date(
     snapshot: DashboardSnapshot,
 ) -> date:
     try:
-        return date.fromisoformat(
-            str((snapshot.data or {}).get("common_effective_date") or "")
-        )
+        return date.fromisoformat(str((snapshot.data or {}).get("common_effective_date") or ""))
     except ValueError:
         return snapshot.as_of.date()
 
@@ -10480,9 +10062,7 @@ def _fed_balance_sheet_lineage_matches_observation(
         and lineage.get("value_date") == observation.value_date.isoformat()
         and lineage.get("as_of") == observation.as_of.isoformat()
         and lineage.get("fetched_at") == observation.fetched_at.isoformat()
-        and _fed_balance_sheet_decimal_equal(
-            lineage.get("raw_value"), observation.value
-        )
+        and _fed_balance_sheet_decimal_equal(lineage.get("raw_value"), observation.value)
     )
 
 
@@ -10498,8 +10078,7 @@ def _fed_balance_sheet_normalized_metrics_match(
         ).select_related("source", "fallback_source")
     }
     expected_normalized = {
-        f"fed-balance-sheet-{key}"
-        for key in FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS
+        f"fed-balance-sheet-{key}" for key in FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS
     }
     if set(normalized) != expected_normalized:
         return False
@@ -10509,24 +10088,17 @@ def _fed_balance_sheet_normalized_metrics_match(
         if (
             stored is None
             or stored.value is None
-            or not _fed_balance_sheet_decimal_equal(
-                stored.value, metric.get("value")
-            )
+            or not _fed_balance_sheet_decimal_equal(stored.value, metric.get("value"))
             or stored.source.key != metric.get("source_key")
             or stored.fallback_source_id is not None
-            or stored.value_date
-            != _parse_payload_datetime(metric.get("value_date"))
+            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
             or stored.as_of != _parse_payload_datetime(metric.get("as_of"))
-            or stored.fetched_at
-            != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
             or stored.quality_status != metric.get("quality_status")
-            or stored.license_scope
-            != str(metric.get("license_scope") or "")[:120]
-            or stored.metadata.get("component_batch_id")
-            != metric.get("batch_id")
+            or stored.license_scope != str(metric.get("license_scope") or "")[:120]
+            or stored.metadata.get("component_batch_id") != metric.get("batch_id")
             or stored.metadata.get("formula") != metadata.get("formula")
-            or stored.metadata.get("input_lineage")
-            != metadata.get("input_lineage")
+            or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
             or stored.metadata.get("previous_input_lineage")
             != metadata.get("previous_input_lineage")
             or set(stored.metadata.get("input_batch_ids") or [])
@@ -10576,14 +10148,11 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
     if allow_retained_stale:
         valid_publication_state = bool(
             snapshot.quality_status == Observation.Quality.STALE
-            and _fed_balance_sheet_refresh_failure_is_valid(
-                data.get("refresh_failure")
-            )
+            and _fed_balance_sheet_refresh_failure_is_valid(data.get("refresh_failure"))
         )
     elif allow_natural_expiry:
         valid_publication_state = bool(
-            snapshot.quality_status
-            in {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+            snapshot.quality_status in {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
             and "refresh_failure" not in data
         )
     else:
@@ -10596,8 +10165,7 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
         or not snapshot.is_published
         or snapshot.source.key != "internal"
         or data.get("demo") is not False
-        or data.get("contract_version")
-        != FED_BALANCE_SHEET_CONTRACT_VERSION
+        or data.get("contract_version") != FED_BALANCE_SHEET_CONTRACT_VERSION
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or str(data.get("fingerprint") or "")
         != _dashboard_content_fingerprint(
@@ -10627,44 +10195,28 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
         not isinstance(references, list)
         or {str(item.get("component") or "") for item in references}
         != set(FED_BALANCE_SHEET_DATASETS)
-        or {
-            str(item.get("batch_id") or "")
-            for item in references
-            if isinstance(item, dict)
-        }
+        or {str(item.get("batch_id") or "") for item in references if isinstance(item, dict)}
         != expected_batches
     ):
         return False
     references_by_component = {
-        str(item.get("component") or ""): item
-        for item in references
-        if isinstance(item, dict)
+        str(item.get("component") or ""): item for item in references if isinstance(item, dict)
     }
     for identity, run in selected_runs.items():
         reference = references_by_component.get(identity) or {}
         if (
             reference.get("kind") != "ingestion_run"
             or reference.get("status") != "valid"
-            or reference.get("source")
-            != FED_BALANCE_SHEET_DATASETS[identity][0]
-            or reference.get("dataset")
-            != FED_BALANCE_SHEET_DATASETS[identity][1]
+            or reference.get("source") != FED_BALANCE_SHEET_DATASETS[identity][0]
+            or reference.get("dataset") != FED_BALANCE_SHEET_DATASETS[identity][1]
             or reference.get("ingestion_run_id") != run.pk
             or reference.get("batch_id") != str(run.batch_id)
             or reference.get("row_count") != run.row_count
         ):
             return False
-    onrrp_cycle = str(
-        (selected_runs["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
-    )
-    tga_cycle = str(
-        (selected_runs["tga"].metadata or {}).get("refresh_cycle_id") or ""
-    )
-    if (
-        not onrrp_cycle
-        or onrrp_cycle != tga_cycle
-        or data.get("refresh_cycle_id") != onrrp_cycle
-    ):
+    onrrp_cycle = str((selected_runs["onrrp"].metadata or {}).get("refresh_cycle_id") or "")
+    tga_cycle = str((selected_runs["tga"].metadata or {}).get("refresh_cycle_id") or "")
+    if not onrrp_cycle or onrrp_cycle != tga_cycle or data.get("refresh_cycle_id") != onrrp_cycle:
         return False
     context, _failures = _fed_balance_sheet_exact_inputs(
         selected_runs, allow_expired=allow_natural_expiry
@@ -10674,23 +10226,16 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
     maps: dict[str, dict[date, Observation]] = context["maps"]
     common_dates: list[date] = context["common_dates"]
     scopes: dict[str, str] = context["licence_scopes"]
-    if (
-        data.get("common_effective_date") != common_dates[-1].isoformat()
-        or data.get("common_row_count") != len(common_dates)
-    ):
+    if data.get("common_effective_date") != common_dates[-1].isoformat() or data.get(
+        "common_row_count"
+    ) != len(common_dates):
         return False
-    chart_by_key = {
-        str(item.get("key") or ""): item for item in data.get("charts", [])
-    }
+    chart_by_key = {str(item.get("key") or ""): item for item in data.get("charts", [])}
     balance_rows = chart_by_key["fed-balance-sheet-history"]["data"]
-    net_rows = chart_by_key[
-        "fed-balance-sheet-net-liquidity-history"
-    ]["data"]
-    if [row["date"] for row in balance_rows] != [
-        period.isoformat() for period in common_dates
-    ] or [row["date"] for row in net_rows] != [
-        period.isoformat() for period in common_dates
-    ]:
+    net_rows = chart_by_key["fed-balance-sheet-net-liquidity-history"]["data"]
+    if [row["date"] for row in balance_rows] != [period.isoformat() for period in common_dates] or [
+        row["date"] for row in net_rows
+    ] != [period.isoformat() for period in common_dates]:
         return False
     direct_fields = {
         "Total assets": "walcl",
@@ -10699,9 +10244,7 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
         "Reserve balances": "wrbwfrbl",
     }
 
-    def input_lineage_matches(
-        items: Any, expected: dict[str, Observation]
-    ) -> bool:
+    def input_lineage_matches(items: Any, expected: dict[str, Observation]) -> bool:
         if not isinstance(items, list):
             return False
         by_series = {
@@ -10718,12 +10261,8 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
             for series_key, observation in expected.items()
         )
 
-    metric_by_key = {
-        str(item.get("key") or ""): item for item in data.get("metrics", [])
-    }
-    if metric_by_key["net-liquidity"].get("license_scope") != scopes[
-        "internal"
-    ]:
+    metric_by_key = {str(item.get("key") or ""): item for item in data.get("metrics", [])}
+    if metric_by_key["net-liquidity"].get("license_scope") != scopes["internal"]:
         return False
     current_period = common_dates[-1]
     previous_period = common_dates[-2]
@@ -10740,16 +10279,10 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
     net_metadata = metric_by_key["net-liquidity"].get("metadata") or {}
     if not input_lineage_matches(
         net_metadata.get("input_lineage"),
-        {
-            key: maps[key][current_period]
-            for key in ("walcl", "onrrp", "tga")
-        },
+        {key: maps[key][current_period] for key in ("walcl", "onrrp", "tga")},
     ) or not input_lineage_matches(
         net_metadata.get("previous_input_lineage"),
-        {
-            key: maps[key][previous_period]
-            for key in ("walcl", "onrrp", "tga")
-        },
+        {key: maps[key][previous_period] for key in ("walcl", "onrrp", "tga")},
     ):
         return False
 
@@ -10768,16 +10301,12 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
     }
     for chart_key, chart in chart_by_key.items():
         if (
-            set(chart.get("batch_ids") or [])
-            != expected_chart_batches[chart_key]
-            or set(chart.get("source_keys") or [])
-            != expected_chart_sources[chart_key]
+            set(chart.get("batch_ids") or []) != expected_chart_batches[chart_key]
+            or set(chart.get("source_keys") or []) != expected_chart_sources[chart_key]
             or chart.get("fallback_sources")
         ):
             return False
-    for period, balance_row, net_row in zip(
-        common_dates, balance_rows, net_rows, strict=True
-    ):
+    for period, balance_row, net_row in zip(common_dates, balance_rows, net_rows, strict=True):
         for field, series_key in direct_fields.items():
             if not _fed_balance_sheet_lineage_matches_observation(
                 balance_row["_lineage"][field],
@@ -10786,12 +10315,8 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
             ):
                 return False
         net_lineage = net_row["_lineage"]["Net liquidity"]
-        expected_inputs = {
-            key: maps[key][period] for key in ("walcl", "onrrp", "tga")
-        }
-        if not input_lineage_matches(
-            net_lineage.get("input_lineage"), expected_inputs
-        ):
+        expected_inputs = {key: maps[key][period] for key in ("walcl", "onrrp", "tga")}
+        if not input_lineage_matches(net_lineage.get("input_lineage"), expected_inputs):
             return False
     section = next(
         item
@@ -10826,10 +10351,7 @@ def _fed_balance_sheet_snapshot_contract_is_valid(
             for field, observation in expected.items()
         ) or not input_lineage_matches(
             row["_lineage"]["Net liquidity"].get("input_lineage"),
-            {
-                key: maps[key][period]
-                for key in ("walcl", "onrrp", "tga")
-            },
+            {key: maps[key][period] for key in ("walcl", "onrrp", "tga")},
         ):
             return False
 
@@ -10883,16 +10405,13 @@ def _fed_balance_sheet_retained_stale_is_displayable(
         or not snapshot.is_published
         or snapshot.source.key != "internal"
         or data.get("demo") is not False
-        or data.get("contract_version")
-        != FED_BALANCE_SHEET_CONTRACT_VERSION
+        or data.get("contract_version") != FED_BALANCE_SHEET_CONTRACT_VERSION
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or (
             require_persisted_failure
             and (
                 snapshot.quality_status != Observation.Quality.STALE
-                or not _fed_balance_sheet_refresh_failure_is_valid(
-                    data.get("refresh_failure")
-                )
+                or not _fed_balance_sheet_refresh_failure_is_valid(data.get("refresh_failure"))
             )
         )
         or (
@@ -10919,14 +10438,10 @@ def _fed_balance_sheet_retained_stale_is_displayable(
         return False
 
     references = data.get("component_runs")
-    if not isinstance(references, list) or len(references) != len(
-        FED_BALANCE_SHEET_DATASETS
-    ):
+    if not isinstance(references, list) or len(references) != len(FED_BALANCE_SHEET_DATASETS):
         return False
     references_by_component = {
-        str(item.get("component") or ""): item
-        for item in references
-        if isinstance(item, dict)
+        str(item.get("component") or ""): item for item in references if isinstance(item, dict)
     }
     if set(references_by_component) != set(FED_BALANCE_SHEET_DATASETS):
         return False
@@ -10935,9 +10450,7 @@ def _fed_balance_sheet_retained_stale_is_displayable(
         reference = references_by_component[identity]
         run_id = reference.get("ingestion_run_id")
         run = (
-            IngestionRun.objects.select_related("source")
-            .filter(pk=run_id)
-            .first()
+            IngestionRun.objects.select_related("source").filter(pk=run_id).first()
             if run_id
             else None
         )
@@ -10957,12 +10470,8 @@ def _fed_balance_sheet_retained_stale_is_displayable(
             return False
         selected_runs[identity] = run
     expected_batches = {str(run.batch_id) for run in selected_runs.values()}
-    onrrp_cycle = str(
-        (selected_runs["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
-    )
-    tga_cycle = str(
-        (selected_runs["tga"].metadata or {}).get("refresh_cycle_id") or ""
-    )
+    onrrp_cycle = str((selected_runs["onrrp"].metadata or {}).get("refresh_cycle_id") or "")
+    tga_cycle = str((selected_runs["tga"].metadata or {}).get("refresh_cycle_id") or "")
     if (
         set(data.get("component_batches") or []) != expected_batches
         or not onrrp_cycle
@@ -10980,9 +10489,7 @@ def _fed_balance_sheet_retained_stale_is_displayable(
         "tga": "tga",
     }
 
-    def embedded_direct_is_valid(
-        lineage: Any, *, series_key: str, expected_date: str
-    ) -> bool:
+    def embedded_direct_is_valid(lineage: Any, *, series_key: str, expected_date: str) -> bool:
         identity = component_for_series[series_key]
         run = selected_runs[identity]
         return bool(
@@ -11016,13 +10523,9 @@ def _fed_balance_sheet_retained_stale_is_displayable(
             for series_key in series_keys
         )
 
-    metric_by_key = {
-        str(item.get("key") or ""): item for item in data.get("metrics", [])
-    }
+    metric_by_key = {str(item.get("key") or ""): item for item in data.get("metrics", [])}
     common_date = str(data.get("common_effective_date") or "")
-    if metric_by_key["net-liquidity"].get("license_scope") != scopes[
-        "internal"
-    ]:
+    if metric_by_key["net-liquidity"].get("license_scope") != scopes["internal"]:
         return False
     for series_key in ("walcl", "wshotsl", "wshomcb", "wrbwfrbl"):
         metadata = metric_by_key[series_key].get("metadata") or {}
@@ -11050,9 +10553,7 @@ def _fed_balance_sheet_retained_stale_is_displayable(
     ):
         return False
 
-    chart_by_key = {
-        str(item.get("key") or ""): item for item in data.get("charts", [])
-    }
+    chart_by_key = {str(item.get("key") or ""): item for item in data.get("charts", [])}
     expected_chart_batches = {
         "fed-balance-sheet-history": {str(selected_runs["h41"].batch_id)},
         "fed-balance-sheet-net-liquidity-history": expected_batches,
@@ -11063,10 +10564,8 @@ def _fed_balance_sheet_retained_stale_is_displayable(
     }
     for chart_key, chart in chart_by_key.items():
         if (
-            set(chart.get("batch_ids") or [])
-            != expected_chart_batches[chart_key]
-            or set(chart.get("source_keys") or [])
-            != expected_chart_sources[chart_key]
+            set(chart.get("batch_ids") or []) != expected_chart_batches[chart_key]
+            or set(chart.get("source_keys") or []) != expected_chart_sources[chart_key]
             or chart.get("fallback_sources")
         ):
             return False
@@ -11087,9 +10586,7 @@ def _fed_balance_sheet_retained_stale_is_displayable(
             for field, series_key in direct_fields.items()
         ):
             return False
-    for row in chart_by_key[
-        "fed-balance-sheet-net-liquidity-history"
-    ].get("data", []):
+    for row in chart_by_key["fed-balance-sheet-net-liquidity-history"].get("data", []):
         period = str(row.get("date") or "")
         net_lineage = (row.get("_lineage") or {}).get("Net liquidity") or {}
         if not embedded_input_set_is_valid(
@@ -11164,8 +10661,7 @@ def _fed_balance_sheet_has_component_transition(
     ):
         return False
     return any(
-        attempt is not None
-        and attempt.pk != referenced_run_ids[identity]
+        attempt is not None and attempt.pk != referenced_run_ids[identity]
         for identity, attempt in attempts.items()
     )
 
@@ -11185,11 +10681,7 @@ def fed_balance_sheet_snapshot_is_publicly_displayable(
         run is None for run in successful.values()
     ):
         return False
-    selected = {
-        identity: run
-        for identity, run in successful.items()
-        if run is not None
-    }
+    selected = {identity: run for identity, run in successful.items() if run is not None}
     latest_success_is_current = all(
         latest_attempts[identity].status == IngestionRun.Status.SUCCESS
         and latest_attempts[identity].row_count > 0
@@ -11259,9 +10751,7 @@ def select_public_fed_balance_sheet_snapshot(
     return selected
 
 
-def _mark_fed_balance_sheet_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_fed_balance_sheet_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -11336,12 +10826,9 @@ def _coordinate_fed_balance_sheet_dashboard(
     expected_batches = {str(run.batch_id) for run in selected.values()}
     if (
         previous is not None
-        and set((previous.data or {}).get("component_batches") or [])
-        == expected_batches
+        and set((previous.data or {}).get("component_batches") or []) == expected_batches
         and not (previous.data or {}).get("refresh_failure")
-        and _fed_balance_sheet_snapshot_contract_is_valid(
-            previous, selected_runs=selected
-        )
+        and _fed_balance_sheet_snapshot_contract_is_valid(previous, selected_runs=selected)
     ):
         return [], set()
     prepared, failures = _fed_balance_sheet_page_data(selected)
@@ -11356,9 +10843,8 @@ def _coordinate_fed_balance_sheet_dashboard(
         return [], {"fed-balance-sheet"}
     metrics, charts, sections, extra_data = prepared
     candidate_date = date.fromisoformat(extra_data["common_effective_date"])
-    if (
-        previous is not None
-        and candidate_date < _fed_balance_sheet_snapshot_effective_date(previous)
+    if previous is not None and candidate_date < _fed_balance_sheet_snapshot_effective_date(
+        previous
     ):
         _mark_fed_balance_sheet_stale(
             [
@@ -11395,13 +10881,9 @@ def _coordinate_fed_balance_sheet_dashboard(
             if (
                 latest is None
                 or not _fed_balance_sheet_runs_still_latest(selected)
-                or not _fed_balance_sheet_snapshot_contract_is_valid(
-                    latest, selected_runs=selected
-                )
+                or not _fed_balance_sheet_snapshot_contract_is_valid(latest, selected_runs=selected)
             ):
-                raise ValueError(
-                    "fed-balance-sheet publication postcondition failed"
-                )
+                raise ValueError("fed-balance-sheet publication postcondition failed")
     except (
         ArithmeticError,
         IndexError,
@@ -11418,8 +10900,7 @@ def _coordinate_fed_balance_sheet_dashboard(
                 )
             ],
             reason=(
-                "fed-balance-sheet v1 发布后置条件未满足；新写入已回滚，"
-                "继续保留上一完整快照。"
+                "fed-balance-sheet v1 发布后置条件未满足；新写入已回滚，继续保留上一完整快照。"
             ),
         )
         return [], {"fed-balance-sheet"}
@@ -11470,21 +10951,16 @@ def _subsurface_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            reason
-            or (run.error if run and run.error else "component is not publishable")
-        )[:320],
+        "reason": (reason or (run.error if run and run.error else "component is not publishable"))[
+            :320
+        ],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
@@ -11496,9 +10972,7 @@ def _subsurface_failure(
     run: IngestionRun | None = None,
 ) -> dict[str, Any]:
     if component in SUBSURFACE_DATASETS:
-        return _subsurface_run_state(
-            component, run, status=status, reason=reason
-        )
+        return _subsurface_run_state(component, run, status=status, reason=reason)
     return {
         "component": component,
         "kind": "contract",
@@ -11510,9 +10984,7 @@ def _subsurface_failure(
 def _select_subsurface_runs(
     trigger_runs: Iterable[IngestionRun],
 ) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
-    relevant: dict[str, list[IngestionRun]] = {
-        identity: [] for identity in SUBSURFACE_DATASETS
-    }
+    relevant: dict[str, list[IngestionRun]] = {identity: [] for identity in SUBSURFACE_DATASETS}
     for run in trigger_runs:
         identity = _subsurface_run_identity(run)
         if identity:
@@ -11523,30 +10995,18 @@ def _select_subsurface_runs(
         if not identity_runs:
             continue
         latest = _latest_subsurface_attempt(identity)
-        if (
-            latest is None
-            or len(identity_runs) != 1
-            or identity_runs[0].pk != latest.pk
-        ):
+        if latest is None or len(identity_runs) != 1 or identity_runs[0].pk != latest.pk:
             return None, [], False
-    optional = {
-        identity: _latest_subsurface_attempt(identity)
-        for identity in SUBSURFACE_DATASETS
-    }
+    optional = {identity: _latest_subsurface_attempt(identity) for identity in SUBSURFACE_DATASETS}
     states = [
-        _subsurface_run_state(identity, optional[identity])
-        for identity in SUBSURFACE_DATASETS
+        _subsurface_run_state(identity, optional[identity]) for identity in SUBSURFACE_DATASETS
     ]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in optional.values()
     ):
         return None, states, True
-    selected = {
-        identity: run for identity, run in optional.items() if run is not None
-    }
+    selected = {identity: run for identity, run in optional.items() if run is not None}
     cycles = {
         str((selected[identity].metadata or {}).get("refresh_cycle_id") or "")
         for identity in ("sofr", "srf", "swaps")
@@ -11574,15 +11034,12 @@ def _select_subsurface_runs(
 
 def _subsurface_runs_still_latest(selected: dict[str, IngestionRun]) -> bool:
     return all(
-        (latest := _latest_subsurface_attempt(identity)) is not None
-        and latest.pk == run.pk
+        (latest := _latest_subsurface_attempt(identity)) is not None and latest.pk == run.pk
         for identity, run in selected.items()
     )
 
 
-def _subsurface_artifact_is_valid(
-    identity: str, run: IngestionRun
-) -> bool:
+def _subsurface_artifact_is_valid(identity: str, run: IngestionRun) -> bool:
     artifacts = list(RawArtifact.objects.filter(run=run))
     if len(artifacts) != 1:
         return False
@@ -11594,12 +11051,8 @@ def _subsurface_artifact_is_valid(
             size = int(metadata.get("byte_length") or 0)
         except (TypeError, ValueError):
             return False
-        content_type = str(
-            metadata.get("content_type") or "application/octet-stream"
-        )
-        expected_uri = (
-            f"private://ny-fed-markets/{digest[:2]}/{digest}.bin"
-        )
+        content_type = str(metadata.get("content_type") or "application/octet-stream")
+        expected_uri = f"private://ny-fed-markets/{digest[:2]}/{digest}.bin"
     else:
         declarations = metadata.get("artifacts")
         if isinstance(declarations, list) and len(declarations) == 1:
@@ -11608,22 +11061,13 @@ def _subsurface_artifact_is_valid(
                 return False
             digest = str(declaration.get("sha256") or "").lower()
             try:
-                size = int(
-                    declaration.get("size")
-                    or declaration.get("size_bytes")
-                    or 0
-                )
+                size = int(declaration.get("size") or declaration.get("size_bytes") or 0)
             except (TypeError, ValueError):
                 return False
             source_url = str(
-                declaration.get("url")
-                or declaration.get("uri")
-                or metadata.get("source_url")
-                or ""
+                declaration.get("url") or declaration.get("uri") or metadata.get("source_url") or ""
             )
-            content_type = str(
-                declaration.get("content_type") or "application/zip"
-            )
+            content_type = str(declaration.get("content_type") or "application/zip")
         else:
             digest = str(metadata.get("archive_sha256") or "").lower()
             try:
@@ -11677,9 +11121,7 @@ def _subsurface_population_z(values: list[Decimal]) -> Decimal | None:
     if len(values) != SUBSURFACE_MINIMUM_Z60_ROWS:
         return None
     mean = sum(values, Decimal("0")) / Decimal(len(values))
-    variance = sum((value - mean) ** 2 for value in values) / Decimal(
-        len(values)
-    )
+    variance = sum((value - mean) ** 2 for value in values) / Decimal(len(values))
     if variance <= 0:
         return None
     return (values[-1] - mean) / variance.sqrt()
@@ -11687,12 +11129,7 @@ def _subsurface_population_z(values: list[Decimal]) -> Decimal | None:
 
 def _subsurface_operation_is_small_value(operation: dict[str, Any]) -> bool:
     explicit = str(operation.get("isSmallValue") or "").strip().upper()
-    note = (
-        str(operation.get("note") or "")
-        .lower()
-        .replace("-", " ")
-        .replace("_", " ")
-    )
+    note = str(operation.get("note") or "").lower().replace("-", " ").replace("_", " ")
     return explicit in {"1", "TRUE", "Y", "YES"} or (
         "small value" in note and ("exercise" in note or "test" in note)
     )
@@ -11725,8 +11162,7 @@ def _subsurface_swap_operations_total(
             or (settlement_date is not None and settlement != settlement_date)
             or (
                 expected_small_value is not None
-                and _subsurface_operation_is_small_value(operation)
-                != expected_small_value
+                and _subsurface_operation_is_small_value(operation) != expected_small_value
             )
         ):
             return None
@@ -11778,13 +11214,9 @@ def _subsurface_srf_operation_summary(
             return None
         operation_id = str(operation.get("operationId") or "").strip()
         try:
-            operation_date = date.fromisoformat(
-                str(operation.get("operationDate"))
-            )
+            operation_date = date.fromisoformat(str(operation.get("operationDate")))
             raw_accepted = operation.get("totalAmtAccepted")
-            if strict_contract and (
-                raw_accepted is None or not str(raw_accepted).strip()
-            ):
+            if strict_contract and (raw_accepted is None or not str(raw_accepted).strip()):
                 return None
             accepted = Decimal(str(raw_accepted or "0")) / Decimal("1000000")
         except (ArithmeticError, TypeError, ValueError):
@@ -11793,8 +11225,7 @@ def _subsurface_srf_operation_summary(
             operation_date != period
             or not accepted.is_finite()
             or accepted < 0
-            or _subsurface_operation_is_small_value(operation)
-            != expected_small_value
+            or _subsurface_operation_is_small_value(operation) != expected_small_value
             or (
                 strict_contract
                 and (
@@ -11821,13 +11252,10 @@ def _subsurface_srf_operation_summary(
                 try:
                     raw_detail_amount = detail.get("amtAccepted")
                     if strict_contract and (
-                        raw_detail_amount is None
-                        or not str(raw_detail_amount).strip()
+                        raw_detail_amount is None or not str(raw_detail_amount).strip()
                     ):
                         return None
-                    detail_amount = Decimal(str(raw_detail_amount or "0")) / Decimal(
-                        "1000000"
-                    )
+                    detail_amount = Decimal(str(raw_detail_amount or "0")) / Decimal("1000000")
                 except (ArithmeticError, TypeError, ValueError):
                     return None
                 if not detail_amount.is_finite() or detail_amount < 0:
@@ -11871,9 +11299,7 @@ def _subsurface_exact_inputs(
     for source_key in required_sources:
         source = Source.objects.filter(key=source_key).first()
         licence = (
-            _effective_source_license(
-                source, require_public=True, require_derived=True
-            )
+            _effective_source_license(source, require_public=True, require_derived=True)
             if source is not None
             else None
         )
@@ -11911,8 +11337,7 @@ def _subsurface_exact_inputs(
         if (
             Observation.objects.filter(source=run.source, batch_id=run.batch_id).count()
             != run.row_count
-            or Observation.objects.filter(batch_id=run.batch_id).count()
-            != run.row_count
+            or Observation.objects.filter(batch_id=run.batch_id).count() != run.row_count
         ):
             return None, [
                 _subsurface_failure(
@@ -11973,9 +11398,7 @@ def _subsurface_exact_inputs(
     }
     if len(cycles) != 1 or not next(iter(cycles), ""):
         return None, [
-            _subsurface_failure(
-                "refresh-cycle", "SOFR, SRF and swaps require one main cycle"
-            )
+            _subsurface_failure("refresh-cycle", "SOFR, SRF and swaps require one main cycle")
         ]
     sofr_dates = sorted(period for period in maps["sofr"] if period <= today_et)
     if not sofr_dates:
@@ -11995,18 +11418,12 @@ def _subsurface_exact_inputs(
             volume = Decimal(str(observation.metadata["volumeInBillions"]))
         except (ArithmeticError, KeyError, TypeError, ValueError):
             return None, [
-                _subsurface_failure(
-                    "sofr", "SOFR exact batch lacks valid 99P or volume metadata"
-                )
+                _subsurface_failure("sofr", "SOFR exact batch lacks valid 99P or volume metadata")
             ]
         if not percentile.is_finite() or not volume.is_finite() or volume < 0:
-            return None, [
-                _subsurface_failure("sofr", "SOFR 99P or volume metadata is invalid")
-            ]
+            return None, [_subsurface_failure("sofr", "SOFR 99P or volume metadata is invalid")]
     if len(sofr_dates) < SUBSURFACE_MINIMUM_Z60_ROWS:
-        return None, [
-            _subsurface_failure("z60", "SOFR exact batch has fewer than 60 observations")
-        ]
+        return None, [_subsurface_failure("z60", "SOFR exact batch has fewer than 60 observations")]
     current_z = _subsurface_population_z(
         [
             Decimal(str(maps["sofr"][period].metadata["volumeInBillions"]))
@@ -12019,9 +11436,7 @@ def _subsurface_exact_inputs(
         ]
     srf_sets = [set(maps[key]) for key in SUBSURFACE_REQUIRED_SERIES["srf"]]
     if not srf_sets or any(periods != srf_sets[0] for periods in srf_sets[1:]):
-        return None, [
-            _subsurface_failure("srf", "SRF required series have mixed date sets")
-        ]
+        return None, [_subsurface_failure("srf", "SRF required series have mixed date sets")]
     window_start = current_date - timedelta(days=29)
     srf_dates = sorted(
         period
@@ -12030,9 +11445,7 @@ def _subsurface_exact_inputs(
     )
     if not srf_dates or current_date not in srf_dates:
         return None, [
-            _subsurface_failure(
-                "srf", "SRF 30D window lacks the current SOFR business date"
-            )
+            _subsurface_failure("srf", "SRF 30D window lacks the current SOFR business date")
         ]
     collateral_series = {
         "Treasury": "srp-non-small-value-treasury",
@@ -12062,8 +11475,7 @@ def _subsurface_exact_inputs(
             or regular_metadata.get("small_value_excluded") is not True
             or regular_metadata.get("classification") != "non-small-value"
             or small_metadata.get("small_value_only") is not True
-            or small_metadata.get("classification")
-            != "small-value-technical-exercise"
+            or small_metadata.get("classification") != "small-value-technical-exercise"
         ):
             return None, [
                 _subsurface_failure(
@@ -12099,10 +11511,7 @@ def _subsurface_exact_inputs(
             )
             or not _fed_balance_sheet_decimal_equal(
                 sum(
-                    (
-                        observation.value
-                        for observation in collateral_observations.values()
-                    ),
+                    (observation.value for observation in collateral_observations.values()),
                     Decimal("0"),
                 ),
                 regular.value,
@@ -12117,10 +11526,8 @@ def _subsurface_exact_inputs(
             or rate_metadata.get("operations") != regular_operations
             or rate_metadata.get("small_value_excluded") is not True
             or any(
-                (observation.metadata or {}).get("operations")
-                != regular_operations
-                or (observation.metadata or {}).get("small_value_excluded")
-                is not True
+                (observation.metadata or {}).get("operations") != regular_operations
+                or (observation.metadata or {}).get("small_value_excluded") is not True
                 for observation in collateral_observations.values()
             )
         ):
@@ -12132,13 +11539,9 @@ def _subsurface_exact_inputs(
             ]
     drawdown_dates = set(maps["fxswap-usd-drawdown-non-small-value"])
     if drawdown_dates != set(maps["fxswap-usd-drawdown-small-value"]):
-        return None, [
-            _subsurface_failure("swaps", "swap drawdown series have mixed date sets")
-        ]
+        return None, [_subsurface_failure("swaps", "swap drawdown series have mixed date sets")]
     for period in drawdown_dates:
-        regular_drawdown = maps[
-            "fxswap-usd-drawdown-non-small-value"
-        ][period]
+        regular_drawdown = maps["fxswap-usd-drawdown-non-small-value"][period]
         small_drawdown = maps["fxswap-usd-drawdown-small-value"][period]
         regular_result = _subsurface_swap_operations_total(
             (regular_drawdown.metadata or {}).get("operations"),
@@ -12155,24 +11558,16 @@ def _subsurface_exact_inputs(
         if (
             regular_result is None
             or small_result is None
-            or (regular_drawdown.metadata or {}).get("small_value_excluded")
-            is not True
-            or (regular_drawdown.metadata or {}).get("classification")
-            != "non-small-value"
+            or (regular_drawdown.metadata or {}).get("small_value_excluded") is not True
+            or (regular_drawdown.metadata or {}).get("classification") != "non-small-value"
             or (small_drawdown.metadata or {}).get("small_value_only") is not True
             or (small_drawdown.metadata or {}).get("classification")
             != "small-value-technical-exercise"
-            or not _fed_balance_sheet_decimal_equal(
-                regular_result[0], regular_drawdown.value
-            )
-            or not _fed_balance_sheet_decimal_equal(
-                small_result[0], small_drawdown.value
-            )
+            or not _fed_balance_sheet_decimal_equal(regular_result[0], regular_drawdown.value)
+            or not _fed_balance_sheet_decimal_equal(small_result[0], small_drawdown.value)
         ):
             return None, [
-                _subsurface_failure(
-                    "swaps", "swap drawdown operation classification failed"
-                )
+                _subsurface_failure("swaps", "swap drawdown operation classification failed")
             ]
     outstanding_keys = (
         "fxswap-usd-outstanding",
@@ -12181,17 +11576,11 @@ def _subsurface_exact_inputs(
     )
     outstanding_sets = [set(maps[key]) for key in outstanding_keys]
     if any(periods != outstanding_sets[0] for periods in outstanding_sets[1:]):
-        return None, [
-            _subsurface_failure("swaps", "swap outstanding series have mixed date sets")
-        ]
+        return None, [_subsurface_failure("swaps", "swap outstanding series have mixed date sets")]
     for period in outstanding_sets[0]:
         total_observation = maps["fxswap-usd-outstanding"][period]
-        small_observation = maps[
-            "fxswap-usd-outstanding-small-value"
-        ][period]
-        non_small_observation = maps[
-            "fxswap-usd-outstanding-non-small-value"
-        ][period]
+        small_observation = maps["fxswap-usd-outstanding-small-value"][period]
+        non_small_observation = maps["fxswap-usd-outstanding-non-small-value"][period]
         total_result = _subsurface_swap_observation_total(
             total_observation, expected_small_value=None
         )
@@ -12206,15 +11595,10 @@ def _subsurface_exact_inputs(
             or small_result is None
             or non_small_result is None
             or (small_observation.metadata or {}).get("small_value_only") is not True
-            or (non_small_observation.metadata or {}).get("small_value_excluded")
-            is not True
+            or (non_small_observation.metadata or {}).get("small_value_excluded") is not True
             or total_result[1] != sorted(small_result[1] + non_small_result[1])
-            or not _fed_balance_sheet_decimal_equal(
-                total_result[0], total_observation.value
-            )
-            or not _fed_balance_sheet_decimal_equal(
-                small_result[0], small_observation.value
-            )
+            or not _fed_balance_sheet_decimal_equal(total_result[0], total_observation.value)
+            or not _fed_balance_sheet_decimal_equal(small_result[0], small_observation.value)
             or not _fed_balance_sheet_decimal_equal(
                 non_small_result[0], non_small_observation.value
             )
@@ -12232,9 +11616,7 @@ def _subsurface_exact_inputs(
     swap_as_of = max(outstanding_sets[0])
     swap_total = maps["fxswap-usd-outstanding"][swap_as_of]
     swap_small = maps["fxswap-usd-outstanding-small-value"][swap_as_of]
-    swap_outstanding = maps[
-        "fxswap-usd-outstanding-non-small-value"
-    ][swap_as_of]
+    swap_outstanding = maps["fxswap-usd-outstanding-non-small-value"][swap_as_of]
     deadlines = [
         _fresh_until(maps["sofr"][current_date]),
         _fresh_until(maps["iorb"][current_date]),
@@ -12270,13 +11652,10 @@ def _subsurface_page_data(
     *,
     allow_expired: bool = False,
 ) -> tuple[
-    tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]
-    | None,
+    tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]] | None,
     list[dict[str, Any]],
 ]:
-    context, failures = _subsurface_exact_inputs(
-        selected, allow_expired=allow_expired
-    )
+    context, failures = _subsurface_exact_inputs(selected, allow_expired=allow_expired)
     if context is None:
         return None, failures
     maps: dict[str, dict[date, Observation]] = context["maps"]
@@ -12299,10 +11678,9 @@ def _subsurface_page_data(
     p99_sofr = (p99 - current_sofr.value) * Decimal("100")
     p99_iorb = (p99 - current_iorb.value) * Decimal("100")
     active_days = sum(
-        1
-        for period in srf_dates
-        if maps["srp-non-small-value-total"][period].value > 0
+        1 for period in srf_dates if maps["srp-non-small-value-total"][period].value > 0
     )
+
     def direct(
         observation: Observation,
         *,
@@ -12332,16 +11710,13 @@ def _subsurface_page_data(
     ) -> dict[str, Any]:
         source_key = "internal" if derived else observation.source.key
         source_keys = sorted(
-            {item["source_key"] for item in lineage}
-            | ({"internal"} if derived else set())
+            {item["source_key"] for item in lineage} | ({"internal"} if derived else set())
         )
         batches = sorted({str(item["batch_id"]) for item in lineage})
         metadata: dict[str, Any] = {
             "input_series": sorted({str(item["series_key"]) for item in lineage}),
             "input_batch_ids": batches,
-            "input_value_dates": sorted(
-                {str(item["value_date"]) for item in lineage}
-            ),
+            "input_value_dates": sorted({str(item["value_date"]) for item in lineage}),
             "input_lineage": lineage,
         }
         if formula:
@@ -12350,12 +11725,8 @@ def _subsurface_page_data(
         if sample_count is not None:
             metadata["sample_count"] = sample_count
             metadata["sample_window"] = "official observation days"
-        freshness_inputs = (
-            lineage if freshness_lineage is None else freshness_lineage
-        )
-        fresh_until = min(
-            str(item["fresh_until"]) for item in freshness_inputs
-        )
+        freshness_inputs = lineage if freshness_lineage is None else freshness_lineage
+        fresh_until = min(str(item["fresh_until"]) for item in freshness_inputs)
         return {
             "key": key,
             "label": label,
@@ -12364,14 +11735,10 @@ def _subsurface_page_data(
             "change": None,
             "unit": unit,
             "quality_status": (
-                Observation.Quality.ESTIMATED
-                if derived
-                else Observation.Quality.FRESH
+                Observation.Quality.ESTIMATED if derived else Observation.Quality.FRESH
             ),
             "source": (
-                "Atlas Macro transparent calculation"
-                if derived
-                else observation.source.name
+                "Atlas Macro transparent calculation" if derived else observation.source.name
             ),
             "source_key": source_key,
             "source_keys": source_keys,
@@ -12407,10 +11774,7 @@ def _subsurface_page_data(
     ]
     srf_lineage = direct(current_srf)
     srf_rate_lineage = direct(current_srf_rate)
-    active_lineage = [
-        direct(maps["srp-non-small-value-total"][period])
-        for period in srf_dates
-    ]
+    active_lineage = [direct(maps["srp-non-small-value-total"][period]) for period in srf_dates]
     swap_total_lineage = direct(current_swap_total)
     swap_small_lineage = direct(current_swap_small)
     swap_lineage = direct(current_swap)
@@ -12527,9 +11891,7 @@ def _subsurface_page_data(
             observation=current_swap,
             lineage=[swap_total_lineage, swap_small_lineage, swap_lineage],
             derived=True,
-            formula=SUBSURFACE_FORMULAS[
-                "fxswap-outstanding-non-small-value"
-            ],
+            formula=SUBSURFACE_FORMULAS["fxswap-outstanding-non-small-value"],
         ),
     ]
     metrics[-1]["metadata"]["active_operations"] = list(
@@ -12542,16 +11904,12 @@ def _subsurface_page_data(
         (current_swap_small.metadata or {}).get("active_operations") or []
     )
     metrics[-1]["metadata"]["swap_total"] = float(current_swap_total.value)
-    metrics[-1]["metadata"]["swap_small_value"] = float(
-        current_swap_small.value
-    )
+    metrics[-1]["metadata"]["swap_small_value"] = float(current_swap_small.value)
     metrics[-1]["metadata"]["swap_as_of"] = swap_as_of.isoformat()
 
     source_names = {
         item.key: item.name
-        for item in Source.objects.filter(
-            key__in={"ny-fed-markets", "federal-reserve", "internal"}
-        )
+        for item in Source.objects.filter(key__in={"ny-fed-markets", "federal-reserve", "internal"})
     }
 
     def chart(
@@ -12579,9 +11937,7 @@ def _subsurface_page_data(
             "fallback_sources": [],
             "lineage_mode": "per-point",
             "as_of": datetime.combine(
-                date.fromisoformat(
-                    max(str(item.get("date") or "") for item in rows)
-                ),
+                date.fromisoformat(max(str(item.get("date") or "") for item in rows)),
                 time.min,
                 tzinfo=UTC,
             ).isoformat(),
@@ -12617,9 +11973,7 @@ def _subsurface_page_data(
                     "99P−IORB": {
                         "series_key": "sofr-p99-minus-iorb",
                         "source_key": "internal",
-                        "formula": SUBSURFACE_FORMULAS[
-                            "sofr-p99-minus-iorb"
-                        ],
+                        "formula": SUBSURFACE_FORMULAS["sofr-p99-minus-iorb"],
                         "input_lineage": [
                             direct(
                                 sofr,
@@ -12639,14 +11993,11 @@ def _subsurface_page_data(
         period = sofr_dates[index]
         window_periods = sofr_dates[index - 59 : index + 1]
         window_values = [
-            Decimal(str(maps["sofr"][item].metadata["volumeInBillions"]))
-            for item in window_periods
+            Decimal(str(maps["sofr"][item].metadata["volumeInBillions"])) for item in window_periods
         ]
         rolling_z = _subsurface_population_z(window_values)
         if rolling_z is None:
-            return None, [
-                _subsurface_failure("z60", "a rolling SOFR volume window has zero std")
-            ]
+            return None, [_subsurface_failure("z60", "a rolling SOFR volume window has zero std")]
         current_volume = window_values[-1]
         volume_rows.append(
             {
@@ -12666,9 +12017,7 @@ def _subsurface_page_data(
                         "input_lineage": [
                             direct(
                                 maps["sofr"][item],
-                                raw_value=maps["sofr"][item].metadata[
-                                    "volumeInBillions"
-                                ],
+                                raw_value=maps["sofr"][item].metadata["volumeInBillions"],
                                 upstream_field="volumeInBillions",
                             )
                             for item in window_periods
@@ -12683,51 +12032,33 @@ def _subsurface_page_data(
     srf_rows = [
         {
             "date": period.isoformat(),
-            "Non-test accepted": float(
-                maps["srp-non-small-value-total"][period].value
-            ),
-            "Treasury": float(
-                maps["srp-non-small-value-treasury"][period].value
-            ),
+            "Non-test accepted": float(maps["srp-non-small-value-total"][period].value),
+            "Treasury": float(maps["srp-non-small-value-treasury"][period].value),
             "Agency": float(maps["srp-non-small-value-agency"][period].value),
             "MBS": float(maps["srp-non-small-value-mbs"][period].value),
             "_lineage": {
-                "Non-test accepted": direct(
-                    maps["srp-non-small-value-total"][period]
-                ),
-                "Treasury": direct(
-                    maps["srp-non-small-value-treasury"][period]
-                ),
-                "Agency": direct(
-                    maps["srp-non-small-value-agency"][period]
-                ),
+                "Non-test accepted": direct(maps["srp-non-small-value-total"][period]),
+                "Treasury": direct(maps["srp-non-small-value-treasury"][period]),
+                "Agency": direct(maps["srp-non-small-value-agency"][period]),
                 "MBS": direct(maps["srp-non-small-value-mbs"][period]),
             },
         }
         for period in srf_dates
     ]
     swap_dates = sorted(
-        period
-        for period in maps["fxswap-usd-drawdown-non-small-value"]
-        if period <= swap_as_of
+        period for period in maps["fxswap-usd-drawdown-non-small-value"] if period <= swap_as_of
     )[-120:]
     swap_rows = [
         {
             "date": period.isoformat(),
-            "Non-test drawdown": float(
-                maps["fxswap-usd-drawdown-non-small-value"][period].value
-            ),
+            "Non-test drawdown": float(maps["fxswap-usd-drawdown-non-small-value"][period].value),
             "_lineage": {
-                "Non-test drawdown": direct(
-                    maps["fxswap-usd-drawdown-non-small-value"][period]
-                )
+                "Non-test drawdown": direct(maps["fxswap-usd-drawdown-non-small-value"][period])
             },
         }
         for period in swap_dates
     ]
-    common_fresh = min(
-        _fresh_until(current_sofr), _fresh_until(current_iorb)
-    ).isoformat()
+    common_fresh = min(_fresh_until(current_sofr), _fresh_until(current_iorb)).isoformat()
     charts = [
         chart(
             key="subsurface-sofr-tail-history",
@@ -12777,9 +12108,7 @@ def _subsurface_page_data(
         period = row["date"]
         volume_row = z_by_date.get(period)
         sofr_observation = maps["sofr"][date.fromisoformat(period)]
-        raw_volume = Decimal(
-            str(sofr_observation.metadata["volumeInBillions"])
-        )
+        raw_volume = Decimal(str(sofr_observation.metadata["volumeInBillions"]))
         volume_lineage_for_row = direct(
             sofr_observation,
             raw_value=raw_volume,
@@ -12791,9 +12120,7 @@ def _subsurface_page_data(
             "99P": row["99P"],
             "IORB": row["IORB"],
             "99P−IORB": row["99P−IORB"],
-            "Volume": (
-                volume_row["Volume"] if volume_row else float(raw_volume)
-            ),
+            "Volume": (volume_row["Volume"] if volume_row else float(raw_volume)),
             "Z60": volume_row["Z60"] if volume_row else None,
         }
         recent_rows.append(
@@ -12802,11 +12129,7 @@ def _subsurface_page_data(
                 "cells_list": [
                     {
                         "key": key.lower().replace("−", "-").replace(" ", "-"),
-                        "cell": {
-                            "value": (
-                                "—" if row_values[key] is None else row_values[key]
-                            )
-                        },
+                        "cell": {"value": ("—" if row_values[key] is None else row_values[key])},
                     }
                     for key in (
                         "date",
@@ -12821,11 +12144,7 @@ def _subsurface_page_data(
                 "_lineage": {
                     **row["_lineage"],
                     "Volume": volume_lineage_for_row,
-                    **(
-                        {"Z60": volume_row["_lineage"]["Z60"]}
-                        if volume_row
-                        else {}
-                    ),
+                    **({"Z60": volume_row["_lineage"]["Z60"]} if volume_row else {}),
                 },
             }
         )
@@ -12837,22 +12156,16 @@ def _subsurface_page_data(
         for observation, is_small in ((regular, False), (small, True)):
             operations = (observation.metadata or {}).get("operations")
             if not isinstance(operations, list):
-                return None, [
-                    _subsurface_failure("srf", "SRF operation metadata is missing")
-                ]
+                return None, [_subsurface_failure("srf", "SRF operation metadata is missing")]
             summed = Decimal("0")
             for operation in operations:
                 if not isinstance(operation, dict):
-                    return None, [
-                        _subsurface_failure("srf", "SRF operation metadata is malformed")
-                    ]
+                    return None, [_subsurface_failure("srf", "SRF operation metadata is malformed")]
                 try:
-                    operation_date = date.fromisoformat(
-                        str(operation.get("operationDate"))
+                    operation_date = date.fromisoformat(str(operation.get("operationDate")))
+                    accepted = Decimal(str(operation.get("totalAmtAccepted") or "0")) / Decimal(
+                        "1000000"
                     )
-                    accepted = Decimal(
-                        str(operation.get("totalAmtAccepted") or "0")
-                    ) / Decimal("1000000")
                 except (ArithmeticError, TypeError, ValueError):
                     return None, [
                         _subsurface_failure("srf", "SRF operation amount/date is malformed")
@@ -12867,10 +12180,7 @@ def _subsurface_page_data(
                     detail.get("percentOfferingRate", detail.get("minimumBidRate"))
                     for detail in details
                     if isinstance(detail, dict)
-                    and detail.get(
-                        "percentOfferingRate", detail.get("minimumBidRate")
-                    )
-                    is not None
+                    and detail.get("percentOfferingRate", detail.get("minimumBidRate")) is not None
                 ]
                 row_values = {
                     "date": period.isoformat(),
@@ -12896,18 +12206,14 @@ def _subsurface_page_data(
                                 "key": "rate",
                                 "cell": {
                                     "value": (
-                                        "—"
-                                        if row_values["rate"] is None
-                                        else row_values["rate"]
+                                        "—" if row_values["rate"] is None else row_values["rate"]
                                     )
                                 },
                             },
                             {
                                 "key": "is-small-value",
                                 "cell": {
-                                    "value": (
-                                        "Yes" if row_values["is_small_value"] else "No"
-                                    )
+                                    "value": ("Yes" if row_values["is_small_value"] else "No")
                                 },
                             },
                         ],
@@ -12937,7 +12243,9 @@ def _subsurface_page_data(
             "as_of": current_sofr.as_of.isoformat(),
             "fetched_at": max(current_sofr.fetched_at, current_iorb.fetched_at).isoformat(),
             "fresh_until": common_fresh,
-            "batch_id": ",".join(sorted({str(selected["sofr"].batch_id), str(selected["iorb"].batch_id)})),
+            "batch_id": ",".join(
+                sorted({str(selected["sofr"].batch_id), str(selected["iorb"].batch_id)})
+            ),
             "full_width": True,
         },
         {
@@ -13023,9 +12331,7 @@ def _subsurface_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         active_inputs = (active_metric.get("metadata") or {}).get("input_lineage")
         if not isinstance(active_inputs, list) or not active_inputs:
             return False
-        active_days = sum(
-            1 for item in active_inputs if Decimal(str(item["raw_value"])) > 0
-        )
+        active_days = sum(1 for item in active_inputs if Decimal(str(item["raw_value"])) > 0)
         swap_metric = metric_by_key["fxswap-outstanding-non-small-value"]
         swap_metadata = swap_metric.get("metadata") or {}
         swap_as_of = date.fromisoformat(str(swap_metadata.get("swap_as_of")))
@@ -13044,16 +12350,10 @@ def _subsurface_page_contract_is_buildable(data: dict[str, Any]) -> bool:
             as_of=swap_as_of,
             expected_small_value=False,
         )
-        if (
-            all_swap_result is None
-            or small_swap_result is None
-            or non_small_swap_result is None
-        ):
+        if all_swap_result is None or small_swap_result is None or non_small_swap_result is None:
             return False
         declared_swap_total = Decimal(str(swap_metadata.get("swap_total")))
-        declared_swap_small = Decimal(
-            str(swap_metadata.get("swap_small_value"))
-        )
+        declared_swap_small = Decimal(str(swap_metadata.get("swap_small_value")))
     except (ArithmeticError, KeyError, TypeError, ValueError):
         return False
     if (
@@ -13068,26 +12368,17 @@ def _subsurface_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         )
         or not _fed_balance_sheet_decimal_equal(z_metric["value"], recomputed_z)
         or not _fed_balance_sheet_decimal_equal(active_metric["value"], active_days)
-        or all_swap_result[1]
-        != sorted(small_swap_result[1] + non_small_swap_result[1])
-        or not _fed_balance_sheet_decimal_equal(
-            declared_swap_total, all_swap_result[0]
-        )
-        or not _fed_balance_sheet_decimal_equal(
-            declared_swap_small, small_swap_result[0]
-        )
-        or not _fed_balance_sheet_decimal_equal(
-            swap_metric["value"], non_small_swap_result[0]
-        )
+        or all_swap_result[1] != sorted(small_swap_result[1] + non_small_swap_result[1])
+        or not _fed_balance_sheet_decimal_equal(declared_swap_total, all_swap_result[0])
+        or not _fed_balance_sheet_decimal_equal(declared_swap_small, small_swap_result[0])
+        or not _fed_balance_sheet_decimal_equal(swap_metric["value"], non_small_swap_result[0])
         or not _fed_balance_sheet_decimal_equal(
             declared_swap_total - declared_swap_small,
             swap_metric["value"],
         )
         or any(
-            metric_by_key[key].get("quality_status")
-            != Observation.Quality.ESTIMATED
-            or (metric_by_key[key].get("metadata") or {}).get("formula")
-            != SUBSURFACE_FORMULAS[key]
+            metric_by_key[key].get("quality_status") != Observation.Quality.ESTIMATED
+            or (metric_by_key[key].get("metadata") or {}).get("formula") != SUBSURFACE_FORMULAS[key]
             for key in SUBSURFACE_FORMULAS
         )
         or any(item.get("fallback_source") is not None for item in metrics)
@@ -13099,29 +12390,18 @@ def _subsurface_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         )
     ):
         return False
-    recent = next(
-        item for item in sections if item["key"] == "recent-subsurface-observations"
-    )
-    operations_section = next(
-        item for item in sections if item["key"] == "recent-srf-operations"
-    )
+    recent = next(item for item in sections if item["key"] == "recent-subsurface-observations")
+    operations_section = next(item for item in sections if item["key"] == "recent-srf-operations")
     recent_rows = recent.get("rows") or []
     operation_rows = operations_section.get("rows") or []
 
-    def cells_match(
-        row: dict[str, Any], keys: tuple[str, ...], values: tuple[Any, ...]
-    ) -> bool:
+    def cells_match(row: dict[str, Any], keys: tuple[str, ...], values: tuple[Any, ...]) -> bool:
         cells = row.get("cells_list")
         return bool(
             isinstance(cells, list)
             and len(cells) == len(keys)
-            and [item.get("key") for item in cells if isinstance(item, dict)]
-            == list(keys)
-            and [
-                (item.get("cell") or {}).get("value")
-                for item in cells
-                if isinstance(item, dict)
-            ]
+            and [item.get("key") for item in cells if isinstance(item, dict)] == list(keys)
+            and [(item.get("cell") or {}).get("value") for item in cells if isinstance(item, dict)]
             == list(values)
         )
 
@@ -13192,18 +12472,13 @@ def _subsurface_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
             or stored.metadata.get("component_batch_id") != metric.get("batch_id")
             or stored.metadata.get("formula") != metadata.get("formula")
             or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
-            or stored.metadata.get("active_operations")
-            != metadata.get("active_operations")
-            or stored.metadata.get("all_active_operations")
-            != metadata.get("all_active_operations")
+            or stored.metadata.get("active_operations") != metadata.get("active_operations")
+            or stored.metadata.get("all_active_operations") != metadata.get("all_active_operations")
             or stored.metadata.get("small_value_active_operations")
             != metadata.get("small_value_active_operations")
-            or stored.metadata.get("swap_as_of")
-            != metadata.get("swap_as_of")
-            or stored.metadata.get("swap_total")
-            != metadata.get("swap_total")
-            or stored.metadata.get("swap_small_value")
-            != metadata.get("swap_small_value")
+            or stored.metadata.get("swap_as_of") != metadata.get("swap_as_of")
+            or stored.metadata.get("swap_total") != metadata.get("swap_total")
+            or stored.metadata.get("swap_small_value") != metadata.get("swap_small_value")
             or set(stored.metadata.get("input_batch_ids") or [])
             != set(metadata.get("input_batch_ids") or [])
         ):
@@ -13218,9 +12493,7 @@ def _subsurface_component_runs_from_snapshot(
     if not isinstance(references, list):
         return None
     by_identity = {
-        str(item.get("component") or ""): item
-        for item in references
-        if isinstance(item, dict)
+        str(item.get("component") or ""): item for item in references if isinstance(item, dict)
     }
     if set(by_identity) != set(SUBSURFACE_DATASETS):
         return None
@@ -13257,8 +12530,7 @@ def _subsurface_component_runs_from_snapshot(
     if (
         len(main_cycles) != 1
         or not next(iter(main_cycles), "")
-        or (snapshot.data or {}).get("refresh_cycle_id")
-        != next(iter(main_cycles))
+        or (snapshot.data or {}).get("refresh_cycle_id") != next(iter(main_cycles))
     ):
         return None
     return selected
@@ -13298,9 +12570,7 @@ def _subsurface_snapshot_contract_is_valid(
         or not _subsurface_page_contract_is_buildable(data)
     ):
         return False
-    prepared, _failures = _subsurface_page_data(
-        selected_runs, allow_expired=allow_natural_expiry
-    )
+    prepared, _failures = _subsurface_page_data(selected_runs, allow_expired=allow_natural_expiry)
     if prepared is None:
         return False
     metrics, charts, sections, extra = prepared
@@ -13329,9 +12599,7 @@ def _subsurface_embedded_snapshot_is_valid(
     for source_key in required_sources:
         source = Source.objects.filter(key=source_key).first()
         licence = (
-            _effective_source_license(
-                source, require_public=True, require_derived=True
-            )
+            _effective_source_license(source, require_public=True, require_derived=True)
             if source is not None
             else None
         )
@@ -13341,9 +12609,7 @@ def _subsurface_embedded_snapshot_is_valid(
     if require_persisted_failure:
         valid_state = bool(
             snapshot.quality_status == Observation.Quality.STALE
-            and _fed_balance_sheet_refresh_failure_is_valid(
-                data.get("refresh_failure")
-            )
+            and _fed_balance_sheet_refresh_failure_is_valid(data.get("refresh_failure"))
         )
     else:
         valid_state = bool(
@@ -13373,9 +12639,7 @@ def _subsurface_embedded_snapshot_is_valid(
     ):
         return False
 
-    expected_batches = {
-        identity: str(run.batch_id) for identity, run in selected.items()
-    }
+    expected_batches = {identity: str(run.batch_id) for identity, run in selected.items()}
 
     def lineage_is_valid(value: Any) -> bool:
         if isinstance(value, list):
@@ -13411,15 +12675,13 @@ def _subsurface_has_component_transition(
     if selected is None:
         return False
     attempts = latest_attempts or {
-        identity: _latest_subsurface_attempt(identity)
-        for identity in SUBSURFACE_DATASETS
+        identity: _latest_subsurface_attempt(identity) for identity in SUBSURFACE_DATASETS
     }
     return bool(
         set(attempts) == set(SUBSURFACE_DATASETS)
         and all(attempt is not None for attempt in attempts.values())
         and any(
-            attempts[identity] is not None
-            and attempts[identity].pk != selected[identity].pk
+            attempts[identity] is not None and attempts[identity].pk != selected[identity].pk
             for identity in SUBSURFACE_DATASETS
         )
     )
@@ -13428,21 +12690,15 @@ def _subsurface_has_component_transition(
 def subsurface_snapshot_is_publicly_displayable(
     snapshot: DashboardSnapshot,
 ) -> bool:
-    attempts = {
-        identity: _latest_subsurface_attempt(identity)
-        for identity in SUBSURFACE_DATASETS
-    }
+    attempts = {identity: _latest_subsurface_attempt(identity) for identity in SUBSURFACE_DATASETS}
     successful = {
-        identity: _latest_successful_subsurface_run(identity)
-        for identity in SUBSURFACE_DATASETS
+        identity: _latest_successful_subsurface_run(identity) for identity in SUBSURFACE_DATASETS
     }
     if any(run is None for run in attempts.values()) or any(
         run is None for run in successful.values()
     ):
         return False
-    selected = {
-        identity: run for identity, run in successful.items() if run is not None
-    }
+    selected = {identity: run for identity, run in successful.items() if run is not None}
     if all(
         attempts[identity].status == IngestionRun.Status.SUCCESS
         and attempts[identity].row_count > 0
@@ -13457,15 +12713,11 @@ def subsurface_snapshot_is_publicly_displayable(
             allow_natural_expiry=expired,
         ):
             return True
-    if _subsurface_embedded_snapshot_is_valid(
-        snapshot, require_persisted_failure=True
-    ):
+    if _subsurface_embedded_snapshot_is_valid(snapshot, require_persisted_failure=True):
         return True
     return _subsurface_has_component_transition(
         snapshot, latest_attempts=attempts
-    ) and _subsurface_embedded_snapshot_is_valid(
-        snapshot, require_persisted_failure=False
-    )
+    ) and _subsurface_embedded_snapshot_is_valid(snapshot, require_persisted_failure=False)
 
 
 def select_public_subsurface_snapshot(
@@ -13501,9 +12753,7 @@ def select_public_subsurface_snapshot(
     return selected
 
 
-def _mark_subsurface_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_subsurface_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -13572,12 +12822,9 @@ def _coordinate_subsurface_dashboard(
     expected_batches = {str(run.batch_id) for run in selected.values()}
     if (
         previous is not None
-        and set((previous.data or {}).get("component_batches") or [])
-        == expected_batches
+        and set((previous.data or {}).get("component_batches") or []) == expected_batches
         and "refresh_failure" not in (previous.data or {})
-        and _subsurface_snapshot_contract_is_valid(
-            previous, selected_runs=selected
-        )
+        and _subsurface_snapshot_contract_is_valid(previous, selected_runs=selected)
     ):
         return [], set()
     prepared, failures = _subsurface_page_data(selected)
@@ -13621,9 +12868,7 @@ def _coordinate_subsurface_dashboard(
             if (
                 latest is None
                 or not _subsurface_runs_still_latest(selected)
-                or not _subsurface_snapshot_contract_is_valid(
-                    latest, selected_runs=selected
-                )
+                or not _subsurface_snapshot_contract_is_valid(latest, selected_runs=selected)
             ):
                 raise ValueError("subsurface v1 publication postcondition failed")
     except (ArithmeticError, IndexError, KeyError, StopIteration, TypeError, ValueError):
@@ -13687,19 +12932,16 @@ def _operations_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            reason
-            or (run.error if run and run.error else "component is not publishable")
-        )[:320],
+        "reason": (reason or (run.error if run and run.error else "component is not publishable"))[
+            :320
+        ],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
         "refresh_cycle_id": (
             str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
@@ -13711,9 +12953,7 @@ def _operations_failure(
     run: IngestionRun | None = None,
 ) -> dict[str, Any]:
     if component in OPERATIONS_DATASETS:
-        return _operations_run_state(
-            component, run, status=status, reason=reason
-        )
+        return _operations_run_state(component, run, status=status, reason=reason)
     return {
         "component": component,
         "kind": "contract",
@@ -13725,9 +12965,7 @@ def _operations_failure(
 def _select_operations_runs(
     trigger_runs: Iterable[IngestionRun],
 ) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
-    relevant: dict[str, list[IngestionRun]] = {
-        identity: [] for identity in OPERATIONS_DATASETS
-    }
+    relevant: dict[str, list[IngestionRun]] = {identity: [] for identity in OPERATIONS_DATASETS}
     for run in trigger_runs:
         identity = _operations_run_identity(run)
         if identity:
@@ -13738,35 +12976,20 @@ def _select_operations_runs(
         if not identity_runs:
             continue
         latest = _latest_operations_attempt(identity)
-        if (
-            latest is None
-            or len(identity_runs) != 1
-            or identity_runs[0].pk != latest.pk
-        ):
+        if latest is None or len(identity_runs) != 1 or identity_runs[0].pk != latest.pk:
             return None, [], False
 
-    optional = {
-        identity: _latest_operations_attempt(identity)
-        for identity in OPERATIONS_DATASETS
-    }
+    optional = {identity: _latest_operations_attempt(identity) for identity in OPERATIONS_DATASETS}
     states = [
-        _operations_run_state(identity, optional[identity])
-        for identity in OPERATIONS_DATASETS
+        _operations_run_state(identity, optional[identity]) for identity in OPERATIONS_DATASETS
     ]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in optional.values()
     ):
         return None, states, True
-    selected = {
-        identity: run for identity, run in optional.items() if run is not None
-    }
-    cycles = {
-        str((run.metadata or {}).get("refresh_cycle_id") or "")
-        for run in selected.values()
-    }
+    selected = {identity: run for identity, run in optional.items() if run is not None}
+    cycles = {str((run.metadata or {}).get("refresh_cycle_id") or "") for run in selected.values()}
     if len(cycles) != 1 or not next(iter(cycles), ""):
         return (
             None,
@@ -13786,8 +13009,7 @@ def _select_operations_runs(
 
 def _operations_runs_still_latest(selected: dict[str, IngestionRun]) -> bool:
     return all(
-        (latest := _latest_operations_attempt(identity)) is not None
-        and latest.pk == run.pk
+        (latest := _latest_operations_attempt(identity)) is not None and latest.pk == run.pk
         for identity, run in selected.items()
     )
 
@@ -13804,9 +13026,7 @@ def _operations_artifact_is_valid(run: IngestionRun) -> bool:
     except (TypeError, ValueError):
         return False
     content_type = str(metadata.get("content_type") or "application/octet-stream")
-    root = Path(
-        getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts")
-    )
+    root = Path(getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts"))
     artifact_path = root / digest[:2] / f"{digest}.bin"
     try:
         payload = artifact_path.read_bytes()
@@ -13819,8 +13039,7 @@ def _operations_artifact_is_valid(run: IngestionRun) -> bool:
         and artifact.sha256.lower() == digest
         and artifact.size_bytes == size
         and artifact.content_type == content_type
-        and artifact.uri
-        == f"private://ny-fed-markets/{digest[:2]}/{digest}.bin"
+        and artifact.uri == f"private://ny-fed-markets/{digest[:2]}/{digest}.bin"
         and len(payload) == size
         and hashlib.sha256(payload).hexdigest() == digest
     )
@@ -13873,9 +13092,7 @@ def _operations_repo_summary(
         raw_date = str(operation.get("operationDate") or "")
         try:
             operation_date = date.fromisoformat(raw_date)
-            accepted = Decimal(str(operation.get("totalAmtAccepted"))) / Decimal(
-                "1000000"
-            )
+            accepted = Decimal(str(operation.get("totalAmtAccepted"))) / Decimal("1000000")
         except (ArithmeticError, TypeError, ValueError):
             return None
         if (
@@ -13890,16 +13107,13 @@ def _operations_repo_summary(
             or accepted < 0
             or (
                 expected_small_value is not None
-                and _subsurface_operation_is_small_value(operation)
-                != expected_small_value
+                and _subsurface_operation_is_small_value(operation) != expected_small_value
             )
         ):
             return None
         seen_ids.add(operation_id)
         total += accepted
-        raw_participants = operation.get(
-            "acceptedCpty", operation.get("participatingCpty")
-        )
+        raw_participants = operation.get("acceptedCpty", operation.get("participatingCpty"))
         if raw_participants is not None:
             try:
                 participant_count = Decimal(str(raw_participants))
@@ -13932,9 +13146,7 @@ def _operations_repo_summary(
             if not rate.is_finite() or rate < 0:
                 return None
             rates.add(rate)
-        canonical.append(
-            json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
-        )
+        canonical.append(json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str))
     return total, rates, participants, sorted(canonical)
 
 
@@ -13956,19 +13168,11 @@ def _operations_treasury_summary(
         raw_date = str(operation.get("operationDate") or "")
         try:
             operation_date = date.fromisoformat(raw_date)
-            accepted = Decimal(str(operation.get("totalParAmtAccepted"))) / Decimal(
-                "1000000"
-            )
-            submitted = Decimal(str(operation.get("totalParAmtSubmitted"))) / Decimal(
-                "1000000"
-            )
+            accepted = Decimal(str(operation.get("totalParAmtAccepted"))) / Decimal("1000000")
+            submitted = Decimal(str(operation.get("totalParAmtSubmitted"))) / Decimal("1000000")
             settlement = date.fromisoformat(str(operation.get("settlementDate") or ""))
-            maturity_start = date.fromisoformat(
-                str(operation.get("maturityRangeStart") or "")
-            )
-            maturity_end = date.fromisoformat(
-                str(operation.get("maturityRangeEnd") or "")
-            )
+            maturity_start = date.fromisoformat(str(operation.get("maturityRangeStart") or ""))
+            maturity_end = date.fromisoformat(str(operation.get("maturityRangeEnd") or ""))
         except (ArithmeticError, TypeError, ValueError):
             return None
         if (
@@ -13979,12 +13183,9 @@ def _operations_treasury_summary(
             or operation.get("auctionStatus") != "Results"
             or operation.get("operationDirection") != "P"
             or not str(operation.get("operationType") or "").strip()
-            or str(operation.get("settlementDate") or "")
-            != settlement.isoformat()
-            or str(operation.get("maturityRangeStart") or "")
-            != maturity_start.isoformat()
-            or str(operation.get("maturityRangeEnd") or "")
-            != maturity_end.isoformat()
+            or str(operation.get("settlementDate") or "") != settlement.isoformat()
+            or str(operation.get("maturityRangeStart") or "") != maturity_start.isoformat()
+            or str(operation.get("maturityRangeEnd") or "") != maturity_end.isoformat()
             or maturity_start > maturity_end
             or not accepted.is_finite()
             or not submitted.is_finite()
@@ -13996,9 +13197,7 @@ def _operations_treasury_summary(
         seen_ids.add(operation_id)
         accepted_total += accepted
         submitted_total += submitted
-        canonical.append(
-            json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
-        )
+        canonical.append(json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str))
     return accepted_total, submitted_total, sorted(canonical)
 
 
@@ -14037,9 +13236,7 @@ def _operations_exact_inputs(
     for source_key in required_sources:
         source = Source.objects.filter(key=source_key).first()
         licence = (
-            _effective_source_license(
-                source, require_public=True, require_derived=True
-            )
+            _effective_source_license(source, require_public=True, require_derived=True)
             if source is not None
             else None
         )
@@ -14057,9 +13254,7 @@ def _operations_exact_inputs(
     deadlines: dict[str, datetime] = {}
     for identity, run in selected.items():
         expected_source, expected_dataset = OPERATIONS_DATASETS[identity]
-        run_fetched_at = _parse_payload_datetime(
-            (run.metadata or {}).get("fetched_at")
-        )
+        run_fetched_at = _parse_payload_datetime((run.metadata or {}).get("fetched_at"))
         if (
             run.source.key != expected_source
             or run.dataset != expected_dataset
@@ -14083,8 +13278,7 @@ def _operations_exact_inputs(
         )
         if (
             len(rows) != run.row_count
-            or Observation.objects.filter(batch_id=run.batch_id).count()
-            != run.row_count
+            or Observation.objects.filter(batch_id=run.batch_id).count() != run.row_count
         ):
             return None, [
                 _operations_failure(
@@ -14167,19 +13361,12 @@ def _operations_exact_inputs(
             identity, latest, run_fetched_at=run_fetched_at
         )
 
-    cycles = {
-        str((run.metadata or {}).get("refresh_cycle_id") or "")
-        for run in selected.values()
-    }
+    cycles = {str((run.metadata or {}).get("refresh_cycle_id") or "") for run in selected.values()}
     if len(cycles) != 1 or not next(iter(cycles), ""):
         return None, [
-            _operations_failure(
-                "refresh-cycle", "four exact inputs do not share one refresh cycle"
-            )
+            _operations_failure("refresh-cycle", "four exact inputs do not share one refresh cycle")
         ]
-    expired = sorted(
-        identity for identity, deadline in deadlines.items() if deadline < now
-    )
+    expired = sorted(identity for identity, deadline in deadlines.items() if deadline < now)
     if expired and not allow_expired:
         return None, [
             _operations_failure(
@@ -14206,9 +13393,7 @@ def _operations_exact_inputs(
         summary = _operations_treasury_summary(
             (observation.metadata or {}).get("operations"), period=period
         )
-        if summary is None or not _fed_balance_sheet_decimal_equal(
-            summary[0], observation.value
-        ):
+        if summary is None or not _fed_balance_sheet_decimal_equal(summary[0], observation.value):
             return None, [
                 _operations_failure(
                     "treasury",
@@ -14221,9 +13406,7 @@ def _operations_exact_inputs(
             operation_id = str(json.loads(canonical).get("operationId") or "")
             if operation_id in treasury_operation_ids:
                 return None, [
-                    _operations_failure(
-                        "treasury", "duplicate Treasury operation ID across dates"
-                    )
+                    _operations_failure("treasury", "duplicate Treasury operation ID across dates")
                 ]
             treasury_operation_ids.add(operation_id)
 
@@ -14236,9 +13419,7 @@ def _operations_exact_inputs(
     )
     onrrp_date_sets = [set(maps[key]) for key in onrrp_series]
     if any(item != onrrp_date_sets[0] for item in onrrp_date_sets[1:]):
-        return None, [
-            _operations_failure("onrrp", "ON RRP required series date sets differ")
-        ]
+        return None, [_operations_failure("onrrp", "ON RRP required series date sets differ")]
     for period in sorted(onrrp_date_sets[0]):
         total = maps["onrrp"][period]
         regular = maps["onrrp-non-small-value-total"][period]
@@ -14287,24 +13468,17 @@ def _operations_exact_inputs(
             or rate_summary is None
             or participant_summary is None
             or len(regular_summary[1]) != 1
-            or total_summary[3]
-            != sorted(regular_summary[3] + small_summary[3])
+            or total_summary[3] != sorted(regular_summary[3] + small_summary[3])
             or rate_summary[3] != regular_summary[3]
             or participant_summary[3] != regular_summary[3]
             or (regular.metadata or {}).get("small_value_excluded") is not True
             or (small.metadata or {}).get("small_value_only") is not True
-            or (rate_observation.metadata or {}).get("small_value_excluded")
-            is not True
-            or (participant_observation.metadata or {}).get(
-                "small_value_excluded"
-            )
-            is not True
+            or (rate_observation.metadata or {}).get("small_value_excluded") is not True
+            or (participant_observation.metadata or {}).get("small_value_excluded") is not True
             or not _fed_balance_sheet_decimal_equal(total.value, total_summary[0])
             or not _fed_balance_sheet_decimal_equal(regular.value, regular_summary[0])
             or not _fed_balance_sheet_decimal_equal(small.value, small_summary[0])
-            or not _fed_balance_sheet_decimal_equal(
-                total.value, regular.value + small.value
-            )
+            or not _fed_balance_sheet_decimal_equal(total.value, regular.value + small.value)
             or not _fed_balance_sheet_decimal_equal(
                 rate_observation.value, next(iter(regular_summary[1]))
             )
@@ -14324,9 +13498,7 @@ def _operations_exact_inputs(
     srf_series = tuple(OPERATIONS_REQUIRED_SERIES["srf"])
     srf_date_sets = [set(maps[key]) for key in srf_series]
     if any(item != srf_date_sets[0] for item in srf_date_sets[1:]):
-        return None, [
-            _operations_failure("srf", "SRF required series date sets differ")
-        ]
+        return None, [_operations_failure("srf", "SRF required series date sets differ")]
     for period in sorted(srf_date_sets[0]):
         total = maps["srp"][period]
         regular = maps["srp-non-small-value-total"][period]
@@ -14377,14 +13549,11 @@ def _operations_exact_inputs(
             or regular_evidence is None
             or small_evidence is None
             or len(regular_summary[2]) != 1
-            or total_evidence[3]
-            != sorted(regular_evidence[3] + small_evidence[3])
+            or total_evidence[3] != sorted(regular_evidence[3] + small_evidence[3])
             or not _fed_balance_sheet_decimal_equal(total.value, total_evidence[0])
             or regular_evidence[3]
             != sorted(
-                json.dumps(
-                    operation, sort_keys=True, ensure_ascii=False, default=str
-                )
+                json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
                 for operation in (regular.metadata or {}).get("operations") or []
             )
             or any(
@@ -14395,24 +13564,15 @@ def _operations_exact_inputs(
                         ensure_ascii=False,
                         default=str,
                     )
-                    for operation in (
-                        maps[series_key][period].metadata or {}
-                    ).get("operations")
+                    for operation in (maps[series_key][period].metadata or {}).get("operations")
                     or []
                 )
                 != regular_evidence[3]
-                or (maps[series_key][period].metadata or {}).get(
-                    "small_value_excluded"
-                )
-                is not True
+                or (maps[series_key][period].metadata or {}).get("small_value_excluded") is not True
                 for series_key in regular_series_keys
             )
-            or not _fed_balance_sheet_decimal_equal(
-                total.value, regular.value + small.value
-            )
-            or not _fed_balance_sheet_decimal_equal(
-                regular.value, regular_summary[0]
-            )
+            or not _fed_balance_sheet_decimal_equal(total.value, regular.value + small.value)
+            or not _fed_balance_sheet_decimal_equal(regular.value, regular_summary[0])
             or not _fed_balance_sheet_decimal_equal(small.value, small_summary[0])
             or not _fed_balance_sheet_decimal_equal(
                 maps["srp-non-small-value-treasury"][period].value,
@@ -14460,15 +13620,11 @@ def _operations_exact_inputs(
         for observation in maps[series_key].values()
     ):
         return None, [
-            _operations_failure(
-                "soma", "SOMA series source-field metadata failed validation"
-            )
+            _operations_failure("soma", "SOMA series source-field metadata failed validation")
         ]
     if len(maps["soma-total"]) < 2:
         return None, [
-            _operations_failure(
-                "soma", "SOMA exact batch requires two official observations"
-            )
+            _operations_failure("soma", "SOMA exact batch requires two official observations")
         ]
     return {
         "maps": maps,
@@ -14497,9 +13653,7 @@ def _operations_direct_metric(
     formula: str | None = None,
     input_lineage: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    lineage = _operations_direct_lineage(
-        observation, license_scope=scope, fresh_until=fresh_until
-    )
+    lineage = _operations_direct_lineage(observation, license_scope=scope, fresh_until=fresh_until)
     metadata = {
         "input_series": [observation.series.key],
         "input_batch_ids": [str(observation.batch_id)],
@@ -14544,9 +13698,7 @@ def _operations_derived_metric(
     input_batches = sorted({str(item["batch_id"]) for item in inputs})
     value_dates = [str(item["value_date"]) for item in inputs]
     fetched = max(datetime.fromisoformat(str(item["fetched_at"])) for item in inputs)
-    fresh_until = min(
-        datetime.fromisoformat(str(item["fresh_until"])) for item in inputs
-    )
+    fresh_until = min(datetime.fromisoformat(str(item["fresh_until"])) for item in inputs)
     latest_date = max(datetime.fromisoformat(item) for item in value_dates)
     return {
         "key": key,
@@ -14562,9 +13714,7 @@ def _operations_derived_metric(
         "fallback_source": None,
         "license_scope": internal_scope,
         "value_date": latest_date.isoformat(),
-        "as_of": max(
-            datetime.fromisoformat(str(item["as_of"])) for item in inputs
-        ).isoformat(),
+        "as_of": max(datetime.fromisoformat(str(item["as_of"])) for item in inputs).isoformat(),
         "fetched_at": fetched.isoformat(),
         "fresh_until": fresh_until.isoformat(),
         "batch_id": ",".join(input_batches),
@@ -14597,9 +13747,7 @@ def _operations_chart(
     quality_status: str,
     scopes: dict[str, str],
 ) -> dict[str, Any]:
-    sources = {
-        source.key: source for source in Source.objects.filter(key__in=source_keys)
-    }
+    sources = {source.key: source for source in Source.objects.filter(key__in=source_keys)}
     return {
         "key": key,
         "title": title,
@@ -14637,9 +13785,7 @@ def _operations_page_data(
     | None,
     list[dict[str, Any]],
 ]:
-    context, failures = _operations_exact_inputs(
-        selected, allow_expired=allow_expired
-    )
+    context, failures = _operations_exact_inputs(selected, allow_expired=allow_expired)
     if context is None:
         return None, failures
     maps = context["maps"]
@@ -14651,9 +13797,7 @@ def _operations_page_data(
     treasury_dates = sorted(maps["treasury-purchases"])
     latest_treasury_date = treasury_dates[-1]
     treasury_window_dates = [
-        period
-        for period in treasury_dates
-        if period >= latest_treasury_date - timedelta(days=29)
+        period for period in treasury_dates if period >= latest_treasury_date - timedelta(days=29)
     ]
     treasury_inputs = [
         _operations_direct_lineage(
@@ -14685,11 +13829,7 @@ def _operations_page_data(
         for period in srf_window_dates
     ]
     srf_active_days = Decimal(
-        sum(
-            1
-            for period in srf_window_dates
-            if maps["srp-non-small-value-total"][period].value > 0
-        )
+        sum(1 for period in srf_window_dates if maps["srp-non-small-value-total"][period].value > 0)
     )
 
     soma_dates = sorted(maps["soma-total"])
@@ -14814,16 +13954,12 @@ def _operations_page_data(
         ),
     ]
     metrics[-1]["metadata"]["previous_value"] = float(previous_soma.value)
-    metrics[-1]["metadata"]["previous_value_date"] = (
-        previous_soma.value_date.isoformat()
-    )
+    metrics[-1]["metadata"]["previous_value_date"] = previous_soma.value_date.isoformat()
     metrics[-1]["metadata"]["previous_input_lineage"] = [previous_soma_lineage]
 
     treasury_chart_rows: list[dict[str, Any]] = []
     treasury_chart_dates = [
-        period
-        for period in treasury_dates
-        if treasury_dates[0] <= period - timedelta(days=29)
+        period for period in treasury_dates if treasury_dates[0] <= period - timedelta(days=29)
     ]
     for period in treasury_chart_dates:
         observation = maps["treasury-purchases"][period]
@@ -14869,8 +14005,7 @@ def _operations_page_data(
 
     standing_rows: list[dict[str, Any]] = []
     standing_dates = sorted(
-        set(maps["onrrp-non-small-value-total"])
-        | set(maps["srp-non-small-value-total"])
+        set(maps["onrrp-non-small-value-total"]) | set(maps["srp-non-small-value-total"])
     )
     for period in standing_dates:
         row: dict[str, Any] = {"date": period.isoformat(), "_lineage": {}}
@@ -14922,9 +14057,7 @@ def _operations_page_data(
         _operations_chart(
             key="operations-treasury-purchases-history",
             title="国债二级市场购买",
-            description=(
-                "官方购买结果全量；含 RMP、再投资及 feed 未分类的可能演练。"
-            ),
+            description=("官方购买结果全量；含 RMP、再投资及 feed 未分类的可能演练。"),
             data=treasury_chart_rows,
             source_keys={"internal", "ny-fed-markets"},
             batch_ids={str(selected["treasury"].batch_id)},
@@ -14974,15 +14107,9 @@ def _operations_page_data(
             fresh_until=deadlines["treasury"],
         )
         for operation in reversed((observation.metadata or {}).get("operations") or []):
-            submitted = Decimal(str(operation["totalParAmtSubmitted"])) / Decimal(
-                "1000000"
-            )
-            accepted = Decimal(str(operation["totalParAmtAccepted"])) / Decimal(
-                "1000000"
-            )
-            maturity_range = (
-                f"{operation['maturityRangeStart']} → {operation['maturityRangeEnd']}"
-            )
+            submitted = Decimal(str(operation["totalParAmtSubmitted"])) / Decimal("1000000")
+            accepted = Decimal(str(operation["totalParAmtAccepted"])) / Decimal("1000000")
+            maturity_range = f"{operation['maturityRangeStart']} → {operation['maturityRangeEnd']}"
             cells = [
                 _operations_cell("operation-id", operation["operationId"]),
                 _operations_cell("date", operation["operationDate"]),
@@ -15032,9 +14159,7 @@ def _operations_page_data(
                 observation, license_scope=ny_scope, fresh_until=deadline
             )
             for operation in (observation.metadata or {}).get("operations") or []:
-                accepted = Decimal(str(operation["totalAmtAccepted"])) / Decimal(
-                    "1000000"
-                )
+                accepted = Decimal(str(operation["totalAmtAccepted"])) / Decimal("1000000")
                 rates: list[Decimal] = []
                 for detail in operation.get("details") or []:
                     raw_rate = detail.get("percentAwardRate")
@@ -15046,9 +14171,7 @@ def _operations_page_data(
                         rates.append(Decimal(str(raw_rate)))
                 rates = sorted(set(rates))
                 rate_display = ", ".join(str(rate) for rate in rates) or "—"
-                participants = operation.get(
-                    "acceptedCpty", operation.get("participatingCpty")
-                )
+                participants = operation.get("acceptedCpty", operation.get("participatingCpty"))
                 collateral = ", ".join(
                     str(detail.get("securityType"))
                     for detail in operation.get("details") or []
@@ -15104,9 +14227,7 @@ def _operations_page_data(
         {
             "key": "recent-treasury-purchase-operations",
             "title": "最近 20 场国债二级市场购买",
-            "description": (
-                "结果 feed 不披露稳定的 RMP/再投资用途或 small-value 标志。"
-            ),
+            "description": ("结果 feed 不披露稳定的 RMP/再投资用途或 small-value 标志。"),
             "columns": [
                 {"key": "operation-id", "label": "Operation ID"},
                 {"key": "date", "label": "日期"},
@@ -15151,12 +14272,8 @@ def _operations_page_data(
                 str(selected["srf"].batch_id),
             ],
             "as_of": max(onrrp_regular.as_of, srf_regular.as_of).isoformat(),
-            "fetched_at": max(
-                onrrp_regular.fetched_at, srf_regular.fetched_at
-            ).isoformat(),
-            "fresh_until": min(
-                deadlines["onrrp"], deadlines["srf"]
-            ).isoformat(),
+            "fetched_at": max(onrrp_regular.fetched_at, srf_regular.fetched_at).isoformat(),
+            "fresh_until": min(deadlines["onrrp"], deadlines["srf"]).isoformat(),
             "quality_status": Observation.Quality.FRESH,
             "fallback_source": None,
         },
@@ -15170,8 +14287,7 @@ def _operations_page_data(
         ],
         "formulas": dict(OPERATIONS_FORMULAS),
         "component_value_dates": {
-            identity: period.isoformat()
-            for identity, period in context["latest_dates"].items()
+            identity: period.isoformat() for identity, period in context["latest_dates"].items()
         },
         "treasury_coverage": (
             "All official purchase results; includes reserve-management and "
@@ -15217,15 +14333,15 @@ def _operations_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         return False
     metric_by_key = {str(item["key"]): item for item in metrics}
     try:
-        treasury_inputs = (
-            metric_by_key["treasury-purchases-30d"].get("metadata") or {}
-        ).get("input_lineage")
-        srf_inputs = (
-            metric_by_key["srf-active-days-30d"].get("metadata") or {}
-        ).get("input_lineage")
-        soma_inputs = (
-            metric_by_key["soma-weekly-change"].get("metadata") or {}
-        ).get("input_lineage")
+        treasury_inputs = (metric_by_key["treasury-purchases-30d"].get("metadata") or {}).get(
+            "input_lineage"
+        )
+        srf_inputs = (metric_by_key["srf-active-days-30d"].get("metadata") or {}).get(
+            "input_lineage"
+        )
+        soma_inputs = (metric_by_key["soma-weekly-change"].get("metadata") or {}).get(
+            "input_lineage"
+        )
         if (
             not isinstance(treasury_inputs, list)
             or not treasury_inputs
@@ -15239,15 +14355,13 @@ def _operations_page_contract_is_buildable(data: dict[str, Any]) -> bool:
             (Decimal(str(item["raw_value"])) for item in treasury_inputs),
             Decimal("0"),
         )
-        active_days = Decimal(
-            sum(1 for item in srf_inputs if Decimal(str(item["raw_value"])) > 0)
-        )
+        active_days = Decimal(sum(1 for item in srf_inputs if Decimal(str(item["raw_value"])) > 0))
         soma_change = Decimal(str(soma_inputs[0]["raw_value"])) - Decimal(
             str(soma_inputs[1]["raw_value"])
         )
-        onrrp_inputs = (
-            metric_by_key["onrrp-non-small-value-total"].get("metadata") or {}
-        ).get("input_lineage")
+        onrrp_inputs = (metric_by_key["onrrp-non-small-value-total"].get("metadata") or {}).get(
+            "input_lineage"
+        )
         srf_partition_inputs = (
             metric_by_key["srf-non-small-value-total"].get("metadata") or {}
         ).get("input_lineage")
@@ -15289,9 +14403,7 @@ def _operations_page_contract_is_buildable(data: dict[str, Any]) -> bool:
     ):
         return False
     section_by_key = {str(item["key"]): item for item in sections}
-    treasury_rows = section_by_key["recent-treasury-purchase-operations"].get(
-        "rows"
-    )
+    treasury_rows = section_by_key["recent-treasury-purchase-operations"].get("rows")
     repo_rows = section_by_key["recent-repo-reverse-repo-operations"].get("rows")
     if (
         not isinstance(treasury_rows, list)
@@ -15311,8 +14423,7 @@ def _operations_page_contract_is_buildable(data: dict[str, Any]) -> bool:
             and all(isinstance(item, dict) for item in cells)
             and tuple(str(item.get("key") or "") for item in cells) == keys
             and all(
-                isinstance(item.get("cell"), dict)
-                and item["cell"].get("kind") == "text"
+                isinstance(item.get("cell"), dict) and item["cell"].get("kind") == "text"
                 for item in cells
             )
             and row.get("source_key") == "ny-fed-markets"
@@ -15359,11 +14470,7 @@ def _operations_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
             "source", "fallback_source"
         )
     )
-    normalized = {
-        item.key: item
-        for item in all_normalized
-        if item.key.startswith("operations-")
-    }
+    normalized = {item.key: item for item in all_normalized if item.key.startswith("operations-")}
     expected = {f"operations-{key}" for key in OPERATIONS_REQUIRED_METRIC_KEYS}
     if len(all_normalized) != len(expected) or set(normalized) != expected:
         return False
@@ -15380,9 +14487,7 @@ def _operations_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
             or (stored.change is None) != (metric.get("change") is None)
             or (
                 stored.change is not None
-                and not _fed_balance_sheet_decimal_equal(
-                    stored.change, metric.get("change")
-                )
+                and not _fed_balance_sheet_decimal_equal(stored.change, metric.get("change"))
             )
             or stored.source.key != metric.get("source_key")
             or stored.fallback_source_id is not None
@@ -15394,22 +14499,15 @@ def _operations_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
             or stored.metadata.get("component_batch_id") != metric.get("batch_id")
             or stored.metadata.get("formula") != metadata.get("formula")
             or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
-            or stored.metadata.get("input_series")
-            != metadata.get("input_series", [])
-            or stored.metadata.get("input_value_dates")
-            != metadata.get("input_value_dates", [])
-            or stored.metadata.get("calculation_owner")
-            != metadata.get("calculation_owner")
-            or stored.metadata.get("previous_value")
-            != metadata.get("previous_value")
-            or stored.metadata.get("previous_value_date")
-            != metadata.get("previous_value_date")
+            or stored.metadata.get("input_series") != metadata.get("input_series", [])
+            or stored.metadata.get("input_value_dates") != metadata.get("input_value_dates", [])
+            or stored.metadata.get("calculation_owner") != metadata.get("calculation_owner")
+            or stored.metadata.get("previous_value") != metadata.get("previous_value")
+            or stored.metadata.get("previous_value_date") != metadata.get("previous_value_date")
             or stored.metadata.get("previous_input_lineage")
             != metadata.get("previous_input_lineage", [])
-            or stored.metadata.get("publication_fingerprint")
-            != data.get("fingerprint")
-            or stored.metadata.get("payload_integrity_hash")
-            != data.get("payload_integrity_hash")
+            or stored.metadata.get("publication_fingerprint") != data.get("fingerprint")
+            or stored.metadata.get("payload_integrity_hash") != data.get("payload_integrity_hash")
             or set(stored.metadata.get("input_batch_ids") or [])
             != set(metadata.get("input_batch_ids") or [])
         ):
@@ -15428,9 +14526,7 @@ def _operations_component_runs_from_snapshot(
     ):
         return None
     by_identity = {
-        str(item.get("component") or ""): item
-        for item in references
-        if isinstance(item, dict)
+        str(item.get("component") or ""): item for item in references if isinstance(item, dict)
     }
     if set(by_identity) != set(OPERATIONS_DATASETS):
         return None
@@ -15457,15 +14553,11 @@ def _operations_component_runs_from_snapshot(
             or str(reference.get("refresh_cycle_id") or "")
             != str((run.metadata or {}).get("refresh_cycle_id") or "")
             or not _operations_artifact_is_valid(run)
-            or reference
-            != _operations_run_state(identity, run, status="valid")
+            or reference != _operations_run_state(identity, run, status="valid")
         ):
             return None
         selected[identity] = run
-    cycles = {
-        str((run.metadata or {}).get("refresh_cycle_id") or "")
-        for run in selected.values()
-    }
+    cycles = {str((run.metadata or {}).get("refresh_cycle_id") or "") for run in selected.values()}
     if (
         len(cycles) != 1
         or not next(iter(cycles), "")
@@ -15494,8 +14586,7 @@ def _operations_snapshot_contract_is_valid(
         or snapshot.source.key != "internal"
         or snapshot.quality_status not in valid_quality
         or data.get("demo") is not False
-        or data.get("required_notices")
-        != public_source_notices(required_sources)
+        or data.get("required_notices") != public_source_notices(required_sources)
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or "refresh_failure" in data
         or set(data.get("component_batches") or [])
@@ -15515,9 +14606,7 @@ def _operations_snapshot_contract_is_valid(
         or not _operations_page_contract_is_buildable(data)
     ):
         return False
-    prepared, _failures = _operations_page_data(
-        selected_runs, allow_expired=allow_natural_expiry
-    )
+    prepared, _failures = _operations_page_data(selected_runs, allow_expired=allow_natural_expiry)
     if prepared is None:
         return False
     metrics, charts, sections, extra = prepared
@@ -15545,9 +14634,7 @@ def _operations_embedded_snapshot_is_valid(
     for source_key in required_sources:
         source = Source.objects.filter(key=source_key).first()
         licence = (
-            _effective_source_license(
-                source, require_public=True, require_derived=True
-            )
+            _effective_source_license(source, require_public=True, require_derived=True)
             if source is not None
             else None
         )
@@ -15569,8 +14656,7 @@ def _operations_embedded_snapshot_is_valid(
         or not snapshot.is_published
         or snapshot.source.key != "internal"
         or data.get("demo") is not False
-        or data.get("required_notices")
-        != public_source_notices(required_sources)
+        or data.get("required_notices") != public_source_notices(required_sources)
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or set(data.get("component_batches") or [])
         != {str(run.batch_id) for run in selected.values()}
@@ -15592,14 +14678,14 @@ def _operations_embedded_snapshot_is_valid(
     ):
         return False
     charts = data.get("charts")
-    if not isinstance(charts, list) or not charts or data.get("chart_data") != charts[0].get(
-        "data"
+    if (
+        not isinstance(charts, list)
+        or not charts
+        or data.get("chart_data") != charts[0].get("data")
     ):
         return False
     expected_batches = {str(run.batch_id) for run in selected.values()}
-    audited_payload = {
-        key: value for key, value in data.items() if key != "refresh_failure"
-    }
+    audited_payload = {key: value for key, value in data.items() if key != "refresh_failure"}
 
     if (
         set(data.get("source_keys") or []) != required_sources
@@ -15618,16 +14704,14 @@ def _operations_embedded_snapshot_is_valid(
         if declared_source_keys is not None:
             if (
                 not isinstance(declared_source_keys, list)
-                or not set(str(item) for item in declared_source_keys)
-                <= required_sources
+                or not set(str(item) for item in declared_source_keys) <= required_sources
             ):
                 return False
         declared_batch_ids = value.get("batch_ids")
         if declared_batch_ids is not None:
             if (
                 not isinstance(declared_batch_ids, list)
-                or not set(str(item) for item in declared_batch_ids)
-                <= expected_batches
+                or not set(str(item) for item in declared_batch_ids) <= expected_batches
             ):
                 return False
         source_key = value.get("source_key")
@@ -15654,9 +14738,7 @@ def _operations_embedded_snapshot_is_valid(
                 return False
         if source_key == "internal":
             internal_batches = {
-                item.strip()
-                for item in str(batch_id or "").split(",")
-                if item.strip()
+                item.strip() for item in str(batch_id or "").split(",") if item.strip()
             }
             if (
                 not internal_batches
@@ -15679,15 +14761,13 @@ def _operations_has_component_transition(
     if selected is None:
         return False
     attempts = latest_attempts or {
-        identity: _latest_operations_attempt(identity)
-        for identity in OPERATIONS_DATASETS
+        identity: _latest_operations_attempt(identity) for identity in OPERATIONS_DATASETS
     }
     return bool(
         set(attempts) == set(OPERATIONS_DATASETS)
         and all(attempt is not None for attempt in attempts.values())
         and any(
-            attempts[identity] is not None
-            and attempts[identity].pk != selected[identity].pk
+            attempts[identity] is not None and attempts[identity].pk != selected[identity].pk
             for identity in OPERATIONS_DATASETS
         )
     )
@@ -15696,21 +14776,15 @@ def _operations_has_component_transition(
 def _operations_snapshot_is_publicly_displayable_unchecked(
     snapshot: DashboardSnapshot,
 ) -> bool:
-    attempts = {
-        identity: _latest_operations_attempt(identity)
-        for identity in OPERATIONS_DATASETS
-    }
+    attempts = {identity: _latest_operations_attempt(identity) for identity in OPERATIONS_DATASETS}
     successful = {
-        identity: _latest_successful_operations_run(identity)
-        for identity in OPERATIONS_DATASETS
+        identity: _latest_successful_operations_run(identity) for identity in OPERATIONS_DATASETS
     }
     if any(run is None for run in attempts.values()) or any(
         run is None for run in successful.values()
     ):
         return False
-    selected = {
-        identity: run for identity, run in successful.items() if run is not None
-    }
+    selected = {identity: run for identity, run in successful.items() if run is not None}
     if all(
         attempts[identity].status == IngestionRun.Status.SUCCESS
         and attempts[identity].row_count > 0
@@ -15725,15 +14799,11 @@ def _operations_snapshot_is_publicly_displayable_unchecked(
             allow_natural_expiry=expired,
         ):
             return True
-    if _operations_embedded_snapshot_is_valid(
-        snapshot, require_persisted_failure=True
-    ):
+    if _operations_embedded_snapshot_is_valid(snapshot, require_persisted_failure=True):
         return True
     return _operations_has_component_transition(
         snapshot, latest_attempts=attempts
-    ) and _operations_embedded_snapshot_is_valid(
-        snapshot, require_persisted_failure=False
-    )
+    ) and _operations_embedded_snapshot_is_valid(snapshot, require_persisted_failure=False)
 
 
 def operations_snapshot_is_publicly_displayable(
@@ -15780,9 +14850,7 @@ def select_public_operations_snapshot(
     return selected
 
 
-def _mark_operations_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_operations_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -15857,12 +14925,9 @@ def _coordinate_operations_dashboard(
     expected_batches = {str(run.batch_id) for run in selected.values()}
     if (
         previous is not None
-        and set((previous.data or {}).get("component_batches") or [])
-        == expected_batches
+        and set((previous.data or {}).get("component_batches") or []) == expected_batches
         and "refresh_failure" not in (previous.data or {})
-        and _operations_snapshot_contract_is_valid(
-            previous, selected_runs=selected
-        )
+        and _operations_snapshot_contract_is_valid(previous, selected_runs=selected)
     ):
         return [], set()
     prepared, failures = _operations_page_data(selected)
@@ -15880,16 +14945,11 @@ def _coordinate_operations_dashboard(
         previous_dates = (previous.data or {}).get("component_value_dates") or {}
         candidate_dates = extra_data["component_value_dates"]
         if any(
-            identity in previous_dates
-            and candidate_dates[identity] < str(previous_dates[identity])
+            identity in previous_dates and candidate_dates[identity] < str(previous_dates[identity])
             for identity in OPERATIONS_DATASETS
         ):
             _mark_operations_stale(
-                [
-                    _operations_failure(
-                        "regression", "candidate component value date regressed"
-                    )
-                ],
+                [_operations_failure("regression", "candidate component value date regressed")],
                 reason="Candidate operations v1 data regressed; retained prior snapshot.",
             )
             return [], {"operations"}
@@ -15924,9 +14984,7 @@ def _coordinate_operations_dashboard(
             if (
                 latest is None
                 or not _operations_runs_still_latest(selected)
-                or not _operations_snapshot_contract_is_valid(
-                    latest, selected_runs=selected
-                )
+                or not _operations_snapshot_contract_is_valid(latest, selected_runs=selected)
             ):
                 raise ValueError("operations v1 publication postcondition failed")
     except (ArithmeticError, IndexError, KeyError, StopIteration, TypeError, ValueError):
@@ -15969,10 +15027,7 @@ def _h10_run_state(
         "source": ASSETS_FX_DATASET[0],
         "dataset": ASSETS_FX_DATASET[1],
         "status": status or (run.status if run is not None else "missing"),
-        "reason": (
-            reason
-            or (run.error if run is not None else "required H.10 run missing")
-        )[:320],
+        "reason": (reason or (run.error if run is not None else "required H.10 run missing"))[:320],
         "ingestion_run_id": run.pk if run is not None else None,
         "batch_id": str(run.batch_id) if run is not None else None,
         "row_count": run.row_count if run is not None else 0,
@@ -16025,9 +15080,7 @@ def _validated_h10_artifact_bytes(
     if len(artifacts) != 1:
         raise ValueError("H.10 requires exactly one private acquisition artifact")
     artifact = artifacts[0]
-    expected_uri = (
-        f"private://federal-reserve/{archive_sha[:2]}/{archive_sha}.bin"
-    )
+    expected_uri = f"private://federal-reserve/{archive_sha[:2]}/{archive_sha}.bin"
     if (
         artifact.sha256.lower() != archive_sha
         or artifact.size_bytes != archive_size
@@ -16048,18 +15101,14 @@ def _validated_h10_artifact_bytes(
             payload = handle.read(archive_size + 1)
     except OSError as exc:
         raise ValueError("H.10 private artifact is unavailable") from exc
-    if (
-        len(payload) != archive_size
-        or hashlib.sha256(payload).hexdigest() != archive_sha
-    ):
+    if len(payload) != archive_size or hashlib.sha256(payload).hexdigest() != archive_sha:
         raise ValueError("H.10 private artifact bytes failed integrity check")
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             member = FederalReserveH10Provider._data_member(archive)
             if (
                 member.flag_bits & 0x1
-                or member.compress_type
-                not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                or member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
                 or member.file_size != member_size
                 or (
                     member.file_size > 1024 * 1024
@@ -16080,13 +15129,17 @@ def _validated_h10_artifact_bytes(
         or hashlib.sha256(member_bytes).hexdigest() != member_sha
     ):
         raise ValueError("H.10 private member hash, name or size changed")
-    return payload, artifact, {
-        "archive_sha256": archive_sha,
-        "archive_size": archive_size,
-        "member_sha256": member_sha,
-        "member_size": member_size,
-        "member_name": member.filename,
-    }
+    return (
+        payload,
+        artifact,
+        {
+            "archive_sha256": archive_sha,
+            "archive_size": archive_size,
+            "member_sha256": member_sha,
+            "member_size": member_size,
+            "member_name": member.filename,
+        },
+    )
 
 
 def _validated_h10_component(
@@ -16100,10 +15153,7 @@ def _validated_h10_component(
     payload, artifact, artifact_meta = _validated_h10_artifact_bytes(run)
     run_metadata = dict(run.metadata or {})
     fetched_at = _parse_payload_datetime(run_metadata.get("fetched_at"))
-    if (
-        fetched_at is None
-        or fetched_at > timezone.now() + timedelta(minutes=5)
-    ):
+    if fetched_at is None or fetched_at > timezone.now() + timedelta(minutes=5):
         raise ValueError("H.10 run lacks a valid nonfuture fetched_at")
     validator = FederalReserveH10Provider()
     try:
@@ -16128,10 +15178,7 @@ def _validated_h10_component(
         "missing_observation_count",
         "quality_status",
     )
-    if any(
-        run_metadata.get(key) != reparsed_metadata.get(key)
-        for key in required_metadata
-    ):
+    if any(run_metadata.get(key) != reparsed_metadata.get(key) for key in required_metadata):
         raise ValueError("H.10 stored release metadata changed")
     prepared = _parse_payload_datetime(reparsed_metadata.get("source_prepared_at"))
     if (
@@ -16145,13 +15192,8 @@ def _validated_h10_component(
         for item in records
         if item.get("value") is not None
     }
-    required_series = {
-        str(item["series_id"]).lower() for item in H10_TARGET_SERIES.values()
-    }
-    if (
-        len(expected) != run.row_count
-        or {identity[0] for identity in expected} != required_series
-    ):
+    required_series = {str(item["series_id"]).lower() for item in H10_TARGET_SERIES.values()}
+    if len(expected) != run.row_count or {identity[0] for identity in expected} != required_series:
         raise ValueError("H.10 reparsed numeric rows do not match the run")
     units = {
         "h10-broad-dollar": "index",
@@ -16160,17 +15202,13 @@ def _validated_h10_component(
         "h10-usdjpy": "JPY/USD",
     }
     definitions = {
-        item.key: item
-        for item in SeriesDefinition.objects.filter(key__in=required_series)
+        item.key: item for item in SeriesDefinition.objects.filter(key__in=required_series)
     }
-    if (
-        set(definitions) != required_series
-        or any(
-            definition.source_id != run.source_id
-            or definition.frequency != "daily"
-            or definition.unit != units[key]
-            for key, definition in definitions.items()
-        )
+    if set(definitions) != required_series or any(
+        definition.source_id != run.source_id
+        or definition.frequency != "daily"
+        or definition.unit != units[key]
+        for key, definition in definitions.items()
     ):
         raise ValueError("H.10 normalized series definitions changed")
 
@@ -16210,9 +15248,7 @@ def _validated_h10_component(
                 raise ValueError("H.10 normalized observation was tampered")
     else:
         for (series_key, raw_date), expected_row in sorted(expected.items()):
-            value_date = datetime.combine(
-                date.fromisoformat(raw_date), time.min, tzinfo=UTC
-            )
+            value_date = datetime.combine(date.fromisoformat(raw_date), time.min, tzinfo=UTC)
             observations.append(
                 SimpleNamespace(
                     series=definitions[series_key],
@@ -16239,9 +15275,7 @@ def _validated_h10_component(
         H10_TARGET_SERIES[board_id]["series_id"].lower(): raw_date
         for board_id, raw_date in reparsed_metadata["latest_valid_dates"].items()
     }
-    if {
-        key: value.date().isoformat() for key, value in latest_dates.items()
-    } != declared_latest:
+    if {key: value.date().isoformat() for key, value in latest_dates.items()} != declared_latest:
         raise ValueError("H.10 latest observation dates changed")
     component_deadline = min(
         fetched_at + timedelta(days=8),
@@ -16328,9 +15362,7 @@ def _assets_fx_page_data(
             raise ValueError("assets-fx requires one successful non-empty H.10 run")
         sources = {
             item.key: item
-            for item in Source.objects.filter(
-                key__in={"federal-reserve", "internal"}
-            )
+            for item in Source.objects.filter(key__in={"federal-reserve", "internal"})
         }
         if set(sources) != {"federal-reserve", "internal"}:
             raise ValueError("assets-fx required sources are missing")
@@ -16385,9 +15417,7 @@ def _assets_fx_page_data(
         metrics: list[dict[str, Any]] = []
         for key, label, decimals, unit in metric_specs:
             previous, current = by_series[key][-2:]
-            change = Decimal("100") * (
-                current.value / previous.value - Decimal("1")
-            )
+            change = Decimal("100") * (current.value / previous.value - Decimal("1"))
             current_lineage = lineage(current)
             previous_lineage = lineage(previous)
             metrics.append(
@@ -16415,9 +15445,7 @@ def _assets_fx_page_data(
                         "change_quality_status": Observation.Quality.ESTIMATED,
                         "change_calculation_owner": "Atlas Macro",
                         "calculation_owner": "Federal Reserve Board",
-                        "quote_convention": current.metadata.get(
-                            "quote_convention"
-                        ),
+                        "quote_convention": current.metadata.get("quote_convention"),
                         "input_series": [key],
                         "input_batch_ids": [str(run.batch_id)],
                         "input_value_dates": [
@@ -16451,25 +15479,18 @@ def _assets_fx_page_data(
                     "fallback_source": None,
                     "lineage": lineage(observation),
                     "_source_keys": ["federal-reserve"],
-                    "_lineage": {
-                        "Nominal Broad Dollar Index": lineage(observation)
-                    },
+                    "_lineage": {"Nominal Broad Dollar Index": lineage(observation)},
                 }
             )
 
         fx_series_keys = ("h10-eurusd", "h10-usdcny", "h10-usdjpy")
         fx_maps = {
-            key: {item.value_date.date(): item for item in by_series[key]}
-            for key in fx_series_keys
+            key: {item.value_date.date(): item for item in by_series[key]} for key in fx_series_keys
         }
-        common_fx_dates = sorted(
-            set.intersection(*(set(rows) for rows in fx_maps.values()))
-        )[-120:]
+        common_fx_dates = sorted(set.intersection(*(set(rows) for rows in fx_maps.values())))[-120:]
         if len(common_fx_dates) != 120:
             raise ValueError("assets-fx major rates require exactly 120 common dates")
-        base_inputs = {
-            key: fx_maps[key][common_fx_dates[0]] for key in fx_series_keys
-        }
+        base_inputs = {key: fx_maps[key][common_fx_dates[0]] for key in fx_series_keys}
         rebased_rows: list[dict[str, Any]] = []
         labels = {
             "h10-eurusd": "EUR reciprocal USD strength",
@@ -16557,13 +15578,10 @@ def _assets_fx_page_data(
                 "data": rebased_rows,
                 "source_keys": ["federal-reserve", "internal"],
                 "license_scopes": [
-                    f"{sources[key].name}: {scopes[key]}"
-                    for key in ("federal-reserve", "internal")
+                    f"{sources[key].name}: {scopes[key]}" for key in ("federal-reserve", "internal")
                 ],
                 "batch_ids": [str(run.batch_id)],
-                "as_of": datetime.combine(
-                    common_fx_dates[-1], time.min, tzinfo=UTC
-                ).isoformat(),
+                "as_of": datetime.combine(common_fx_dates[-1], time.min, tzinfo=UTC).isoformat(),
                 "fetched_at": component["fetched_at"].isoformat(),
                 "fresh_until": fresh_until.isoformat(),
                 "quality_status": Observation.Quality.ESTIMATED,
@@ -16578,17 +15596,12 @@ def _assets_fx_page_data(
             key: {item.value_date.date(): item for item in by_series[key]}
             for key in ASSETS_FX_REQUIRED_METRIC_KEYS
         }
-        recent_dates = sorted(
-            set.intersection(*(set(rows) for rows in all_maps.values()))
-        )[-20:]
+        recent_dates = sorted(set.intersection(*(set(rows) for rows in all_maps.values())))[-20:]
         if len(recent_dates) != 20:
             raise ValueError("assets-fx recent table requires exactly 20 common dates")
         recent_rows: list[dict[str, Any]] = []
         for period in recent_dates:
-            observations = {
-                key: all_maps[key][period]
-                for key in ASSETS_FX_REQUIRED_METRIC_KEYS
-            }
+            observations = {key: all_maps[key][period] for key in ASSETS_FX_REQUIRED_METRIC_KEYS}
             row_lineage = {key: lineage(item) for key, item in observations.items()}
             row = {
                 "date": period.isoformat(),
@@ -16605,9 +15618,7 @@ def _assets_fx_page_data(
                 "fallback_source": None,
                 "lineage": row_lineage,
             }
-            row["cells_list"] = [
-                _assets_fx_cell(key, row[key]) for key in ASSETS_FX_RECENT_COLUMNS
-            ]
+            row["cells_list"] = [_assets_fx_cell(key, row[key]) for key in ASSETS_FX_RECENT_COLUMNS]
             recent_rows.append(row)
 
         latest_date_labels = {
@@ -16645,8 +15656,7 @@ def _assets_fx_page_data(
             "fresh-until": fresh_until.isoformat(),
             "archive": f"{archive_sha} ({component['artifact_size']} bytes)",
             "member": (
-                f"{component['member_name']} / {member_sha} "
-                f"({component['member_size']} bytes)"
+                f"{component['member_name']} / {member_sha} ({component['member_size']} bytes)"
             ),
             "row-count": str(component["row_count"]),
             "licence": scopes["federal-reserve"],
@@ -16659,8 +15669,7 @@ def _assets_fx_page_data(
             "lineage": methodology_lineage,
         }
         methodology_row["cells_list"] = [
-            _assets_fx_cell(key, methodology_row[key])
-            for key in ASSETS_FX_METHODOLOGY_COLUMNS
+            _assets_fx_cell(key, methodology_row[key]) for key in ASSETS_FX_METHODOLOGY_COLUMNS
         ]
 
         gap_rows: list[dict[str, Any]] = []
@@ -16687,8 +15696,7 @@ def _assets_fx_page_data(
                 },
             }
             gap_row["cells_list"] = [
-                _assets_fx_cell(key, gap_row[key])
-                for key in ASSETS_FX_GAP_COLUMNS
+                _assets_fx_cell(key, gap_row[key]) for key in ASSETS_FX_GAP_COLUMNS
             ]
             gap_rows.append(gap_row)
 
@@ -16849,12 +15857,7 @@ def _assets_fx_cells_are_exact(
     return bool(
         isinstance(cells, list)
         and len(cells) == len(keys)
-        and tuple(
-            str(item.get("key") or "")
-            for item in cells
-            if isinstance(item, dict)
-        )
-        == keys
+        and tuple(str(item.get("key") or "") for item in cells if isinstance(item, dict)) == keys
         and all(
             isinstance(item.get("cell"), dict)
             and item["cell"].get("kind") == "text"
@@ -16881,39 +15884,28 @@ def _assets_fx_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         or data.get("formula_version") != ASSETS_FX_FORMULA_VERSION
         or data.get("formulas") != ASSETS_FX_FORMULAS
         or data.get("semantic_boundary") != ASSETS_FX_SEMANTIC_BOUNDARY
-        or data.get("required_metric_keys")
-        != sorted(ASSETS_FX_REQUIRED_METRIC_KEYS)
-        or data.get("required_chart_keys")
-        != sorted(ASSETS_FX_REQUIRED_CHART_KEYS)
-        or data.get("required_section_keys")
-        != sorted(ASSETS_FX_REQUIRED_SECTION_KEYS)
+        or data.get("required_metric_keys") != sorted(ASSETS_FX_REQUIRED_METRIC_KEYS)
+        or data.get("required_chart_keys") != sorted(ASSETS_FX_REQUIRED_CHART_KEYS)
+        or data.get("required_section_keys") != sorted(ASSETS_FX_REQUIRED_SECTION_KEYS)
         or not isinstance(metrics, list)
         or len(metrics) != 4
         or any(not isinstance(item, dict) for item in metrics)
-        or {str(item.get("key") or "") for item in metrics}
-        != set(ASSETS_FX_REQUIRED_METRIC_KEYS)
+        or {str(item.get("key") or "") for item in metrics} != set(ASSETS_FX_REQUIRED_METRIC_KEYS)
         or not isinstance(charts, list)
         or len(charts) != 2
         or any(not isinstance(item, dict) for item in charts)
-        or {str(item.get("key") or "") for item in charts}
-        != set(ASSETS_FX_REQUIRED_CHART_KEYS)
+        or {str(item.get("key") or "") for item in charts} != set(ASSETS_FX_REQUIRED_CHART_KEYS)
         or not isinstance(sections, list)
         or len(sections) != 3
         or any(not isinstance(item, dict) for item in sections)
-        or {str(item.get("key") or "") for item in sections}
-        != set(ASSETS_FX_REQUIRED_SECTION_KEYS)
+        or {str(item.get("key") or "") for item in sections} != set(ASSETS_FX_REQUIRED_SECTION_KEYS)
         or data.get("chart_data")
         != next(
-            (
-                item.get("data")
-                for item in charts
-                if item.get("key") == "fx-broad-dollar-history"
-            ),
+            (item.get("data") for item in charts if item.get("key") == "fx-broad-dollar-history"),
             None,
         )
         or data.get("demo") is not False
-        or set(data.get("source_keys") or [])
-        != {"federal-reserve", "internal"}
+        or set(data.get("source_keys") or []) != {"federal-reserve", "internal"}
         or _payload_fallback_source_keys(data)
     ):
         return False
@@ -16922,38 +15914,31 @@ def _assets_fx_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         metadata = metric.get("metadata")
         if (
             metric.get("source_key") != "federal-reserve"
-            or set(metric.get("source_keys") or [])
-            != {"federal-reserve", "internal"}
+            or set(metric.get("source_keys") or []) != {"federal-reserve", "internal"}
             or metric.get("quality_status") != Observation.Quality.FRESH
             or metric.get("fallback_source") is not None
             or not isinstance(metadata, dict)
             or metadata.get("formula") != ASSETS_FX_CHANGE_FORMULA
             or metadata.get("change_formula") != ASSETS_FX_CHANGE_FORMULA
-            or metadata.get("change_quality_status")
-            != Observation.Quality.ESTIMATED
+            or metadata.get("change_quality_status") != Observation.Quality.ESTIMATED
             or metadata.get("change_calculation_owner") != "Atlas Macro"
             or metadata.get("current_value_date") != metric.get("value_date")
             or not isinstance(metadata.get("input_lineage"), list)
             or len(metadata["input_lineage"]) != 2
-            or metadata.get("current_input_lineage")
-            != metadata["input_lineage"][1]
-            or metadata.get("previous_input_lineage")
-            != [metadata["input_lineage"][0]]
+            or metadata.get("current_input_lineage") != metadata["input_lineage"][1]
+            or metadata.get("previous_input_lineage") != [metadata["input_lineage"][0]]
             or metadata["input_lineage"][0].get("series_key") != key
             or metadata["input_lineage"][1].get("series_key") != key
         ):
             return False
         try:
             expected_change = Decimal("100") * (
-                Decimal(str(metadata["current_value"]))
-                / Decimal(str(metadata["previous_value"]))
+                Decimal(str(metadata["current_value"])) / Decimal(str(metadata["previous_value"]))
                 - Decimal("1")
             )
         except (ArithmeticError, TypeError, ValueError):
             return False
-        if not _fed_balance_sheet_decimal_equal(
-            metric.get("change"), expected_change
-        ):
+        if not _fed_balance_sheet_decimal_equal(metric.get("change"), expected_change):
             return False
     chart_map = {str(item["key"]): item for item in charts}
     broad = chart_map["fx-broad-dollar-history"]
@@ -16999,18 +15984,12 @@ def _assets_fx_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         or len(methodology_rows) != 1
         or not isinstance(gap_rows, list)
         or len(gap_rows) != 6
-        or not all(
-            _assets_fx_cells_are_exact(row, ASSETS_FX_RECENT_COLUMNS)
-            for row in recent_rows
-        )
+        or not all(_assets_fx_cells_are_exact(row, ASSETS_FX_RECENT_COLUMNS) for row in recent_rows)
         or not all(
             _assets_fx_cells_are_exact(row, ASSETS_FX_METHODOLOGY_COLUMNS)
             for row in methodology_rows
         )
-        or not all(
-            _assets_fx_cells_are_exact(row, ASSETS_FX_GAP_COLUMNS)
-            for row in gap_rows
-        )
+        or not all(_assets_fx_cells_are_exact(row, ASSETS_FX_GAP_COLUMNS) for row in gap_rows)
         or {
             (
                 str(row.get("market-data") or ""),
@@ -17038,9 +16017,7 @@ def _assets_fx_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
             "source", "fallback_source"
         )
     )
-    expected_keys = {
-        f"assets-fx-{key}" for key in ASSETS_FX_REQUIRED_METRIC_KEYS
-    }
+    expected_keys = {f"assets-fx-{key}" for key in ASSETS_FX_REQUIRED_METRIC_KEYS}
     stored = {item.key: item for item in stored_rows}
     if len(stored_rows) != 4 or set(stored) != expected_keys:
         return False
@@ -17149,9 +16126,7 @@ def _assets_fx_refresh_failure_is_valid(
     latest = _latest_h10_attempt() if require_active else None
     if require_active and (latest is None or latest.pk != run.pk):
         return False
-    incomplete = (
-        run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
-    )
+    incomplete = run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
     if incomplete:
         return reason_code == "latest-attempt-incomplete"
     return reason_code in {
@@ -17171,9 +16146,7 @@ def _assets_fx_snapshot_matches_run(
 ) -> bool:
     data = dict(snapshot.data or {})
     required_sources = {"federal-reserve", "internal"}
-    sources = {
-        item.key: item for item in Source.objects.filter(key__in=required_sources)
-    }
+    sources = {item.key: item for item in Source.objects.filter(key__in=required_sources)}
     if set(sources) != required_sources:
         return False
     if any(
@@ -17201,9 +16174,7 @@ def _assets_fx_snapshot_matches_run(
     elif refresh_failure is not None:
         return False
     valid_quality = (
-        {Observation.Quality.STALE}
-        if allow_refresh_failure
-        else {Observation.Quality.ESTIMATED}
+        {Observation.Quality.STALE} if allow_refresh_failure else {Observation.Quality.ESTIMATED}
     )
     if (
         snapshot.key != "assets-fx"
@@ -17230,9 +16201,7 @@ def _assets_fx_snapshot_matches_run(
         or not _assets_fx_page_contract_is_buildable(data)
     ):
         return False
-    audited_payload = {
-        key: value for key, value in data.items() if key != "refresh_failure"
-    }
+    audited_payload = {key: value for key, value in data.items() if key != "refresh_failure"}
     if (
         _payload_batch_ids(audited_payload) != {str(run.batch_id)}
         or not _payload_source_keys(audited_payload) <= required_sources
@@ -17246,9 +16215,7 @@ def _assets_fx_snapshot_matches_run(
     if prepared is None:
         return False
     metrics, charts, sections, extra = prepared
-    metric_dates = [
-        _parse_payload_datetime(item.get("value_date")) for item in metrics
-    ]
+    metric_dates = [_parse_payload_datetime(item.get("value_date")) for item in metrics]
     if any(value is None for value in metric_dates):
         return False
     expected_as_of = min(value for value in metric_dates if value is not None)
@@ -17326,8 +16293,7 @@ def _assets_fx_snapshot_public_state(
         return "retained_failure"
     if (
         latest.pk != embedded.pk
-        and latest.status
-        in {IngestionRun.Status.RUNNING, IngestionRun.Status.SUCCESS}
+        and latest.status in {IngestionRun.Status.RUNNING, IngestionRun.Status.SUCCESS}
         and (latest.status != IngestionRun.Status.SUCCESS or latest.row_count > 0)
         and _assets_fx_base_snapshot_is_valid(snapshot, run=embedded)
     ):
@@ -17339,10 +16305,13 @@ def assets_fx_snapshot_is_publicly_displayable(
     snapshot: DashboardSnapshot,
 ) -> bool:
     try:
-        return _assets_fx_snapshot_public_state(
-            snapshot,
-            latest=_latest_h10_attempt(),
-        ) is not None
+        return (
+            _assets_fx_snapshot_public_state(
+                snapshot,
+                latest=_latest_h10_attempt(),
+            )
+            is not None
+        )
     except (
         ArithmeticError,
         AttributeError,
@@ -17473,8 +16442,7 @@ def _coordinate_assets_fx_dashboard(
     relevant = [
         run
         for run in trigger_runs
-        if run.source.key == ASSETS_FX_DATASET[0]
-        and run.dataset == ASSETS_FX_DATASET[1]
+        if run.source.key == ASSETS_FX_DATASET[0] and run.dataset == ASSETS_FX_DATASET[1]
     ]
     latest = _latest_h10_attempt(lock=True)
     if relevant and (latest is None or any(run.pk != latest.pk for run in relevant)):
@@ -17542,15 +16510,12 @@ def _coordinate_assets_fx_dashboard(
         previous_dates = (previous.data or {}).get("component_value_dates") or {}
         candidate_dates = extra_data["component_value_dates"]
         if not isinstance(previous_dates, dict) or any(
-            key in previous_dates
-            and str(candidate_dates[key]) < str(previous_dates[key])
+            key in previous_dates and str(candidate_dates[key]) < str(previous_dates[key])
             for key in candidate_dates
         ):
             _mark_assets_fx_stale(reason_code="candidate-regression")
             return [], {"assets-fx"}
-    metric_dates = [
-        _parse_payload_datetime(item.get("value_date")) for item in metrics
-    ]
+    metric_dates = [_parse_payload_datetime(item.get("value_date")) for item in metrics]
     if any(value is None for value in metric_dates):
         _mark_assets_fx_stale(reason_code="candidate-validation")
         return [], {"assets-fx"}
@@ -17560,15 +16525,12 @@ def _coordinate_assets_fx_dashboard(
                 run=latest,
                 batch_id=uuid.uuid4(),
             )
-            if not (
-                current := _latest_h10_attempt(lock=True)
-            ) or current.pk != latest.pk:
+            if not (current := _latest_h10_attempt(lock=True)) or current.pk != latest.pk:
                 raise ValueError("assets-fx H.10 run was superseded before commit")
             selected = select_public_assets_fx_snapshot()
             if (
                 selected is None
-                or getattr(selected, "assets_fx_state", None)
-                != "current_candidate"
+                or getattr(selected, "assets_fx_state", None) != "current_candidate"
                 or _assets_fx_run_from_snapshot(selected) != latest
                 or not _assets_fx_snapshot_matches_run(
                     selected,
@@ -17642,15 +16604,11 @@ def _global_dollar_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (reason or (run.error if run else "required dataset run missing"))[
-            :320
-        ],
+        "reason": (reason or (run.error if run else "required dataset run missing"))[:320],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
         "fetched_at": metadata.get("fetched_at") if run else None,
         "prepared_at": metadata.get("source_prepared_at") if run else None,
         "coverage_start": metadata.get("coverage_start") if run else None,
@@ -17672,17 +16630,14 @@ def _select_global_dollar_runs(
         if latest is None or latest.pk != run.pk:
             return None, [], False
     attempts = {
-        identity: _latest_global_dollar_attempt(identity)
-        for identity in GLOBAL_DOLLAR_DATASETS
+        identity: _latest_global_dollar_attempt(identity) for identity in GLOBAL_DOLLAR_DATASETS
     }
     states = [
         _global_dollar_run_state(identity, attempts[identity])
         for identity in GLOBAL_DOLLAR_DATASETS
     ]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in attempts.values()
     ):
         return None, states, True
@@ -17695,8 +16650,7 @@ def _select_global_dollar_runs(
 
 def _global_dollar_runs_still_latest(selected: dict[str, IngestionRun]) -> bool:
     return all(
-        (latest := _latest_global_dollar_attempt(identity)) is not None
-        and latest.pk == run.pk
+        (latest := _latest_global_dollar_attempt(identity)) is not None and latest.pk == run.pk
         for identity, run in selected.items()
     )
 
@@ -17714,14 +16668,9 @@ def _global_dollar_artifact_bytes(
         raise ValueError(f"{identity} requires exactly one acquisition artifact")
     artifact = artifacts[0]
     metadata = dict(run.metadata or {})
-    digest = str(
-        metadata.get("archive_sha256" if identity == "h10" else "sha256") or ""
-    ).lower()
+    digest = str(metadata.get("archive_sha256" if identity == "h10" else "sha256") or "").lower()
     try:
-        size = int(
-            metadata.get("archive_size" if identity == "h10" else "byte_length")
-            or 0
-        )
+        size = int(metadata.get("archive_size" if identity == "h10" else "byte_length") or 0)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{identity} artifact size metadata is invalid") from exc
     content_type = str(metadata.get("content_type") or "")
@@ -17737,9 +16686,7 @@ def _global_dollar_artifact_bytes(
         or size > 16 * 1024 * 1024
     ):
         raise ValueError(f"{identity} artifact row does not match run metadata")
-    root = Path(
-        getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts")
-    )
+    root = Path(getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts"))
     path = root / digest[:2] / f"{digest}.bin"
     try:
         with path.open("rb") as handle:
@@ -17775,22 +16722,17 @@ def _global_dollar_swap_component(
     fetched_at = _parse_payload_datetime(metadata.get("fetched_at"))
     if fetched_at is None:
         raise ValueError("USD swap run lacks valid fetched_at")
-    operations, coverage_start, coverage_end = (
-        _validated_global_dollar_swap_coverage_contract(
-            metadata=metadata,
-            fetched_at=fetched_at,
-            raw_bytes=payload_bytes,
-        )
+    operations, coverage_start, coverage_end = _validated_global_dollar_swap_coverage_contract(
+        metadata=metadata,
+        fetched_at=fetched_at,
+        raw_bytes=payload_bytes,
     )
     expected_rows = NYFedMarketsProvider.usd_fx_swap_records(
         operations,
         as_of_date=coverage_end,
         history_limit=None,
     )
-    expected = {
-        (str(item["series_id"]).lower(), str(item["date"])): item
-        for item in expected_rows
-    }
+    expected = {(str(item["series_id"]).lower(), str(item["date"])): item for item in expected_rows}
     observations: list[Observation] = []
     if require_observations:
         observations = list(
@@ -17799,8 +16741,7 @@ def _global_dollar_swap_component(
             .order_by("series__key", "value_date", "id")
         )
         actual = {
-            (item.series.key, item.value_date.date().isoformat()): item
-            for item in observations
+            (item.series.key, item.value_date.date().isoformat()): item for item in observations
         }
         if (
             run.row_count != len(expected)
@@ -17823,16 +16764,20 @@ def _global_dollar_swap_component(
     if not allow_expired and fresh_until < timezone.now():
         raise ValueError("USD swap exact component is stale")
     by_series = {item.series.key: item for item in observations}
-    return operations, by_series, {
-        "artifact": artifact,
-        "artifact_sha256": artifact.sha256,
-        "fetched_at": fetched_at,
-        "as_of_date": coverage_end,
-        "fresh_until": fresh_until,
-        "row_count": len(observations),
-        "coverage_start": coverage_start,
-        "returned_count": len(operations),
-    }
+    return (
+        operations,
+        by_series,
+        {
+            "artifact": artifact,
+            "artifact_sha256": artifact.sha256,
+            "fetched_at": fetched_at,
+            "as_of_date": coverage_end,
+            "fresh_until": fresh_until,
+            "row_count": len(observations),
+            "coverage_start": coverage_start,
+            "returned_count": len(operations),
+        },
+    )
 
 
 def _global_dollar_cell(key: str, value: Any) -> dict[str, Any]:
@@ -17877,9 +16822,7 @@ def _global_dollar_operation_lineage(
     return {
         "natural_key": operation["natural_key"],
         "counterparty": operation["counterparty"],
-        "trade_date": (
-            operation["trade_date"].isoformat() if operation["trade_date"] else None
-        ),
+        "trade_date": (operation["trade_date"].isoformat() if operation["trade_date"] else None),
         "settlement_date": operation["settlement_date"].isoformat(),
         "maturity_date": operation["maturity_date"].isoformat(),
         "term_in_days": operation["term_in_days"],
@@ -17960,9 +16903,7 @@ def _global_dollar_page_data(
             raise ValueError("H.10 broad dollar lacks six valid observations")
         current_broad = broad_rows[-1]
         prior_broad = broad_rows[-6]
-        broad_change = Decimal("100") * (
-            current_broad.value / prior_broad.value - Decimal("1")
-        )
+        broad_change = Decimal("100") * (current_broad.value / prior_broad.value - Decimal("1"))
         latest_by_key = {key: rows[-1] for key, rows in h10.items()}
 
         def direct_metric(
@@ -18001,17 +16942,13 @@ def _global_dollar_page_data(
                 "fallback_source": None,
                 "metadata": {
                     "calculation_owner": "Federal Reserve Board",
-                    "quote_convention": observation.metadata.get(
-                        "quote_convention"
-                    ),
+                    "quote_convention": observation.metadata.get("quote_convention"),
                     "input_series": [series_key],
                     "input_batch_ids": [str(h10_run.batch_id)],
                     "input_value_dates": [observation.value_date.isoformat()],
                     "input_lineage": [lineage],
                     "acquisition_sha256": h10_hash,
-                    "archive_member_sha256": (h10_run.metadata or {}).get(
-                        "archive_member_sha256"
-                    ),
+                    "archive_member_sha256": (h10_run.metadata or {}).get("archive_member_sha256"),
                     "component": "h10",
                     "input_run_id": h10_run.pk,
                 },
@@ -18054,22 +16991,16 @@ def _global_dollar_page_data(
                 "batch_id": str(h10_run.batch_id),
                 "fallback_source": None,
                 "metadata": {
-                    "formula": GLOBAL_DOLLAR_FORMULAS[
-                        "h10-broad-dollar-5d-change-pct"
-                    ],
+                    "formula": GLOBAL_DOLLAR_FORMULAS["h10-broad-dollar-5d-change-pct"],
                     "calculation_owner": "Atlas Macro",
                     "input_series": ["h10-broad-dollar"],
                     "input_batch_ids": [str(h10_run.batch_id)],
-                    "input_value_dates": [
-                        item.value_date.isoformat() for item in broad_rows[-6:]
-                    ],
+                    "input_value_dates": [item.value_date.isoformat() for item in broad_rows[-6:]],
                     "input_lineage": broad_lineage,
                     "previous_value": f"{Decimal(str(prior_broad.value)):.8f}",
                     "previous_value_date": prior_broad.value_date.isoformat(),
                     "acquisition_sha256": h10_hash,
-                    "archive_member_sha256": (h10_run.metadata or {}).get(
-                        "archive_member_sha256"
-                    ),
+                    "archive_member_sha256": (h10_run.metadata or {}).get("archive_member_sha256"),
                     "component": "h10",
                     "input_run_id": h10_run.pk,
                 },
@@ -18106,15 +17037,11 @@ def _global_dollar_page_data(
         active_regular = [item for item in active if not item["is_small_value"]]
         active_small = [item for item in active if item["is_small_value"]]
         total = sum((item["amount"] for item in active), Decimal("0"))
-        regular_total = sum(
-            (item["amount"] for item in active_regular), Decimal("0")
-        )
+        regular_total = sum((item["amount"] for item in active_regular), Decimal("0"))
         small_total = sum((item["amount"] for item in active_small), Decimal("0"))
         if total != regular_total + small_total:
             raise ValueError("USD swap active partition failed exact reconciliation")
-        counterparty_count = len(
-            {item["counterparty"] for item in active_regular}
-        )
+        counterparty_count = len({item["counterparty"] for item in active_regular})
         swap_as_of = datetime.combine(as_of_date, time.min, tzinfo=UTC)
 
         def swap_metric(
@@ -18161,15 +17088,10 @@ def _global_dollar_page_data(
                     "input_series": ["ny-fed-usd-liquidity-swap-operation"],
                     "input_batch_ids": [str(swap_run.batch_id)],
                     "input_value_dates": sorted(
-                        {
-                            item["settlement_date"].isoformat()
-                            for item in operations_input
-                        }
+                        {item["settlement_date"].isoformat() for item in operations_input}
                     ),
                     "input_lineage": lineage,
-                    "active_operations": [
-                        item["natural_key"] for item in operations_input
-                    ],
+                    "active_operations": [item["natural_key"] for item in operations_input],
                     "swap_as_of": as_of_date.isoformat(),
                     "acquisition_sha256": swap_hash,
                     "component": "swaps",
@@ -18237,9 +17159,7 @@ def _global_dollar_page_data(
             key: {item.value_date.date(): item for item in h10[key]}
             for key in ("h10-eurusd", "h10-usdcny", "h10-usdjpy")
         }
-        common_dates = sorted(set.intersection(*(set(value) for value in fx_maps.values())))[
-            -120:
-        ]
+        common_dates = sorted(set.intersection(*(set(value) for value in fx_maps.values())))[-120:]
         if len(common_dates) < 2:
             raise ValueError("H.10 major FX series lack a common rebasing window")
         transformed: dict[str, dict[date, Decimal]] = {
@@ -18247,14 +17167,8 @@ def _global_dollar_page_data(
                 period: Decimal("1") / fx_maps["h10-eurusd"][period].value
                 for period in common_dates
             },
-            "CNY per USD": {
-                period: fx_maps["h10-usdcny"][period].value
-                for period in common_dates
-            },
-            "JPY per USD": {
-                period: fx_maps["h10-usdjpy"][period].value
-                for period in common_dates
-            },
+            "CNY per USD": {period: fx_maps["h10-usdcny"][period].value for period in common_dates},
+            "JPY per USD": {period: fx_maps["h10-usdjpy"][period].value for period in common_dates},
         }
         rebased_rows = []
         for period in common_dates:
@@ -18407,8 +17321,7 @@ def _global_dollar_page_data(
                 "fallback_source": None,
                 "fallback_sources": [],
                 "license_scopes": [
-                    f"{sources[key].name}: {scopes[key]}"
-                    for key in ("federal-reserve", "internal")
+                    f"{sources[key].name}: {scopes[key]}" for key in ("federal-reserve", "internal")
                 ],
             },
             {
@@ -18430,8 +17343,7 @@ def _global_dollar_page_data(
                 "fallback_source": None,
                 "fallback_sources": [],
                 "license_scopes": [
-                    f"{sources[key].name}: {scopes[key]}"
-                    for key in ("internal", "ny-fed-markets")
+                    f"{sources[key].name}: {scopes[key]}" for key in ("internal", "ny-fed-markets")
                 ],
             },
         ]
@@ -18459,12 +17371,8 @@ def _global_dollar_page_data(
                 "cells_list": [
                     _global_dollar_cell("counterparty", operation["counterparty"]),
                     _global_dollar_cell("trade", operation["trade_date"].isoformat()),
-                    _global_dollar_cell(
-                        "settlement", operation["settlement_date"].isoformat()
-                    ),
-                    _global_dollar_cell(
-                        "maturity", operation["maturity_date"].isoformat()
-                    ),
+                    _global_dollar_cell("settlement", operation["settlement_date"].isoformat()),
+                    _global_dollar_cell("maturity", operation["maturity_date"].isoformat()),
                     _global_dollar_cell("term", operation["term_in_days"]),
                     _global_dollar_cell("rate", f"{rate}%"),
                     _global_dollar_cell("amount", f"{operation['amount']:,.2f}"),
@@ -18518,7 +17426,17 @@ def _global_dollar_page_data(
                 "fresh/direct fields; Atlas derived aggregates",
             ),
         )
-        for component, observation_date, prepared_at, fetched, fresh, run, digest, scope, quality in component_rows:
+        for (
+            component,
+            observation_date,
+            prepared_at,
+            fetched,
+            fresh,
+            run,
+            digest,
+            scope,
+            quality,
+        ) in component_rows:
             values = (
                 component,
                 observation_date,
@@ -18632,9 +17550,7 @@ def _global_dollar_page_data(
                 "source_keys": ["federal-reserve", "ny-fed-markets"],
                 "batch_ids": [str(h10_run.batch_id), str(swap_run.batch_id)],
                 "as_of": min(current_broad.as_of, swap_as_of).isoformat(),
-                "fetched_at": max(
-                    h10_meta["fetched_at"], swap_meta["fetched_at"]
-                ).isoformat(),
+                "fetched_at": max(h10_meta["fetched_at"], swap_meta["fetched_at"]).isoformat(),
                 "fresh_until": min(h10_deadline, swap_deadline).isoformat(),
                 "quality_status": Observation.Quality.FRESH,
                 "fallback_source": None,
@@ -18658,9 +17574,7 @@ def _global_dollar_page_data(
                 "source_keys": ["internal"],
                 "batch_ids": [],
                 "as_of": min(current_broad.as_of, swap_as_of).isoformat(),
-                "fetched_at": max(
-                    h10_meta["fetched_at"], swap_meta["fetched_at"]
-                ).isoformat(),
+                "fetched_at": max(h10_meta["fetched_at"], swap_meta["fetched_at"]).isoformat(),
                 "fresh_until": min(h10_deadline, swap_deadline).isoformat(),
                 "quality_status": Observation.Quality.ESTIMATED,
                 "fallback_source": None,
@@ -18691,9 +17605,7 @@ def _global_dollar_page_data(
             "acquisition_artifacts": {
                 "h10": {
                     "sha256": h10_hash,
-                    "member_sha256": (h10_run.metadata or {}).get(
-                        "archive_member_sha256"
-                    ),
+                    "member_sha256": (h10_run.metadata or {}).get("archive_member_sha256"),
                     "private_uri": h10_meta["artifact"].uri,
                 },
                 "swaps": {
@@ -18745,12 +17657,9 @@ def _global_dollar_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         or data.get("contract_version") != GLOBAL_DOLLAR_CONTRACT_VERSION
         or data.get("formula_version") != GLOBAL_DOLLAR_FORMULA_VERSION
         or data.get("formulas") != GLOBAL_DOLLAR_FORMULAS
-        or data.get("required_metric_keys")
-        != sorted(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS)
-        or data.get("required_chart_keys")
-        != sorted(GLOBAL_DOLLAR_REQUIRED_CHART_KEYS)
-        or data.get("required_section_keys")
-        != sorted(GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS)
+        or data.get("required_metric_keys") != sorted(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS)
+        or data.get("required_chart_keys") != sorted(GLOBAL_DOLLAR_REQUIRED_CHART_KEYS)
+        or data.get("required_section_keys") != sorted(GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS)
         or not isinstance(metrics, list)
         or len(metrics) != len(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS)
         or {str(item.get("key") or "") for item in metrics if isinstance(item, dict)}
@@ -18776,9 +17685,7 @@ def _global_dollar_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         return False
     metric_map = {str(item["key"]): item for item in metrics}
     try:
-        change_inputs = metric_map["h10-broad-dollar-5d-change-pct"]["metadata"][
-            "input_lineage"
-        ]
+        change_inputs = metric_map["h10-broad-dollar-5d-change-pct"]["metadata"]["input_lineage"]
         if not isinstance(change_inputs, list) or len(change_inputs) != 6:
             return False
         expected_change = Decimal("100") * (
@@ -18787,21 +17694,15 @@ def _global_dollar_page_contract_is_buildable(data: dict[str, Any]) -> bool:
             - Decimal("1")
         )
         total = Decimal(str(metric_map["fxswap-usd-outstanding"]["value"]))
-        regular = Decimal(
-            str(metric_map["fxswap-usd-outstanding-non-small-value"]["value"])
-        )
-        small = Decimal(
-            str(metric_map["fxswap-usd-outstanding-small-value"]["value"])
-        )
-        regular_inputs = metric_map[
-            "fxswap-usd-outstanding-non-small-value"
-        ]["metadata"]["input_lineage"]
+        regular = Decimal(str(metric_map["fxswap-usd-outstanding-non-small-value"]["value"]))
+        small = Decimal(str(metric_map["fxswap-usd-outstanding-small-value"]["value"]))
+        regular_inputs = metric_map["fxswap-usd-outstanding-non-small-value"]["metadata"][
+            "input_lineage"
+        ]
         counterparty_inputs = metric_map["fxswap-active-counterparties"]["metadata"][
             "input_lineage"
         ]
-        expected_counterparties = len(
-            {str(item["counterparty"]) for item in counterparty_inputs}
-        )
+        expected_counterparties = len({str(item["counterparty"]) for item in counterparty_inputs})
     except (ArithmeticError, KeyError, TypeError, ValueError):
         return False
     if (
@@ -18847,8 +17748,7 @@ def _global_dollar_page_contract_is_buildable(data: dict[str, Any]) -> bool:
             for tenor in ("1M", "3M", "1Y")
         }
         or any(
-            item.get("status") != "PURCHASE_REQUIRED"
-            or item.get("value") != "No public value"
+            item.get("status") != "PURCHASE_REQUIRED" or item.get("value") != "No public value"
             for item in gap_rows
         )
     ):
@@ -18861,8 +17761,7 @@ def _global_dollar_page_contract_is_buildable(data: dict[str, Any]) -> bool:
             and len(cells) == len(keys)
             and tuple(str(item.get("key") or "") for item in cells) == keys
             and all(
-                isinstance(item.get("cell"), dict)
-                and item["cell"].get("kind") == "text"
+                isinstance(item.get("cell"), dict) and item["cell"].get("kind") == "text"
                 for item in cells
                 if isinstance(item, dict)
             )
@@ -18922,14 +17821,8 @@ def _global_dollar_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool
             "source", "fallback_source"
         )
     )
-    expected_keys = {
-        f"global-dollar-{key}" for key in GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS
-    }
-    stored = {
-        item.key: item
-        for item in stored_rows
-        if item.key.startswith("global-dollar-")
-    }
+    expected_keys = {f"global-dollar-{key}" for key in GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS}
+    stored = {item.key: item for item in stored_rows if item.key.startswith("global-dollar-")}
     if len(stored_rows) != len(expected_keys) or set(stored) != expected_keys:
         return False
     for metric in data.get("metrics", []):
@@ -18942,26 +17835,20 @@ def _global_dollar_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool
         if (
             normalized is None
             or normalized.value is None
-            or not _fed_balance_sheet_decimal_equal(
-                normalized.value, metric.get("value")
-            )
+            or not _fed_balance_sheet_decimal_equal(normalized.value, metric.get("value"))
             or normalized.label != str(metric.get("label") or "")
             or normalized.display_value != str(metric.get("display_value") or "")
             or normalized.unit != str(metric.get("unit") or "")
             or (normalized.change is None) != (metric.get("change") is None)
             or (
                 normalized.change is not None
-                and not _fed_balance_sheet_decimal_equal(
-                    normalized.change, metric.get("change")
-                )
+                and not _fed_balance_sheet_decimal_equal(normalized.change, metric.get("change"))
             )
             or normalized.source.key != metric.get("source_key")
             or normalized.fallback_source_id is not None
-            or normalized.value_date
-            != _parse_payload_datetime(metric.get("value_date"))
+            or normalized.value_date != _parse_payload_datetime(metric.get("value_date"))
             or normalized.as_of != _parse_payload_datetime(metric.get("as_of"))
-            or normalized.fetched_at
-            != _parse_payload_datetime(metric.get("fetched_at"))
+            or normalized.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
             or normalized.quality_status != metric.get("quality_status")
             or normalized.license_scope != str(metric.get("license_scope") or "")[:120]
             or normalized.metadata != expected_metadata
@@ -19074,9 +17961,7 @@ def _global_dollar_refresh_failure_is_valid(
         ):
             return False
         audited_attempts[identity] = run
-    completed = [
-        run.completed_at or run.started_at for run in audited_attempts.values()
-    ]
+    completed = [run.completed_at or run.started_at for run in audited_attempts.values()]
     if not completed or checked_at < max(completed):
         return False
     embedded = _global_dollar_component_runs_from_snapshot(snapshot)
@@ -19086,8 +17971,7 @@ def _global_dollar_refresh_failure_is_valid(
     ):
         return False
     incomplete = any(
-        run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in audited_attempts.values()
     )
     if incomplete:
@@ -19100,8 +17984,7 @@ def _global_dollar_refresh_failure_is_valid(
     }:
         return False
     current_attempts = {
-        identity: _latest_global_dollar_attempt(identity)
-        for identity in GLOBAL_DOLLAR_DATASETS
+        identity: _latest_global_dollar_attempt(identity) for identity in GLOBAL_DOLLAR_DATASETS
     }
     if any(run is None for run in current_attempts.values()):
         return False
@@ -19129,9 +18012,7 @@ def _global_dollar_snapshot_matches_runs(
 ) -> bool:
     data = dict(snapshot.data or {})
     required_sources = {"federal-reserve", "internal", "ny-fed-markets"}
-    sources = {
-        item.key: item for item in Source.objects.filter(key__in=required_sources)
-    }
+    sources = {item.key: item for item in Source.objects.filter(key__in=required_sources)}
     if set(sources) != required_sources:
         return False
     for source in sources.values():
@@ -19193,9 +18074,7 @@ def _global_dollar_snapshot_matches_runs(
         or not _global_dollar_page_contract_is_buildable(data)
     ):
         return False
-    audited_payload = {
-        key: value for key, value in data.items() if key != "refresh_failure"
-    }
+    audited_payload = {key: value for key, value in data.items() if key != "refresh_failure"}
     if (
         not _payload_batch_ids(audited_payload) <= expected_batches
         or not _payload_source_keys(audited_payload) <= required_sources
@@ -19227,15 +18106,13 @@ def _global_dollar_has_component_transition(
     if embedded is None:
         return False
     latest = attempts or {
-        identity: _latest_global_dollar_attempt(identity)
-        for identity in GLOBAL_DOLLAR_DATASETS
+        identity: _latest_global_dollar_attempt(identity) for identity in GLOBAL_DOLLAR_DATASETS
     }
     return bool(
         set(latest) == set(GLOBAL_DOLLAR_DATASETS)
         and all(run is not None for run in latest.values())
         and any(
-            latest[identity] is not None
-            and latest[identity].pk != embedded[identity].pk
+            latest[identity] is not None and latest[identity].pk != embedded[identity].pk
             for identity in GLOBAL_DOLLAR_DATASETS
         )
     )
@@ -19245,18 +18122,13 @@ def _global_dollar_snapshot_is_publicly_displayable_unchecked(
     snapshot: DashboardSnapshot,
 ) -> bool:
     attempts = {
-        identity: _latest_global_dollar_attempt(identity)
-        for identity in GLOBAL_DOLLAR_DATASETS
+        identity: _latest_global_dollar_attempt(identity) for identity in GLOBAL_DOLLAR_DATASETS
     }
     if all(run is not None for run in attempts.values()) and all(
-        run is not None
-        and run.status == IngestionRun.Status.SUCCESS
-        and run.row_count > 0
+        run is not None and run.status == IngestionRun.Status.SUCCESS and run.row_count > 0
         for run in attempts.values()
     ):
-        selected = {
-            identity: run for identity, run in attempts.items() if run is not None
-        }
+        selected = {identity: run for identity, run in attempts.items() if run is not None}
         deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
         expired = deadline is not None and deadline < timezone.now()
         if _global_dollar_snapshot_matches_runs(
@@ -19380,8 +18252,7 @@ def _mark_global_dollar_stale(
     if reason is None:
         raise ValueError("unknown global-dollar refresh failure reason")
     attempts = {
-        identity: _latest_global_dollar_attempt(identity)
-        for identity in GLOBAL_DOLLAR_DATASETS
+        identity: _latest_global_dollar_attempt(identity) for identity in GLOBAL_DOLLAR_DATASETS
     }
     if any(run is None for run in attempts.values()):
         return
@@ -19448,8 +18319,7 @@ def _coordinate_global_dollar_dashboard(
     expected_batches = {str(run.batch_id) for run in selected.values()}
     if (
         previous is not None
-        and set((previous.data or {}).get("component_batches") or [])
-        == expected_batches
+        and set((previous.data or {}).get("component_batches") or []) == expected_batches
         and "refresh_failure" not in (previous.data or {})
         and _global_dollar_snapshot_matches_runs(
             previous,
@@ -19475,10 +18345,7 @@ def _coordinate_global_dollar_dashboard(
         new_swap = extra_data["component_value_dates"]["swaps"]
         if (
             isinstance(old_h10, dict)
-            and any(
-                key in old_h10 and new_h10[key] < str(old_h10[key])
-                for key in new_h10
-            )
+            and any(key in old_h10 and new_h10[key] < str(old_h10[key]) for key in new_h10)
             or old_swap is not None
             and new_swap < str(old_swap)
         ):
@@ -19621,9 +18488,7 @@ def _transmission_component_runs_from_snapshot(
     return selected
 
 
-def _transmission_runs_are_latest(
-    page_key: str, selected: dict[str, IngestionRun]
-) -> bool:
+def _transmission_runs_are_latest(page_key: str, selected: dict[str, IngestionRun]) -> bool:
     expected = _transmission_component_datasets(page_key)
     return all(
         (
@@ -19670,14 +18535,9 @@ def _transmission_child_fingerprint(snapshot: DashboardSnapshot) -> str:
 
 def _transmission_metadata_mentions_digest(value: Any, digest: str) -> bool:
     if isinstance(value, dict):
-        return any(
-            _transmission_metadata_mentions_digest(item, digest)
-            for item in value.values()
-        )
+        return any(_transmission_metadata_mentions_digest(item, digest) for item in value.values())
     if isinstance(value, list):
-        return any(
-            _transmission_metadata_mentions_digest(item, digest) for item in value
-        )
+        return any(_transmission_metadata_mentions_digest(item, digest) for item in value)
     return str(value or "").lower() == digest
 
 
@@ -19706,9 +18566,7 @@ def _transmission_artifact_evidence(
                 len(digest) != 64
                 or any(character not in "0123456789abcdef" for character in digest)
                 or artifact.size_bytes <= 0
-                or not _transmission_metadata_mentions_digest(
-                    dict(run.metadata or {}), digest
-                )
+                or not _transmission_metadata_mentions_digest(dict(run.metadata or {}), digest)
             ):
                 return None
             item = {
@@ -19812,12 +18670,9 @@ def _transmission_child_contract_is_valid(
         or "title" in data
         or "summary" in data
         or data.get("contract_version") != component["contract_version"]
-        or {str(item.get("key") or "") for item in data.get("metrics", [])}
-        != set(metric_keys)
-        or {str(item.get("key") or "") for item in data.get("charts", [])}
-        != set(chart_keys)
-        or str(data.get("fingerprint") or "")
-        != _transmission_child_fingerprint(snapshot)
+        or {str(item.get("key") or "") for item in data.get("metrics", [])} != set(metric_keys)
+        or {str(item.get("key") or "") for item in data.get("charts", [])} != set(chart_keys)
+        or str(data.get("fingerprint") or "") != _transmission_child_fingerprint(snapshot)
         or str(data.get("payload_integrity_hash") or "")
         != _transmission_child_payload_hash(snapshot)
         or _payload_fallback_source_keys(data)
@@ -19843,11 +18698,7 @@ def _transmission_child_contract_is_valid(
     naturally_expired = mode == "natural_expiry"
     if mode == "current_candidate":
         deadline = _parse_payload_datetime(data.get("fresh_until"))
-        if (
-            deadline is None
-            or deadline < timezone.now()
-            or refresh_failure is not None
-        ):
+        if deadline is None or deadline < timezone.now() or refresh_failure is not None:
             return False
     if snapshot.key == "fed-balance-sheet":
         if mode == "retained":
@@ -19887,21 +18738,16 @@ def _transmission_child_contract_is_valid(
             snapshot,
             selected=selected,
             allow_expired=mode != "current_candidate",
-            allow_refresh_failure=(
-                mode == "retained" and refresh_failure is not None
-            ),
+            allow_refresh_failure=(mode == "retained" and refresh_failure is not None),
             require_observations=mode != "retained",
         )
     if snapshot.key == "reserves":
         return _reserves_snapshot_contract_is_valid(
             snapshot,
             selected_runs=selected,
-            allow_retained_stale=(
-                mode == "retained" and refresh_failure is not None
-            ),
+            allow_retained_stale=(mode == "retained" and refresh_failure is not None),
             allow_natural_expiry=(
-                mode == "natural_expiry"
-                or mode == "retained" and refresh_failure is None
+                mode == "natural_expiry" or mode == "retained" and refresh_failure is None
             ),
             allow_expired=mode != "current_candidate",
         )
@@ -19929,13 +18775,7 @@ def _transmission_component_fetched_at(snapshot: DashboardSnapshot) -> datetime 
             for nested in value:
                 visit(nested)
 
-    visit(
-        {
-            key: value
-            for key, value in (snapshot.data or {}).items()
-            if key != "refresh_failure"
-        }
-    )
+    visit({key: value for key, value in (snapshot.data or {}).items() if key != "refresh_failure"})
     return max(values) if values else None
 
 
@@ -19960,9 +18800,7 @@ def _transmission_publication_quality(snapshot: DashboardSnapshot) -> str:
 def _transmission_component_metric_rows(
     snapshot: DashboardSnapshot,
 ) -> dict[str, MetricSnapshot] | None:
-    required_metrics, _required_charts = _transmission_component_required_sets(
-        snapshot.key
-    )
+    required_metrics, _required_charts = _transmission_component_required_sets(snapshot.key)
     rows = list(
         MetricSnapshot.objects.filter(
             batch_id=snapshot.batch_id,
@@ -19971,9 +18809,7 @@ def _transmission_component_metric_rows(
         .select_related("source", "fallback_source")
         .order_by("key")
     )
-    by_child_key = {
-        item.key.removeprefix(f"{snapshot.key}-"): item for item in rows
-    }
+    by_child_key = {item.key.removeprefix(f"{snapshot.key}-"): item for item in rows}
     if set(by_child_key) != set(required_metrics):
         return None
     return by_child_key
@@ -19988,9 +18824,7 @@ def _transmission_component_envelope(
         return None
     evidence = _transmission_artifact_evidence(snapshot.key, selected)
     fetched_at = _transmission_component_fetched_at(snapshot)
-    fresh_until = _parse_payload_datetime(
-        (snapshot.data or {}).get("fresh_until")
-    )
+    fresh_until = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
     if evidence is None or fetched_at is None or fresh_until is None:
         return None
     source_keys = sorted(set((snapshot.data or {}).get("source_keys") or []))
@@ -20015,23 +18849,17 @@ def _transmission_component_envelope(
             "row_count": selected[role].row_count,
             "started_at": selected[role].started_at.isoformat(),
             "completed_at": (
-                selected[role].completed_at.isoformat()
-                if selected[role].completed_at
-                else None
+                selected[role].completed_at.isoformat() if selected[role].completed_at else None
             ),
         }
         for role in _transmission_component_datasets(snapshot.key)
     ]
     return {
         "component_page_key": snapshot.key,
-        "component_contract_version": (snapshot.data or {}).get(
-            "contract_version"
-        ),
+        "component_contract_version": (snapshot.data or {}).get("contract_version"),
         "component_snapshot_id": snapshot.pk,
         "component_publication_batch_id": str(snapshot.batch_id),
-        "component_fingerprint": str(
-            (snapshot.data or {}).get("fingerprint") or ""
-        ),
+        "component_fingerprint": str((snapshot.data or {}).get("fingerprint") or ""),
         "component_payload_integrity_hash": str(
             (snapshot.data or {}).get("payload_integrity_hash") or ""
         ),
@@ -20049,15 +18877,11 @@ def _transmission_component_envelope(
         "as_of": snapshot.as_of.isoformat(),
         "fetched_at": fetched_at.isoformat(),
         "fresh_until": fresh_until.isoformat(),
-        "publication_quality_status": _transmission_publication_quality(
-            snapshot
-        ),
+        "publication_quality_status": _transmission_publication_quality(snapshot),
         "source_keys": source_keys,
         "datasets": [
             {"source": source_key, "dataset": dataset}
-            for source_key, dataset in sorted(
-                {(run["source"], run["dataset"]) for run in runs}
-            )
+            for source_key, dataset in sorted({(run["source"], run["dataset"]) for run in runs})
         ],
         "license_decisions": scopes,
         "fallback_sources": [],
@@ -20068,11 +18892,7 @@ def _transmission_run_reference(
     envelopes: dict[str, dict[str, Any]], page_key: str, role: str
 ) -> dict[str, Any] | None:
     return next(
-        (
-            item
-            for item in envelopes[page_key]["input_runs"]
-            if item.get("input_role") == role
-        ),
+        (item for item in envelopes[page_key]["input_runs"] if item.get("input_role") == role),
         None,
     )
 
@@ -20081,9 +18901,7 @@ def _transmission_artifact_identity(
     envelope: dict[str, Any], role: str
 ) -> list[dict[str, Any]] | None:
     matches = [
-        item
-        for item in envelope.get("artifact_evidence", [])
-        if item.get("input_role") == role
+        item for item in envelope.get("artifact_evidence", []) if item.get("input_role") == role
     ]
     if not matches:
         return None
@@ -20100,9 +18918,13 @@ def _transmission_shared_input_reconciliation(
     envelopes: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]] | None:
     rows: list[dict[str, Any]] = []
-    for input_name, left_page, left_role, right_page, right_role in (
-        TRANSMISSION_CHAIN_SHARED_INPUTS
-    ):
+    for (
+        input_name,
+        left_page,
+        left_role,
+        right_page,
+        right_role,
+    ) in TRANSMISSION_CHAIN_SHARED_INPUTS:
         left = _transmission_run_reference(envelopes, left_page, left_role)
         right = _transmission_run_reference(envelopes, right_page, right_role)
         if left is None or right is None:
@@ -20120,12 +18942,8 @@ def _transmission_shared_input_reconciliation(
             right.get("batch_id"),
         ):
             return None
-        left_artifacts = _transmission_artifact_identity(
-            envelopes[left_page], left_role
-        )
-        right_artifacts = _transmission_artifact_identity(
-            envelopes[right_page], right_role
-        )
+        left_artifacts = _transmission_artifact_identity(envelopes[left_page], left_role)
+        right_artifacts = _transmission_artifact_identity(envelopes[right_page], right_role)
         if left_artifacts is None or left_artifacts != right_artifacts:
             return None
         fields = TRANSMISSION_CHAIN_SHARED_INPUT_FIELDS[input_name]
@@ -20155,12 +18973,16 @@ def _transmission_upstream_fields(value: Any) -> list[str]:
     def visit(nested: Any) -> None:
         if isinstance(nested, dict):
             for key, item in nested.items():
-                if key in {
-                    "series_key",
-                    "source_field",
-                    "upstream_field",
-                    "treasury_field",
-                } and item:
+                if (
+                    key
+                    in {
+                        "series_key",
+                        "source_field",
+                        "upstream_field",
+                        "treasury_field",
+                    }
+                    and item
+                ):
                     fields.add(str(item))
                 visit(item)
         elif isinstance(nested, list):
@@ -20190,25 +19012,19 @@ def _transmission_scoped_component_evidence(
     envelope: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
     batches = _transmission_lineage_batches(value)
-    runs = [
-        item
-        for item in envelope["input_runs"]
-        if str(item.get("batch_id") or "") in batches
-    ]
+    runs = [item for item in envelope["input_runs"] if str(item.get("batch_id") or "") in batches]
     if not runs:
         return None
-    identities = {
-        (item["run_id"], item["batch_id"])
-        for item in runs
-    }
+    identities = {(item["run_id"], item["batch_id"]) for item in runs}
     artifacts = [
         item
         for item in envelope["artifact_evidence"]
         if (item.get("run_id"), item.get("batch_id")) in identities
     ]
-    if not artifacts or {
-        (item.get("run_id"), item.get("batch_id")) for item in artifacts
-    } != identities:
+    if (
+        not artifacts
+        or {(item.get("run_id"), item.get("batch_id")) for item in artifacts} != identities
+    ):
         return None
     return runs, artifacts
 
@@ -20223,11 +19039,7 @@ def _transmission_copy_metric(
     if page_key != snapshot.key:
         return None
     child_metric = next(
-        (
-            item
-            for item in (snapshot.data or {}).get("metrics", [])
-            if item.get("key") == child_key
-        ),
+        (item for item in (snapshot.data or {}).get("metrics", []) if item.get("key") == child_key),
         None,
     )
     child_rows = _transmission_component_metric_rows(snapshot)
@@ -20248,17 +19060,11 @@ def _transmission_copy_metric(
     metadata.update(
         {
             "component_page_key": page_key,
-            "component_contract_version": envelope[
-                "component_contract_version"
-            ],
+            "component_contract_version": envelope["component_contract_version"],
             "component_snapshot_id": envelope["component_snapshot_id"],
-            "component_publication_batch_id": envelope[
-                "component_publication_batch_id"
-            ],
+            "component_publication_batch_id": envelope["component_publication_batch_id"],
             "component_fingerprint": envelope["component_fingerprint"],
-            "component_payload_integrity_hash": envelope[
-                "component_payload_integrity_hash"
-            ],
+            "component_payload_integrity_hash": envelope["component_payload_integrity_hash"],
             "component_metric_snapshot_id": normalized.pk,
             "component_metric_snapshot_key": normalized.key,
             "component_metric_snapshot_batch_id": str(normalized.batch_id),
@@ -20274,9 +19080,7 @@ def _transmission_copy_metric(
                 }
                 for item in scoped_runs
             ],
-            "upstream_fields": _transmission_upstream_fields(
-                child_metric.get("metadata") or {}
-            ),
+            "upstream_fields": _transmission_upstream_fields(child_metric.get("metadata") or {}),
         }
     )
     copied["metadata"] = metadata
@@ -20284,13 +19088,13 @@ def _transmission_copy_metric(
 
 
 def _transmission_chart_date_range(data: Any) -> tuple[str | None, str | None]:
-    rows = data if isinstance(data, list) else (
-        data.get("_rows", []) if isinstance(data, dict) else []
+    rows = (
+        data
+        if isinstance(data, list)
+        else (data.get("_rows", []) if isinstance(data, dict) else [])
     )
     dates = sorted(
-        str(row.get("date"))
-        for row in rows
-        if isinstance(row, dict) and row.get("date")
+        str(row.get("date")) for row in rows if isinstance(row, dict) and row.get("date")
     )
     return (dates[0], dates[-1]) if dates else (None, None)
 
@@ -20300,11 +19104,7 @@ def _transmission_copy_chart(
 ) -> dict[str, Any] | None:
     chart_key = str(TRANSMISSION_CHAIN_COMPONENTS[snapshot.key]["chart_key"])
     child_chart = next(
-        (
-            item
-            for item in (snapshot.data or {}).get("charts", [])
-            if item.get("key") == chart_key
-        ),
+        (item for item in (snapshot.data or {}).get("charts", []) if item.get("key") == chart_key),
         None,
     )
     if child_chart is None:
@@ -20319,17 +19119,11 @@ def _transmission_copy_chart(
         {
             "component_page_key": snapshot.key,
             "component_chart_key": chart_key,
-            "component_contract_version": envelope[
-                "component_contract_version"
-            ],
+            "component_contract_version": envelope["component_contract_version"],
             "component_snapshot_id": envelope["component_snapshot_id"],
-            "component_publication_batch_id": envelope[
-                "component_publication_batch_id"
-            ],
+            "component_publication_batch_id": envelope["component_publication_batch_id"],
             "component_fingerprint": envelope["component_fingerprint"],
-            "component_payload_integrity_hash": envelope[
-                "component_payload_integrity_hash"
-            ],
+            "component_payload_integrity_hash": envelope["component_payload_integrity_hash"],
             "data_start_date": start_date,
             "data_end_date": end_date,
             "component_all_input_runs": envelope["input_runs"],
@@ -20365,10 +19159,7 @@ def _transmission_table_section(
         "key": key,
         "title": title,
         "description": description,
-        "columns": [
-            {"key": column_key, "label": label}
-            for column_key, label in columns
-        ],
+        "columns": [{"key": column_key, "label": label} for column_key, label in columns],
         "rows": rendered_rows,
         "full_width": True,
     }
@@ -20401,8 +19192,7 @@ def _transmission_sections(
                 ),
                 "sources": ", ".join(envelope["source_keys"]),
                 "datasets": ", ".join(
-                    f"{item['source']}/{item['dataset']}"
-                    for item in envelope["datasets"]
+                    f"{item['source']}/{item['dataset']}" for item in envelope["datasets"]
                 ),
                 "licence": "; ".join(
                     f"{item['source_key']}: {item['scope']}"
@@ -20415,12 +19205,8 @@ def _transmission_sections(
     shared_rows = [
         {
             "input": item["input"],
-            "left": (
-                f"{item['left_component']}/{item['left_input_role']}"
-            ),
-            "right": (
-                f"{item['right_component']}/{item['right_input_role']}"
-            ),
+            "left": (f"{item['left_component']}/{item['left_input_role']}"),
+            "right": (f"{item['right_component']}/{item['right_input_role']}"),
             "source": item["source"],
             "dataset": item["dataset"],
             "run": item["run_id"],
@@ -20497,10 +19283,7 @@ def _transmission_sections(
     for item in unavailable:
         gap_rows.append(
             {
-                "item": (
-                    f"{item['component_page_key']}/{item['input_role']} "
-                    "acquisition artifact"
-                ),
+                "item": (f"{item['component_page_key']}/{item['input_role']} acquisition artifact"),
                 "status": "NEEDS_SOURCE",
                 "scope": (
                     "NOT_AVAILABLE_UNDER_CHILD_V1; no private bytes or verified "
@@ -20509,17 +19292,12 @@ def _transmission_sections(
             }
         )
     freshness_values = [
-        _parse_payload_datetime(envelope["fresh_until"])
-        for envelope in envelopes.values()
+        _parse_payload_datetime(envelope["fresh_until"]) for envelope in envelopes.values()
     ]
     if any(value is None for value in freshness_values):
         raise ValueError("transmission component freshness is malformed")
-    freshness = min(
-        value for value in freshness_values if value is not None
-    ).isoformat()
-    source_keys = sorted(
-        set().union(*(set(item["source_keys"]) for item in envelopes.values()))
-    )
+    freshness = min(value for value in freshness_values if value is not None).isoformat()
+    source_keys = sorted(set().union(*(set(item["source_keys"]) for item in envelopes.values())))
     sections = [
         _transmission_table_section(
             key="layer-evidence-ledger",
@@ -20552,9 +19330,7 @@ def _transmission_sections(
         _transmission_table_section(
             key="shared-input-reconciliation",
             title="共享输入对账",
-            description=(
-                "对账 acquisition identity；不要求两个组件的派生 scalar 相等。"
-            ),
+            description=("对账 acquisition identity；不要求两个组件的派生 scalar 相等。"),
             columns=(
                 ("input", "共享输入"),
                 ("left", "组件 A"),
@@ -20573,9 +19349,7 @@ def _transmission_sections(
         _transmission_table_section(
             key="methodology-and-licensing-gaps",
             title="方法与许可缺口",
-            description=(
-                "缺口使用明确状态，不用空白、估算值或未授权数据替代。"
-            ),
+            description=("缺口使用明确状态，不用空白、估算值或未授权数据替代。"),
             columns=(
                 ("item", "项目"),
                 ("status", "状态"),
@@ -20666,12 +19440,8 @@ def _transmission_semantic_manifest(
         "components": [
             {
                 "component_page_key": page_key,
-                "component_contract_version": envelopes[page_key][
-                    "component_contract_version"
-                ],
-                "component_fingerprint": envelopes[page_key][
-                    "component_fingerprint"
-                ],
+                "component_contract_version": envelopes[page_key]["component_contract_version"],
+                "component_fingerprint": envelopes[page_key]["component_fingerprint"],
             }
             for page_key in TRANSMISSION_CHAIN_COMPONENTS
         ],
@@ -20686,8 +19456,7 @@ def _transmission_semantic_manifest(
                     {
                         str(evidence.get("artifact_status") or "")
                         for evidence in item.get("artifact_identity", [])
-                        if isinstance(evidence, dict)
-                        and evidence.get("artifact_status")
+                        if isinstance(evidence, dict) and evidence.get("artifact_status")
                     }
                 ),
                 "status": item["status"],
@@ -20701,12 +19470,15 @@ def _transmission_page_data(
     components: dict[str, DashboardSnapshot],
     *,
     publication_timestamp: datetime | None = None,
-) -> tuple[
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    list[dict[str, Any]],
-    dict[str, Any],
-] | None:
+) -> (
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None
+):
     if set(components) != set(TRANSMISSION_CHAIN_COMPONENTS):
         return None
     envelopes: dict[str, dict[str, Any]] = {}
@@ -20746,18 +19518,14 @@ def _transmission_page_data(
         generated = generated.replace(tzinfo=UTC)
     generated_at = generated.isoformat()
     component_fetched = [
-        _parse_payload_datetime(envelope["fetched_at"])
-        for envelope in envelopes.values()
+        _parse_payload_datetime(envelope["fetched_at"]) for envelope in envelopes.values()
     ]
     component_as_of = [
-        _parse_payload_datetime(envelope["as_of"])
-        for envelope in envelopes.values()
+        _parse_payload_datetime(envelope["as_of"]) for envelope in envelopes.values()
     ]
     if any(value is None for value in [*component_fetched, *component_as_of]):
         return None
-    fetched_at = max(
-        value for value in component_fetched if value is not None
-    ).isoformat()
+    fetched_at = max(value for value in component_fetched if value is not None).isoformat()
     extra_data = {
         "contract_version": TRANSMISSION_CHAIN_CONTRACT_VERSION,
         "formula_version": TRANSMISSION_CHAIN_FORMULA_VERSION,
@@ -20765,9 +19533,7 @@ def _transmission_page_data(
         "required_metric_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS),
         "required_chart_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS),
         "required_section_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS),
-        "component_snapshots": [
-            envelopes[page_key] for page_key in TRANSMISSION_CHAIN_COMPONENTS
-        ],
+        "component_snapshots": [envelopes[page_key] for page_key in TRANSMISSION_CHAIN_COMPONENTS],
         "shared_input_reconciliation": reconciliation,
         "semantic_manifest": _transmission_semantic_manifest(
             metrics=metrics,
@@ -20776,9 +19542,7 @@ def _transmission_page_data(
             envelopes=envelopes,
             reconciliation=reconciliation,
         ),
-        "as_of": min(
-            value for value in component_as_of if value is not None
-        ).isoformat(),
+        "as_of": min(value for value in component_as_of if value is not None).isoformat(),
         "fetched_at": fetched_at,
         "generated_at": generated_at,
         "published_at": generated_at,
@@ -20800,12 +19564,9 @@ def _transmission_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         data.get("contract_version") != TRANSMISSION_CHAIN_CONTRACT_VERSION
         or data.get("formula_version") != TRANSMISSION_CHAIN_FORMULA_VERSION
         or data.get("formulas") != TRANSMISSION_CHAIN_FORMULAS
-        or data.get("required_metric_keys")
-        != sorted(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS)
-        or data.get("required_chart_keys")
-        != sorted(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS)
-        or data.get("required_section_keys")
-        != sorted(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS)
+        or data.get("required_metric_keys") != sorted(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS)
+        or data.get("required_chart_keys") != sorted(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS)
+        or data.get("required_section_keys") != sorted(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS)
         or not isinstance(metrics, list)
         or len(metrics) != len(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS)
         or {str(item.get("key") or "") for item in metrics}
@@ -20857,8 +19618,7 @@ def _transmission_page_contract_is_buildable(data: dict[str, Any]) -> bool:
         expected_columns = [str(item.get("key") or "") for item in columns]
         if not expected_columns or any(
             not isinstance(row, dict)
-            or [item.get("key") for item in row.get("cells_list", [])]
-            != expected_columns
+            or [item.get("key") for item in row.get("cells_list", [])] != expected_columns
             for row in rows
         ):
             return False
@@ -20877,16 +19637,11 @@ def _transmission_normalized_metrics_match(
         .order_by("key")
     )
     by_key = {row.key: row for row in rows}
-    expected_keys = {
-        f"transmission-chain-{key}"
-        for key in TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS
-    }
+    expected_keys = {f"transmission-chain-{key}" for key in TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS}
     if len(rows) != len(expected_keys) or set(by_key) != expected_keys:
         return False
     fingerprint = str((snapshot.data or {}).get("fingerprint") or "")
-    payload_hash = str(
-        (snapshot.data or {}).get("payload_integrity_hash") or ""
-    )
+    payload_hash = str((snapshot.data or {}).get("payload_integrity_hash") or "")
     for metric in metrics:
         key = str(metric.get("key") or "")
         stored = by_key.get(f"transmission-chain-{key}")
@@ -20900,33 +19655,19 @@ def _transmission_normalized_metrics_match(
             or stored.value.quantize(Decimal("0.00000001"))
             != Decimal(str(value)).quantize(Decimal("0.00000001"))
             or stored.display_value != str(metric.get("display_value") or "")
-            or (
-                stored.change.quantize(Decimal("0.000001"))
-                if stored.change is not None
-                else None
-            )
-            != (
-                Decimal(str(change)).quantize(Decimal("0.000001"))
-                if change is not None
-                else None
-            )
+            or (stored.change.quantize(Decimal("0.000001")) if stored.change is not None else None)
+            != (Decimal(str(change)).quantize(Decimal("0.000001")) if change is not None else None)
             or stored.unit != str(metric.get("unit") or "")
             or stored.value_date
-            != _parse_payload_datetime(
-                metric.get("value_date") or metric.get("as_of")
-            )
+            != _parse_payload_datetime(metric.get("value_date") or metric.get("as_of"))
             or stored.as_of
-            != _parse_payload_datetime(
-                metric.get("as_of") or metric.get("value_date")
-            )
-            or stored.fetched_at
-            != _parse_payload_datetime(metric.get("fetched_at"))
+            != _parse_payload_datetime(metric.get("as_of") or metric.get("value_date"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
             or stored.source.key != metric.get("source_key")
             or stored.fallback_source_id is not None
             or metric.get("fallback_source") not in {None, ""}
             or stored.quality_status != metric.get("quality_status")
-            or stored.license_scope
-            != str(metric.get("license_scope") or "")[:120]
+            or stored.license_scope != str(metric.get("license_scope") or "")[:120]
             or stored.metadata
             != _dashboard_metric_snapshot_metadata(
                 metric,
@@ -20950,9 +19691,7 @@ def _transmission_components_from_snapshot(
         or not all(isinstance(item, dict) for item in envelopes)
     ):
         return None
-    by_page = {
-        str(item.get("component_page_key") or ""): item for item in envelopes
-    }
+    by_page = {str(item.get("component_page_key") or ""): item for item in envelopes}
     if set(by_page) != set(TRANSMISSION_CHAIN_COMPONENTS):
         return None
     components: dict[str, DashboardSnapshot] = {}
@@ -20999,9 +19738,7 @@ def _transmission_latest_valid_child(
         (
             candidate
             for candidate in candidates
-            if _transmission_child_contract_is_valid(
-                candidate, mode=mode
-            )
+            if _transmission_child_contract_is_valid(candidate, mode=mode)
         ),
         None,
     )
@@ -21028,14 +19765,11 @@ def _transmission_attempt_state(
     }
 
 
-def _transmission_latest_attempts(
-) -> dict[str, dict[str, IngestionRun | None]]:
+def _transmission_latest_attempts() -> dict[str, dict[str, IngestionRun | None]]:
     attempts: dict[str, dict[str, IngestionRun | None]] = {}
     for page_key in TRANSMISSION_CHAIN_COMPONENTS:
         attempts[page_key] = {}
-        for role, (source_key, dataset) in _transmission_component_datasets(
-            page_key
-        ).items():
+        for role, (source_key, dataset) in _transmission_component_datasets(page_key).items():
             attempts[page_key][role] = (
                 IngestionRun.objects.select_related("source")
                 .filter(source__key=source_key, dataset=dataset)
@@ -21074,8 +19808,7 @@ def _transmission_refresh_failure_is_valid(
     reason_code = marker.get("reason_code")
     if (
         reason_code not in TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS
-        or marker.get("reason")
-        != TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS[reason_code]
+        or marker.get("reason") != TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS[reason_code]
     ):
         return False
     checked_at_raw = marker.get("checked_at")
@@ -21102,9 +19835,7 @@ def _transmission_refresh_failure_is_valid(
     has_terminal_incomplete_attempt = False
     position = 0
     for page_key in TRANSMISSION_CHAIN_COMPONENTS:
-        for role, (source_key, dataset) in _transmission_component_datasets(
-            page_key
-        ).items():
+        for role, (source_key, dataset) in _transmission_component_datasets(page_key).items():
             state = states[position]
             position += 1
             run = (
@@ -21130,10 +19861,7 @@ def _transmission_refresh_failure_is_valid(
                 or checked_at < (run.completed_at or run.started_at)
                 or (
                     require_current_attempts
-                    and (
-                        current[page_key][role] is None
-                        or current[page_key][role].pk != run.pk
-                    )
+                    and (current[page_key][role] is None or current[page_key][role].pk != run.pk)
                 )
             ):
                 return False
@@ -21142,9 +19870,7 @@ def _transmission_refresh_failure_is_valid(
                 or run.status != IngestionRun.Status.SUCCESS
                 or run.row_count <= 0
             )
-    if (
-        reason_code == "latest-attempt-incomplete"
-    ) != has_terminal_incomplete_attempt:
+    if (reason_code == "latest-attempt-incomplete") != has_terminal_incomplete_attempt:
         return False
     return True
 
@@ -21196,8 +19922,7 @@ def _transmission_terminal_successor_chain(
         successors
         and successors[-1].pk == marker_run.pk
         and all(
-            run.status != IngestionRun.Status.RUNNING
-            and run.completed_at is not None
+            run.status != IngestionRun.Status.RUNNING and run.completed_at is not None
             for run in successors
         )
     )
@@ -21213,16 +19938,17 @@ def _transmission_marker_run(
         (
             item
             for item in marker.get("attempts", [])
-            if item.get("component_page_key") == page_key
-            and item.get("input_role") == role
+            if item.get("component_page_key") == page_key and item.get("input_role") == role
         ),
         None,
     )
     if not isinstance(state, dict):
         return None
-    return IngestionRun.objects.select_related("source").filter(
-        pk=state.get("ingestion_run_id")
-    ).first()
+    return (
+        IngestionRun.objects.select_related("source")
+        .filter(pk=state.get("ingestion_run_id"))
+        .first()
+    )
 
 
 def _transmission_transition_is_valid(
@@ -21251,17 +19977,13 @@ def _transmission_transition_is_valid(
                 continue
             changed = True
             latest_is_success = bool(
-                latest.status == IngestionRun.Status.SUCCESS
-                and latest.row_count > 0
+                latest.status == IngestionRun.Status.SUCCESS and latest.row_count > 0
             )
             latest_is_running = bool(
-                latest.status == IngestionRun.Status.RUNNING
-                and latest.completed_at is None
+                latest.status == IngestionRun.Status.RUNNING and latest.completed_at is None
             )
             marker_run = (
-                _transmission_marker_run(snapshot, page_key, role)
-                if marker is not None
-                else None
+                _transmission_marker_run(snapshot, page_key, role) if marker is not None else None
             )
             if (
                 not latest_is_success
@@ -21273,9 +19995,7 @@ def _transmission_transition_is_valid(
                 if not _transmission_direct_successor(referenced, latest):
                     return False
             elif (
-                not _transmission_terminal_successor_chain(
-                    referenced, marker_run
-                )
+                not _transmission_terminal_successor_chain(referenced, marker_run)
                 or latest.pk != marker_run.pk
                 and not _transmission_direct_successor(marker_run, latest)
             ):
@@ -21283,9 +20003,7 @@ def _transmission_transition_is_valid(
             if latest_is_success:
                 if current_child is None:
                     return False
-                current_runs = _transmission_component_runs_from_snapshot(
-                    current_child
-                )
+                current_runs = _transmission_component_runs_from_snapshot(current_child)
                 if current_runs is None or current_runs[role].pk != latest.pk:
                     return False
     return changed
@@ -21336,15 +20054,10 @@ def _transmission_parent_static_contract(
         not source_keys
         or "demo-market" in source_keys
         or source_keys
-        != _payload_source_keys(
-            [data.get("metrics"), data.get("charts"), data.get("sections")]
-        )
-        or data.get("required_notices")
-        != public_source_notices(source_keys)
+        != _payload_source_keys([data.get("metrics"), data.get("charts"), data.get("sections")])
+        or data.get("required_notices") != public_source_notices(source_keys)
         or set(data.get("component_batches") or [])
-        != _payload_batch_ids(
-            [data.get("metrics"), data.get("charts"), data.get("sections")]
-        )
+        != _payload_batch_ids([data.get("metrics"), data.get("charts"), data.get("sections")])
     ):
         return None
     sources = {item.key: item for item in Source.objects.filter(key__in=source_keys)}
@@ -21435,15 +20148,12 @@ def _transmission_snapshot_mode(
         for page_key in TRANSMISSION_CHAIN_COMPONENTS
     )
     latest_naturally_expired_children = {
-        page_key: _transmission_latest_valid_child(
-            page_key, mode="natural_expiry"
-        )
+        page_key: _transmission_latest_valid_child(page_key, mode="natural_expiry")
         for page_key in TRANSMISSION_CHAIN_COMPONENTS
     }
     exact_naturally_expired_children = all(
         latest_naturally_expired_children[page_key] is not None
-        and latest_naturally_expired_children[page_key].pk
-        == components[page_key].pk
+        and latest_naturally_expired_children[page_key].pk == components[page_key].pk
         for page_key in TRANSMISSION_CHAIN_COMPONENTS
     )
     if (
@@ -21452,9 +20162,7 @@ def _transmission_snapshot_mode(
         and deadline >= timezone.now()
         and exact_current_children
         and all(
-            _transmission_child_contract_is_valid(
-                child, mode="current_candidate"
-            )
+            _transmission_child_contract_is_valid(child, mode="current_candidate")
             for child in components.values()
         )
         and snapshot.quality_status == expected_quality
@@ -21463,9 +20171,7 @@ def _transmission_snapshot_mode(
     if (
         marker is not None
         and snapshot.quality_status == Observation.Quality.STALE
-        and _transmission_refresh_failure_is_valid(
-            snapshot, require_current_attempts=True
-        )
+        and _transmission_refresh_failure_is_valid(snapshot, require_current_attempts=True)
         and all(
             _transmission_child_contract_is_valid(child, mode="retained")
             for child in components.values()
@@ -21492,9 +20198,7 @@ def _transmission_snapshot_mode(
         and deadline < timezone.now()
         and exact_naturally_expired_children
         and all(
-            _transmission_child_contract_is_valid(
-                child, mode="natural_expiry"
-            )
+            _transmission_child_contract_is_valid(child, mode="natural_expiry")
             for child in components.values()
         )
         and snapshot.quality_status
@@ -21544,8 +20248,7 @@ def _transmission_changed_components(
         if referenced is None:
             return frozenset()
         if any(
-            attempts[page_key][role] is not None
-            and attempts[page_key][role].pk != run.pk
+            attempts[page_key][role] is not None and attempts[page_key][role].pk != run.pk
             for role, run in referenced.items()
         ):
             changed.add(page_key)
@@ -21608,8 +20311,7 @@ def _mark_transmission_chain_stale(*, reason_code: str) -> None:
         )
         .exclude(source__key="demo-market")
         .select_related("source")
-        .order_by("-created_at", "-id")
-        [:50]
+        .order_by("-created_at", "-id")[:50]
     )
     latest = None
     original_data: dict[str, Any] | None = None
@@ -21629,9 +20331,7 @@ def _mark_transmission_chain_stale(*, reason_code: str) -> None:
             retained_is_valid = bool(
                 components is not None
                 and all(
-                    _transmission_child_contract_is_valid(
-                        child, mode="retained"
-                    )
+                    _transmission_child_contract_is_valid(child, mode="retained")
                     for child in components.values()
                 )
             )
@@ -21687,17 +20387,13 @@ def _coordinate_transmission_chain_dashboard(
         *(
             source_key
             for page_key in TRANSMISSION_CHAIN_COMPONENTS
-            for source_key, _dataset in _transmission_component_datasets(
-                page_key
-            ).values()
+            for source_key, _dataset in _transmission_component_datasets(page_key).values()
         ),
     }
     for source_key in source_keys:
         ensure_source(source_key)
     locked_sources = list(
-        Source.objects.select_for_update()
-        .filter(key__in=source_keys)
-        .order_by("key")
+        Source.objects.select_for_update().filter(key__in=source_keys).order_by("key")
     )
     if {source.key for source in locked_sources} != source_keys:
         _mark_transmission_chain_stale(reason_code="component-validation")
@@ -21721,9 +20417,7 @@ def _coordinate_transmission_chain_dashboard(
         .order_by("source__key", "dataset", "started_at", "id")
         .values_list("pk", flat=True)
     )
-    if any(
-        run.status == IngestionRun.Status.RUNNING for run in attempt_rows
-    ):
+    if any(run.status == IngestionRun.Status.RUNNING for run in attempt_rows):
         return [], {"transmission-chain"}
     previous_candidates = list(
         DashboardSnapshot.objects.select_for_update()
@@ -21734,8 +20428,7 @@ def _coordinate_transmission_chain_dashboard(
         )
         .exclude(source__key="demo-market")
         .select_related("source")
-        .order_by("-created_at", "-id")
-        [:50]
+        .order_by("-created_at", "-id")[:50]
     )
     previous = None
     for candidate in previous_candidates:
@@ -21757,9 +20450,7 @@ def _coordinate_transmission_chain_dashboard(
     }
     if any(child is None for child in components.values()):
         incomplete = any(
-            run is None
-            or run.status != IngestionRun.Status.SUCCESS
-            or run.row_count <= 0
+            run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
             for page_attempts in attempts.values()
             for run in page_attempts.values()
         )
@@ -21768,17 +20459,11 @@ def _coordinate_transmission_chain_dashboard(
             if current_mode != "natural_expiry":
                 _mark_transmission_chain_stale(
                     reason_code=(
-                        "latest-attempt-incomplete"
-                        if incomplete
-                        else "component-validation"
+                        "latest-attempt-incomplete" if incomplete else "component-validation"
                     )
                 )
         return [], {"transmission-chain"}
-    selected = {
-        page_key: child
-        for page_key, child in components.items()
-        if child is not None
-    }
+    selected = {page_key: child for page_key, child in components.items() if child is not None}
     list(
         DashboardSnapshot.objects.select_for_update()
         .filter(pk__in={child.pk for child in selected.values()})
@@ -21847,14 +20532,8 @@ def _coordinate_transmission_chain_dashboard(
                     regressed = True
                     break
                 new_as_of = _parse_payload_datetime(new_envelope.get("as_of"))
-                old_as_of = _parse_payload_datetime(
-                    old_envelopes[page_key].get("as_of")
-                )
-                if (
-                    new_as_of is not None
-                    and old_as_of is not None
-                    and new_as_of < old_as_of
-                ):
+                old_as_of = _parse_payload_datetime(old_envelopes[page_key].get("as_of"))
+                if new_as_of is not None and old_as_of is not None and new_as_of < old_as_of:
                     regressed = True
                     break
         if regressed:
@@ -21885,21 +20564,17 @@ def _coordinate_transmission_chain_dashboard(
                 or _transmission_snapshot_mode(latest) != "current_candidate"
                 or any(
                     current_attempts[page_key][role] is None
-                    or current_attempts[page_key][role].pk
-                    != attempts[page_key][role].pk
+                    or current_attempts[page_key][role].pk != attempts[page_key][role].pk
                     for page_key in TRANSMISSION_CHAIN_COMPONENTS
                     for role in _transmission_component_datasets(page_key)
                 )
                 or any(
-                    (current_child := _transmission_latest_valid_child(page_key))
-                    is None
+                    (current_child := _transmission_latest_valid_child(page_key)) is None
                     or current_child.pk != selected[page_key].pk
                     for page_key in TRANSMISSION_CHAIN_COMPONENTS
                 )
             ):
-                raise ValueError(
-                    "transmission-chain v1 publication postcondition failed"
-                )
+                raise ValueError("transmission-chain v1 publication postcondition failed")
     except (
         ArithmeticError,
         AttributeError,
@@ -21944,21 +20619,14 @@ def _liquidity_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            reason
-            or (run.error if run else "required dataset run missing")
-        )[:320],
+        "reason": (reason or (run.error if run else "required dataset run missing"))[:320],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
@@ -21966,9 +20634,7 @@ def _select_liquidity_runs(
     trigger_runs: Iterable[IngestionRun],
 ) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
     runs = list(trigger_runs)
-    relevant: dict[str, list[IngestionRun]] = {
-        identity: [] for identity in LIQUIDITY_DATASETS
-    }
+    relevant: dict[str, list[IngestionRun]] = {identity: [] for identity in LIQUIDITY_DATASETS}
     fed_funds_triggers: list[tuple[str, IngestionRun]] = []
     for run in runs:
         identity = _liquidity_run_identity(run)
@@ -21995,28 +20661,16 @@ def _select_liquidity_runs(
         if latest is None or run.pk != latest.pk:
             return None, [], False
 
-    selected = {
-        identity: _latest_liquidity_attempt(identity)
-        for identity in LIQUIDITY_DATASETS
-    }
-    states = [
-        _liquidity_run_state(identity, selected[identity])
-        for identity in LIQUIDITY_DATASETS
-    ]
+    selected = {identity: _latest_liquidity_attempt(identity) for identity in LIQUIDITY_DATASETS}
+    states = [_liquidity_run_state(identity, selected[identity]) for identity in LIQUIDITY_DATASETS]
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in selected.values()
     ):
         return None, states, True
 
-    onrrp_cycle = str(
-        (selected["onrrp"].metadata or {}).get("refresh_cycle_id") or ""
-    )
-    tga_cycle = str(
-        (selected["tga"].metadata or {}).get("refresh_cycle_id") or ""
-    )
+    onrrp_cycle = str((selected["onrrp"].metadata or {}).get("refresh_cycle_id") or "")
+    tga_cycle = str((selected["tga"].metadata or {}).get("refresh_cycle_id") or "")
     if not onrrp_cycle or onrrp_cycle != tga_cycle:
         states = [
             (
@@ -22024,9 +20678,7 @@ def _select_liquidity_runs(
                     identity,
                     run,
                     status="invalid-cycle",
-                    reason=(
-                        "ON RRP and TGA are not from the same completed refresh cycle"
-                    ),
+                    reason=("ON RRP and TGA are not from the same completed refresh cycle"),
                 )
                 if identity in {"onrrp", "tga"}
                 else _liquidity_run_state(identity, run)
@@ -22054,14 +20706,8 @@ def _liquidity_component_failure(
         "status": status,
         "reason": reason[:320],
         "snapshot_id": snapshot.pk if snapshot else None,
-        "publication_batch_id": (
-            str(snapshot.batch_id) if snapshot else None
-        ),
-        "fingerprint": (
-            str((snapshot.data or {}).get("fingerprint") or "")
-            if snapshot
-            else ""
-        ),
+        "publication_batch_id": (str(snapshot.batch_id) if snapshot else None),
+        "fingerprint": (str((snapshot.data or {}).get("fingerprint") or "") if snapshot else ""),
     }
 
 
@@ -22077,11 +20723,7 @@ def _liquidity_observation_map(
 def _liquidity_input_lineage(
     observation: Observation, *, component_fresh_until: datetime
 ) -> dict[str, Any]:
-    fallback_key = (
-        observation.fallback_source.key
-        if observation.fallback_source_id
-        else None
-    )
+    fallback_key = observation.fallback_source.key if observation.fallback_source_id else None
     source_keys = sorted(_observation_source_keys(observation))
     return {
         "series_key": observation.series.key,
@@ -22099,9 +20741,7 @@ def _liquidity_input_lineage(
         "quality_status": observation.quality_status,
         "fallback_source": fallback_key,
         "fresh_until": component_fresh_until.isoformat(),
-        "observation_period_fresh_until": _fresh_until(
-            observation
-        ).isoformat(),
+        "observation_period_fresh_until": _fresh_until(observation).isoformat(),
     }
 
 
@@ -22119,9 +20759,7 @@ def _liquidity_direct_metric(
 ) -> dict[str, Any]:
     value = current.value * scale
     previous_value = previous.value * scale
-    current_lineage = _liquidity_input_lineage(
-        current, component_fresh_until=component_fresh_until
-    )
+    current_lineage = _liquidity_input_lineage(current, component_fresh_until=component_fresh_until)
     previous_lineage = _liquidity_input_lineage(
         previous, component_fresh_until=component_fresh_until
     )
@@ -22137,11 +20775,7 @@ def _liquidity_direct_metric(
         "source": current.source.name,
         "source_key": current.source.key,
         "source_keys": sorted(_observation_source_keys(current)),
-        "fallback_source": (
-            current.fallback_source.key
-            if current.fallback_source_id
-            else None
-        ),
+        "fallback_source": (current.fallback_source.key if current.fallback_source_id else None),
         "license_scope": current.source.license_scope,
         "as_of": current.as_of.isoformat(),
         "value_date": current.value_date.isoformat(),
@@ -22173,34 +20807,20 @@ def _liquidity_net_metric(
     page_fresh_until: datetime,
 ) -> dict[str, Any]:
     ordered_keys = ("walcl", "onrrp", "tga")
-    current_value = (
-        current["walcl"].value
-        - current["onrrp"].value
-        - current["tga"].value
-    )
-    previous_value = (
-        previous["walcl"].value
-        - previous["onrrp"].value
-        - previous["tga"].value
-    )
+    current_value = current["walcl"].value - current["onrrp"].value - current["tga"].value
+    previous_value = previous["walcl"].value - previous["onrrp"].value - previous["tga"].value
     scale = Decimal("0.000001")
     current_scaled = current_value * scale
     previous_scaled = previous_value * scale
     input_lineage = [
-        _liquidity_input_lineage(
-            current[key], component_fresh_until=component_deadlines[key]
-        )
+        _liquidity_input_lineage(current[key], component_fresh_until=component_deadlines[key])
         for key in ordered_keys
     ]
     previous_input_lineage = [
-        _liquidity_input_lineage(
-            previous[key], component_fresh_until=component_deadlines[key]
-        )
+        _liquidity_input_lineage(previous[key], component_fresh_until=component_deadlines[key])
         for key in ordered_keys
     ]
-    source_keys = sorted(
-        _observation_source_keys(*(current[key] for key in ordered_keys))
-    )
+    source_keys = sorted(_observation_source_keys(*(current[key] for key in ordered_keys)))
     fallback_keys = sorted(
         {
             current[key].fallback_source.key
@@ -22217,45 +20837,31 @@ def _liquidity_net_metric(
         "change_unit": " USD tn",
         "unit": " USD tn",
         "quality_status": Observation.Quality.ESTIMATED,
-        "source": (
-            "Atlas Macro 代理计算：WALCL − ON RRP − TGA（非官方 LPI）"
-        ),
+        "source": ("Atlas Macro 代理计算：WALCL − ON RRP − TGA（非官方 LPI）"),
         "source_key": "internal",
         "source_keys": sorted({*source_keys, "internal"}),
         "fallback_source": fallback_keys[0] if len(fallback_keys) == 1 else None,
         "license_scope": ensure_source("internal").license_scope,
         "as_of": min(current[key].as_of for key in ordered_keys).isoformat(),
         "value_date": current["walcl"].value_date.isoformat(),
-        "fetched_at": max(
-            current[key].fetched_at for key in ordered_keys
-        ).isoformat(),
+        "fetched_at": max(current[key].fetched_at for key in ordered_keys).isoformat(),
         "fresh_until": page_fresh_until.isoformat(),
-        "batch_id": ",".join(
-            sorted({str(current[key].batch_id) for key in ordered_keys})
-        ),
+        "batch_id": ",".join(sorted({str(current[key].batch_id) for key in ordered_keys})),
         "metadata": {
             "formula": "WALCL - ONRRP - TGA",
             "calculation_owner": "Atlas Macro",
             "model_label": "transparent liquidity proxy; not official LPI",
-            "common_effective_date": current[
-                "walcl"
-            ].value_date.date().isoformat(),
+            "common_effective_date": current["walcl"].value_date.date().isoformat(),
             "input_series": [current[key].series.key for key in ordered_keys],
-            "input_batch_ids": sorted(
-                {str(current[key].batch_id) for key in ordered_keys}
-            ),
+            "input_batch_ids": sorted({str(current[key].batch_id) for key in ordered_keys}),
             "input_value_dates": sorted(
                 {current[key].value_date.isoformat() for key in ordered_keys}
             ),
             "input_lineage": input_lineage,
             "previous_value": float(previous_scaled),
-            "previous_value_date": previous[
-                "walcl"
-            ].value_date.isoformat(),
+            "previous_value_date": previous["walcl"].value_date.isoformat(),
             "previous_input_lineage": previous_input_lineage,
-            "freshness_basis": (
-                "minimum current-release deadline across H.4.1, ON RRP and TGA"
-            ),
+            "freshness_basis": ("minimum current-release deadline across H.4.1, ON RRP and TGA"),
         },
     }
 
@@ -22300,14 +20906,9 @@ def _liquidity_fed_funds_component(
             "fed-funds", "Fed Funds fingerprint is missing or malformed", snapshot=snapshot
         )
 
-    latest_runs = {
-        identity: _latest_fed_funds_attempt(identity)
-        for identity in FED_FUNDS_DATASETS
-    }
+    latest_runs = {identity: _latest_fed_funds_attempt(identity) for identity in FED_FUNDS_DATASETS}
     if any(
-        run is None
-        or run.status != IngestionRun.Status.SUCCESS
-        or run.row_count <= 0
+        run is None or run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
         for run in latest_runs.values()
     ):
         return _liquidity_component_failure(
@@ -22316,9 +20917,7 @@ def _liquidity_fed_funds_component(
             status=Observation.Quality.STALE,
             snapshot=snapshot,
         )
-    expected_batches = {
-        str(run.batch_id) for run in latest_runs.values() if run is not None
-    }
+    expected_batches = {str(run.batch_id) for run in latest_runs.values() if run is not None}
     if set(data.get("component_batches", [])) != expected_batches:
         return _liquidity_component_failure(
             "fed-funds",
@@ -22362,9 +20961,7 @@ def _liquidity_fed_funds_component(
         metric = candidates[0]
         metadata = dict(metric.get("metadata") or {})
         deadline = _parse_payload_datetime(metric.get("fresh_until"))
-        metric_date = _parse_payload_datetime(
-            metric.get("value_date") or metric.get("as_of")
-        )
+        metric_date = _parse_payload_datetime(metric.get("value_date") or metric.get("as_of"))
         metric_as_of = _parse_payload_datetime(metric.get("as_of"))
         metric_fetched_at = _parse_payload_datetime(metric.get("fetched_at"))
         if (
@@ -22385,16 +20982,10 @@ def _liquidity_fed_funds_component(
                 snapshot=snapshot,
             )
         input_lineage = metadata.get("input_lineage")
-        input_batches = {
-            str(item) for item in metadata.get("input_batch_ids", []) if item
-        }
-        input_dates = {
-            str(item) for item in metadata.get("input_value_dates", []) if item
-        }
+        input_batches = {str(item) for item in metadata.get("input_batch_ids", []) if item}
+        input_dates = {str(item) for item in metadata.get("input_value_dates", []) if item}
         expected_inputs = expected_metric_inputs[metric_key]
-        expected_input_batches = {
-            input_specs[series_key][1] for series_key in expected_inputs
-        }
+        expected_input_batches = {input_specs[series_key][1] for series_key in expected_inputs}
         if (
             not isinstance(input_lineage, list)
             or len(input_lineage) != len(expected_inputs)
@@ -22405,25 +20996,20 @@ def _liquidity_fed_funds_component(
             or _payload_batch_ids(metric) != input_batches
             or any(
                 not isinstance(item, dict)
-                or str(item.get("series_key") or "").lower()
-                not in expected_inputs
+                or str(item.get("series_key") or "").lower() not in expected_inputs
                 or item.get("source_key")
                 != input_specs[str(item.get("series_key") or "").lower()][0]
                 or not item.get("license_scope")
                 or item.get("value_date") != metric_date.isoformat()
                 or _parse_payload_datetime(item.get("as_of")) is None
                 or not item.get("fetched_at")
-                or item.get("batch_id")
-                != input_specs[str(item.get("series_key") or "").lower()][1]
+                or item.get("batch_id") != input_specs[str(item.get("series_key") or "").lower()][1]
                 or item.get("quality_status")
                 not in {Observation.Quality.FRESH, Observation.Quality.ESTIMATED}
                 or item.get("fallback_source")
                 for item in input_lineage
             )
-            or {
-                str(item.get("series_key") or "").lower()
-                for item in input_lineage
-            }
+            or {str(item.get("series_key") or "").lower() for item in input_lineage}
             != expected_inputs
         ):
             return _liquidity_component_failure(
@@ -22440,9 +21026,7 @@ def _liquidity_fed_funds_component(
                 snapshot=snapshot,
             )
         normalized = (
-            MetricSnapshot.objects.filter(
-                key=f"fed-funds-{metric_key}", batch_id=snapshot.batch_id
-            )
+            MetricSnapshot.objects.filter(key=f"fed-funds-{metric_key}", batch_id=snapshot.batch_id)
             .select_related("source", "fallback_source")
             .first()
         )
@@ -22453,9 +21037,7 @@ def _liquidity_fed_funds_component(
                 snapshot=snapshot,
             )
         try:
-            payload_value = Decimal(str(metric["value"])).quantize(
-                Decimal("0.00000001")
-            )
+            payload_value = Decimal(str(metric["value"])).quantize(Decimal("0.00000001"))
         except (ArithmeticError, TypeError, ValueError):
             return _liquidity_component_failure(
                 "fed-funds",
@@ -22464,8 +21046,7 @@ def _liquidity_fed_funds_component(
             )
         if any(
             (
-                payload_value
-                != normalized.value.quantize(Decimal("0.00000001")),
+                payload_value != normalized.value.quantize(Decimal("0.00000001")),
                 metric_date != normalized.value_date,
                 metric_as_of != normalized.as_of,
                 metric_fetched_at != normalized.fetched_at,
@@ -22474,19 +21055,12 @@ def _liquidity_fed_funds_component(
                 metric.get("quality_status") != normalized.quality_status,
                 metric.get("unit", "") != normalized.unit,
                 not normalized.license_scope,
-                {
-                    str(item)
-                    for item in normalized.metadata.get("input_batch_ids", [])
-                    if item
-                }
+                {str(item) for item in normalized.metadata.get("input_batch_ids", []) if item}
                 != input_batches,
                 normalized.metadata.get("input_lineage") != input_lineage,
-                set(normalized.metadata.get("input_series") or [])
-                != expected_inputs,
-                normalized.metadata.get("formula")
-                != expected_formulas[metric_key],
-                normalized.metadata.get("common_effective_date")
-                != metric_date.date().isoformat(),
+                set(normalized.metadata.get("input_series") or []) != expected_inputs,
+                normalized.metadata.get("formula") != expected_formulas[metric_key],
+                normalized.metadata.get("common_effective_date") != metric_date.date().isoformat(),
             )
         ):
             return _liquidity_component_failure(
@@ -22534,9 +21108,7 @@ def _liquidity_fed_funds_component(
                 "component_snapshot_id": snapshot.pk,
                 "component_publication_batch_id": str(snapshot.batch_id),
                 "component_fingerprint": fingerprint,
-                "component_payload_integrity_hash": data.get(
-                    "payload_integrity_hash"
-                ),
+                "component_payload_integrity_hash": data.get("payload_integrity_hash"),
                 "component_metric_snapshot_id": normalized.pk,
                 "component_metric_snapshot_key": normalized.key,
                 "component_metric_snapshot_batch_id": str(normalized.batch_id),
@@ -22591,9 +21163,7 @@ def _liquidity_net_from_lineage(lineage: Iterable[dict[str, Any]]) -> Decimal | 
         return None
     if set(values) != {"walcl", "onrrp", "tga"}:
         return None
-    return (
-        values["walcl"] - values["onrrp"] - values["tga"]
-    ) * Decimal("0.000001")
+    return (values["walcl"] - values["onrrp"] - values["tga"]) * Decimal("0.000001")
 
 
 def _liquidity_page_contract_is_buildable(
@@ -22603,19 +21173,13 @@ def _liquidity_page_contract_is_buildable(
 ) -> bool:
     if extra_data.get("contract_version") != LIQUIDITY_CONTRACT_VERSION:
         return False
-    if {str(item.get("key") or "") for item in metrics} != set(
-        LIQUIDITY_REQUIRED_METRIC_KEYS
-    ):
+    if {str(item.get("key") or "") for item in metrics} != set(LIQUIDITY_REQUIRED_METRIC_KEYS):
         return False
-    if {str(item.get("key") or "") for item in charts} != {
-        "net-liquidity-history"
-    }:
+    if {str(item.get("key") or "") for item in charts} != {"net-liquidity-history"}:
         return False
     references = extra_data.get("component_snapshots")
     if not isinstance(references, list) or {
-        str(item.get("component") or "")
-        for item in references
-        if isinstance(item, dict)
+        str(item.get("component") or "") for item in references if isinstance(item, dict)
     } != {"h41", "onrrp", "tga", "fed-funds"}:
         return False
     if any(
@@ -22673,32 +21237,27 @@ def _liquidity_page_contract_is_buildable(
     if metadata.get("formula") != "WALCL - ONRRP - TGA":
         return False
     current_value = _liquidity_net_from_lineage(metadata.get("input_lineage") or [])
-    previous_value = _liquidity_net_from_lineage(
-        metadata.get("previous_input_lineage") or []
-    )
+    previous_value = _liquidity_net_from_lineage(metadata.get("previous_input_lineage") or [])
     if current_value is None or previous_value is None:
         return False
-    if current_value.quantize(Decimal("0.000001")) != Decimal(
-        str(net_metric["value"])
-    ).quantize(Decimal("0.000001")):
+    if current_value.quantize(Decimal("0.000001")) != Decimal(str(net_metric["value"])).quantize(
+        Decimal("0.000001")
+    ):
         return False
     if previous_value.quantize(Decimal("0.000001")) != Decimal(
         str(metadata.get("previous_value"))
     ).quantize(Decimal("0.000001")):
         return False
-    if {
-        str(item.get("value_date") or "")
-        for item in metadata.get("input_lineage", [])
-    } != {str(net_metric.get("value_date") or "")}:
+    if {str(item.get("value_date") or "") for item in metadata.get("input_lineage", [])} != {
+        str(net_metric.get("value_date") or "")
+    }:
         return False
 
     chart = charts[0]
     rows = chart.get("data") or []
     if len(rows) < 2 or chart.get("time_axis") != "date":
         return False
-    if max(str(row.get("date") or "") for row in rows) != next(
-        iter(common_dates)
-    ):
+    if max(str(row.get("date") or "") for row in rows) != next(iter(common_dates)):
         return False
     expected_fields = {
         "Net Liquidity",
@@ -22715,19 +21274,12 @@ def _liquidity_page_contract_is_buildable(
         ):
             return False
         net_lineage = row_lineage.get("Net Liquidity") or {}
-        if any(
-            not safe_lineage(item)
-            for item in net_lineage.get("input_lineage") or []
-        ):
+        if any(not safe_lineage(item) for item in net_lineage.get("input_lineage") or []):
             return False
-        recomputed = _liquidity_net_from_lineage(
-            net_lineage.get("input_lineage") or []
-        )
-        if recomputed is None or recomputed.quantize(
-            Decimal("0.000001")
-        ) != Decimal(str(row["Net Liquidity"])).quantize(
-            Decimal("0.000001")
-        ):
+        recomputed = _liquidity_net_from_lineage(net_lineage.get("input_lineage") or [])
+        if recomputed is None or recomputed.quantize(Decimal("0.000001")) != Decimal(
+            str(row["Net Liquidity"])
+        ).quantize(Decimal("0.000001")):
             return False
     run_batches = {
         str(item.get("batch_id"))
@@ -22773,8 +21325,7 @@ def _liquidity_page_data(
         return None, [
             _liquidity_component_failure(
                 "direct-inputs",
-                "required exact-batch series missing or unlicensed: "
-                + ", ".join(missing),
+                "required exact-batch series missing or unlicensed: " + ", ".join(missing),
                 status="missing",
             )
         ]
@@ -22930,20 +21481,13 @@ def _liquidity_page_data(
         return None, [fed_funds]
     policy_metrics, fed_funds_reference = fed_funds
     policy_by_key = {item["key"]: item for item in policy_metrics}
-    metrics.extend(
-        policy_by_key[key]
-        for key in ("sofr", "iorb", "sofr-effr", "sofr-iorb")
-    )
+    metrics.extend(policy_by_key[key] for key in ("sofr", "iorb", "sofr-effr", "sofr-iorb"))
 
     chart_rows: list[dict[str, Any]] = []
     for period in displayed_dates:
-        period_inputs = {
-            key: values[period] for key, values in observations.items()
-        }
+        period_inputs = {key: values[period] for key, values in observations.items()}
         net_value = (
-            period_inputs["walcl"].value
-            - period_inputs["onrrp"].value
-            - period_inputs["tga"].value
+            period_inputs["walcl"].value - period_inputs["onrrp"].value - period_inputs["tga"].value
         ) * Decimal("0.000001")
         net_input_lineage = [
             _liquidity_input_lineage(
@@ -22954,11 +21498,7 @@ def _liquidity_page_data(
         ]
         net_source_keys = sorted(
             {
-                *(
-                    source_key
-                    for item in net_input_lineage
-                    for source_key in item["source_keys"]
-                ),
+                *(source_key for item in net_input_lineage for source_key in item["source_keys"]),
                 "internal",
             }
         )
@@ -22966,15 +21506,9 @@ def _liquidity_page_data(
             {
                 "date": period.isoformat(),
                 "Net Liquidity": float(net_value),
-                "Federal Reserve Assets": float(
-                    period_inputs["walcl"].value * Decimal("0.000001")
-                ),
-                "ON RRP": float(
-                    period_inputs["onrrp"].value * Decimal("0.000001")
-                ),
-                "TGA": float(
-                    period_inputs["tga"].value * Decimal("0.000001")
-                ),
+                "Federal Reserve Assets": float(period_inputs["walcl"].value * Decimal("0.000001")),
+                "ON RRP": float(period_inputs["onrrp"].value * Decimal("0.000001")),
+                "TGA": float(period_inputs["tga"].value * Decimal("0.000001")),
                 "_source_keys": net_source_keys,
                 "_lineage": {
                     "Net Liquidity": {
@@ -22983,16 +21517,12 @@ def _liquidity_page_data(
                         "source_name": ensure_source("internal").name,
                         "source_keys": net_source_keys,
                         "license_scope": ensure_source("internal").license_scope,
-                        "value_date": period_inputs[
-                            "walcl"
-                        ].value_date.isoformat(),
+                        "value_date": period_inputs["walcl"].value_date.isoformat(),
                         "as_of": min(
-                            period_inputs[key].as_of
-                            for key in ("walcl", "onrrp", "tga")
+                            period_inputs[key].as_of for key in ("walcl", "onrrp", "tga")
                         ).isoformat(),
                         "fetched_at": max(
-                            period_inputs[key].fetched_at
-                            for key in ("walcl", "onrrp", "tga")
+                            period_inputs[key].fetched_at for key in ("walcl", "onrrp", "tga")
                         ).isoformat(),
                         "fresh_until": page_fresh_until.isoformat(),
                         "batch_id": ",".join(
@@ -23004,10 +21534,7 @@ def _liquidity_page_data(
                             )
                         ),
                         "input_batch_ids": sorted(
-                            {
-                                str(period_inputs[key].batch_id)
-                                for key in ("walcl", "onrrp", "tga")
-                            }
+                            {str(period_inputs[key].batch_id) for key in ("walcl", "onrrp", "tga")}
                         ),
                         "input_lineage": net_input_lineage,
                         "formula": "WALCL - ONRRP - TGA",
@@ -23048,9 +21575,7 @@ def _liquidity_page_data(
     )
     if chart is None:
         return None, [
-            _liquidity_component_failure(
-                "chart", "common-date chart contract could not be built"
-            )
+            _liquidity_component_failure("chart", "common-date chart contract could not be built")
         ]
 
     component_references = [
@@ -23080,14 +21605,10 @@ def _liquidity_page_data(
         "contract_version": LIQUIDITY_CONTRACT_VERSION,
         "common_effective_date": current_date.isoformat(),
         "component_snapshots": component_references,
-        "model_disclaimer": (
-            "Atlas Macro transparent proxy; not an official Federal Reserve LPI"
-        ),
+        "model_disclaimer": ("Atlas Macro transparent proxy; not an official Federal Reserve LPI"),
     }
     prepared = (metrics, [chart], sections, extra_data)
-    if not _liquidity_page_contract_is_buildable(
-        metrics, [chart], extra_data
-    ):
+    if not _liquidity_page_contract_is_buildable(metrics, [chart], extra_data):
         return None, [
             _liquidity_component_failure(
                 "liquidity", "prepared page failed the v1 contract post-build check"
@@ -23119,9 +21640,7 @@ def _liquidity_snapshot_effective_date(
         return snapshot.as_of.date()
 
 
-def _mark_liquidity_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_liquidity_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -23187,19 +21706,14 @@ def _coordinate_liquidity_dashboard(
     if prepared is None:
         _mark_liquidity_stale(
             failures,
-            reason=(
-                "必需流动性组件未形成同日、同批、有效且许可可公开的完整组合；"
-                "继续保留上一版。"
-            ),
+            reason=("必需流动性组件未形成同日、同批、有效且许可可公开的完整组合；继续保留上一版。"),
         )
         return [], {"liquidity"}
     _, _, _, extra_data = prepared
     candidate_date = date.fromisoformat(extra_data["common_effective_date"])
     previous_snapshot = _latest_liquidity_snapshot()
-    if (
-        previous_snapshot is not None
-        and candidate_date
-        < _liquidity_snapshot_effective_date(previous_snapshot)
+    if previous_snapshot is not None and candidate_date < _liquidity_snapshot_effective_date(
+        previous_snapshot
     ):
         failures = [
             _liquidity_component_failure(
@@ -23215,13 +21729,9 @@ def _coordinate_liquidity_dashboard(
         )
         return [], {"liquidity"}
 
-    expected_batches = {
-        str(selected[identity].batch_id) for identity in LIQUIDITY_DATASETS
-    }
+    expected_batches = {str(selected[identity].batch_id) for identity in LIQUIDITY_DATASETS}
     fed_reference = next(
-        item
-        for item in extra_data["component_snapshots"]
-        if item.get("component") == "fed-funds"
+        item for item in extra_data["component_snapshots"] if item.get("component") == "fed-funds"
     )
     expected_batches.update(fed_reference.get("component_batches", []))
     try:
@@ -23232,22 +21742,13 @@ def _coordinate_liquidity_dashboard(
             latest = _latest_liquidity_snapshot()
             postcondition_failed = (
                 latest is None
-                or (latest.data or {}).get("publication_batch_id")
-                != str(latest.batch_id)
-                or {
-                    str(item.get("key") or "")
-                    for item in (latest.data or {}).get("metrics", [])
-                }
+                or (latest.data or {}).get("publication_batch_id") != str(latest.batch_id)
+                or {str(item.get("key") or "") for item in (latest.data or {}).get("metrics", [])}
                 != set(LIQUIDITY_REQUIRED_METRIC_KEYS)
-                or {
-                    str(item.get("key") or "")
-                    for item in (latest.data or {}).get("charts", [])
-                }
+                or {str(item.get("key") or "") for item in (latest.data or {}).get("charts", [])}
                 != {"net-liquidity-history"}
-                or set((latest.data or {}).get("component_batches", []))
-                != expected_batches
-                or (latest.data or {}).get("common_effective_date")
-                != candidate_date.isoformat()
+                or set((latest.data or {}).get("component_batches", [])) != expected_batches
+                or (latest.data or {}).get("common_effective_date") != candidate_date.isoformat()
                 or (latest.data or {}).get("refresh_failure")
                 or not _liquidity_page_contract_is_buildable(
                     list((latest.data or {}).get("metrics", [])),
@@ -23268,13 +21769,10 @@ def _coordinate_liquidity_dashboard(
                     normalized is None
                     or normalized.value is None
                     or normalized.value.quantize(Decimal("0.000001"))
-                    != Decimal(str(net_metric["value"])).quantize(
-                        Decimal("0.000001")
-                    )
+                    != Decimal(str(net_metric["value"])).quantize(Decimal("0.000001"))
                     or normalized.value_date
                     != _parse_payload_datetime(net_metric.get("value_date"))
-                    or normalized.metadata.get("formula")
-                    != "WALCL - ONRRP - TGA"
+                    or normalized.metadata.get("formula") != "WALCL - ONRRP - TGA"
                     or not normalized.metadata.get("input_lineage")
                 )
             if postcondition_failed:
@@ -23289,10 +21787,7 @@ def _coordinate_liquidity_dashboard(
         ]
         _mark_liquidity_stale(
             failures,
-            reason=(
-                "流动性总览发布后置条件未满足；新写入已回滚，继续保留"
-                "上一版完整快照。"
-            ),
+            reason=("流动性总览发布后置条件未满足；新写入已回滚，继续保留上一版完整快照。"),
         )
         return [], {"liquidity"}
     return dashboards, set()
@@ -23320,21 +21815,14 @@ def _auction_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            reason
-            or (run.error if run else "required auction dataset run missing")
-        )[:320],
+        "reason": (reason or (run.error if run else "required auction dataset run missing"))[:320],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
@@ -23391,10 +21879,7 @@ def _auction_run_contract_error(
         normalized = state.get("normalized_count", returned)
         total = state.get("total_count")
         count = state.get("count")
-        if not all(
-            isinstance(value, int)
-            for value in (returned, normalized, total, count)
-        ):
+        if not all(isinstance(value, int) for value in (returned, normalized, total, count)):
             return f"{name} lacks complete integer row counts"
         if not returned == normalized == total == count:
             return f"{name} row counts do not reconcile"
@@ -23414,9 +21899,7 @@ def _select_auction_run(
 ) -> tuple[IngestionRun | None, list[dict[str, Any]], bool]:
     source_key, dataset = AUCTION_DATASET
     relevant = [
-        run
-        for run in trigger_runs
-        if run.source.key == source_key and run.dataset == dataset
+        run for run in trigger_runs if run.source.key == source_key and run.dataset == dataset
     ]
     if not relevant:
         return None, [], False
@@ -23486,9 +21969,7 @@ def _auction_row_payload(
     lineage_field: str = "offering_amount",
     lineage_value: Decimal | None = None,
     lineage_unit: str = "USD gross par",
-    additional_lineage_fields: tuple[
-        tuple[str, Decimal | None, str], ...
-    ] = (),
+    additional_lineage_fields: tuple[tuple[str, Decimal | None, str], ...] = (),
 ) -> dict[str, Any]:
     primary_value = (
         item.offering_amount
@@ -23574,11 +22055,7 @@ def _auction_derived_metric(
             "input_series": ["treasury-securities-auctions"],
             "input_batch_ids": [str(batch_id)],
             "input_value_dates": sorted(
-                {
-                    str(item.get("value_date") or "")
-                    for item in inputs
-                    if item.get("value_date")
-                }
+                {str(item.get("value_date") or "") for item in inputs if item.get("value_date")}
             ),
             "input_lineage": inputs,
             "calculation_owner": "Atlas Macro",
@@ -23678,9 +22155,7 @@ def _auction_page_data(
     fetched_at = _parse_payload_datetime((run.metadata or {}).get("fetched_at"))
     if fetched_at is None or fetched_at > now + timedelta(minutes=5):
         return None, [
-            _auction_run_state(
-                run, status="invalid", reason="invalid or future fetched_at"
-            )
+            _auction_run_state(run, status="invalid", reason="invalid or future fetched_at")
         ]
     fresh_until = datetime.combine(
         today_et + timedelta(days=2),
@@ -23707,9 +22182,7 @@ def _auction_page_data(
         identity = (item.cusip, item.auction_date)
         if identity in identities:
             return None, [
-                _auction_run_state(
-                    run, status="invalid", reason="duplicate auction identity"
-                )
+                _auction_run_state(run, status="invalid", reason="duplicate auction identity")
             ]
         identities.add(identity)
         dates = [
@@ -23761,8 +22234,7 @@ def _auction_page_data(
     results = [
         item
         for item in auctions
-        if recent_start <= item.auction_date <= today_et
-        and item.bid_to_cover_ratio is not None
+        if recent_start <= item.auction_date <= today_et and item.bid_to_cover_ratio is not None
     ]
     if any(
         item.offering_amount is None or item.offering_amount <= 0
@@ -23781,9 +22253,7 @@ def _auction_page_data(
 
     seven_day_end = today_et + timedelta(days=7)
     formal_7d = [item for item in formal if item.auction_date < seven_day_end]
-    issues_7d = [
-        item for item in issues if item.issue_date and item.issue_date < seven_day_end
-    ]
+    issues_7d = [item for item in issues if item.issue_date and item.issue_date < seven_day_end]
     gross_formal_7d = sum(
         (item.offering_amount or Decimal("0") for item in formal_7d),
         Decimal("0"),
@@ -23808,17 +22278,16 @@ def _auction_page_data(
         )
 
     next_item = formal[0] if formal else None
-    next_inputs = (
-        [offering_lineage(next_item, next_item.auction_date)] if next_item else []
-    )
+    next_inputs = [offering_lineage(next_item, next_item.auction_date)] if next_item else []
     days_to_next = (next_item.auction_date - today_et).days if next_item else None
     next_display = (
-        f"{days_to_next} 天 · {next_item.auction_date.isoformat()} · "
-        f"{next_item.security_term}"
+        f"{days_to_next} 天 · {next_item.auction_date.isoformat()} · {next_item.security_term}"
         if next_item is not None
         else "未来 14 天无已公告待拍卖项目"
     )
-    latest_result = max(results, key=lambda item: (item.auction_date, item.cusip)) if results else None
+    latest_result = (
+        max(results, key=lambda item: (item.auction_date, item.cusip)) if results else None
+    )
     latest_btc = latest_result.bid_to_cover_ratio if latest_result else None
     latest_btc_date = latest_result.auction_date if latest_result else today_et
     metrics = [
@@ -23886,7 +22355,9 @@ def _auction_page_data(
             key="latest-bid-to-cover",
             label="最近拍卖 Bid-to-Cover",
             value=latest_btc,
-            display_value=(f"{latest_btc:.2f}x" if latest_btc is not None else "近 90 天暂无已完成结果"),
+            display_value=(
+                f"{latest_btc:.2f}x" if latest_btc is not None else "近 90 天暂无已完成结果"
+            ),
             item=latest_result,
             value_date=latest_btc_date,
             fetched_at=fetched_at,
@@ -23901,9 +22372,7 @@ def _auction_page_data(
             event_date=item.auction_date,
             display_value=f"${(item.offering_amount or Decimal('0')) / Decimal('1000000000'):,.1f}B",
             status="待拍卖",
-            description=(
-                f"CUSIP {item.cusip}；公告面值，不代表财政部实际净融资或 TGA 流入"
-            ),
+            description=(f"CUSIP {item.cusip}；公告面值，不代表财政部实际净融资或 TGA 流入"),
             fresh_until=fresh_until,
         )
         for item in formal
@@ -23932,7 +22401,9 @@ def _auction_page_data(
             item,
             event_date=item.auction_date,
             display_value=f"{item.bid_to_cover_ratio:.2f}x",
-            status=(f"高收益率 {item.high_yield:.3f}%" if item.high_yield is not None else "结果已公布"),
+            status=(
+                f"高收益率 {item.high_yield:.3f}%" if item.high_yield is not None else "结果已公布"
+            ),
             description=(
                 f"CUSIP {item.cusip}；公告面值 "
                 f"${item.offering_amount / Decimal('1000000000'):,.1f}B"
@@ -23948,23 +22419,21 @@ def _auction_page_data(
                 ("high_yield", item.high_yield, "%"),
             ),
         )
-        for item in sorted(results, key=lambda value: (value.auction_date, value.cusip), reverse=True)
+        for item in sorted(
+            results, key=lambda value: (value.auction_date, value.cusip), reverse=True
+        )
     ]
 
     chart_rows = []
     for offset in range(14):
         event_date = today_et + timedelta(days=offset)
         daily = [item for item in issues if item.issue_date == event_date]
-        daily_total = sum(
-            (item.offering_amount or Decimal("0") for item in daily), Decimal("0")
-        )
+        daily_total = sum((item.offering_amount or Decimal("0") for item in daily), Decimal("0"))
         daily_inputs = [offering_lineage(item, event_date) for item in daily]
         chart_rows.append(
             {
                 "date": event_date.isoformat(),
-                "Gross announced issue amount": float(
-                    daily_total / Decimal("1000000000")
-                ),
+                "Gross announced issue amount": float(daily_total / Decimal("1000000000")),
                 "_source_keys": ["internal", "treasury-fiscal-data"],
                 "_lineage": {
                     "Gross announced issue amount": {
@@ -24001,9 +22470,7 @@ def _auction_page_data(
     )
     if chart is None:
         return None, [
-            _auction_run_state(
-                run, status="invalid", reason="gross issue chart contract failed"
-            )
+            _auction_run_state(run, status="invalid", reason="gross issue chart contract failed")
         ]
     sections = [
         {
@@ -24064,9 +22531,7 @@ def _auction_page_data(
         "timezone": "America/New_York",
         "window_semantics": "half-open [start, end)",
         "coverage_complete": True,
-        "component_snapshots": [
-            _auction_run_state(run, status="valid")
-        ],
+        "component_snapshots": [_auction_run_state(run, status="valid")],
         "model_disclaimer": (
             "offering_amount is gross announced face amount; it is not actual cash, "
             "net financing, a TGA forecast or a net-liquidity forecast"
@@ -24088,9 +22553,7 @@ def _latest_auction_snapshot() -> DashboardSnapshot | None:
     )
 
 
-def _mark_auction_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_auction_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -24137,10 +22600,8 @@ def _auction_snapshot_contract_is_valid(
         or data.get("refresh_failure")
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or set(data.get("component_batches", [])) != {str(run.batch_id)}
-        or {str(item.get("key") or "") for item in metrics}
-        != set(AUCTION_REQUIRED_METRIC_KEYS)
-        or {str(item.get("key") or "") for item in charts}
-        != {"gross-issue-calendar"}
+        or {str(item.get("key") or "") for item in metrics} != set(AUCTION_REQUIRED_METRIC_KEYS)
+        or {str(item.get("key") or "") for item in charts} != {"gross-issue-calendar"}
         or {str(item.get("key") or "") for item in sections}
         != {"formal-auctions-14d", "issue-settlement-14d", "recent-results-90d"}
     ):
@@ -24155,9 +22616,11 @@ def _auction_snapshot_contract_is_valid(
             or not item.get("value_date")
         ):
             return False
-        if item.get("source_key") == "internal" and not (
-            item.get("metadata") or {}
-        ).get("input_lineage") and item.get("value") not in {0, 0.0, None}:
+        if (
+            item.get("source_key") == "internal"
+            and not (item.get("metadata") or {}).get("input_lineage")
+            and item.get("value") not in {0, 0.0, None}
+        ):
             return False
     for section in sections:
         if section.get("batch_id") != str(run.batch_id):
@@ -24172,10 +22635,7 @@ def _auction_snapshot_contract_is_valid(
                 return False
     chart = charts[0]
     chart_rows = list(chart.get("data", []))
-    expected_dates = {
-        (today_et + timedelta(days=offset)).isoformat()
-        for offset in range(14)
-    }
+    expected_dates = {(today_et + timedelta(days=offset)).isoformat() for offset in range(14)}
     if {str(row.get("date") or "") for row in chart_rows} != expected_dates:
         return False
     field = "Gross announced issue amount"
@@ -24189,32 +22649,21 @@ def _auction_snapshot_contract_is_valid(
             or field not in row
         ):
             return False
-    by_date = {
-        date.fromisoformat(str(row["date"])): Decimal(str(row[field]))
-        for row in chart_rows
-    }
+    by_date = {date.fromisoformat(str(row["date"])): Decimal(str(row[field])) for row in chart_rows}
     metric_by_key = {item["key"]: item for item in metrics}
-    if (
-        sum(
-            (
-                by_date[today_et + timedelta(days=offset)]
-                for offset in range(7)
-            ),
-            Decimal("0"),
-        )
-        != Decimal(str(metric_by_key["issue-gross-7d"]["value"]))
-        or sum(by_date.values(), Decimal("0"))
-        != Decimal(str(metric_by_key["issue-gross-14d"]["value"]))
-    ):
+    if sum(
+        (by_date[today_et + timedelta(days=offset)] for offset in range(7)),
+        Decimal("0"),
+    ) != Decimal(str(metric_by_key["issue-gross-7d"]["value"])) or sum(
+        by_date.values(), Decimal("0")
+    ) != Decimal(str(metric_by_key["issue-gross-14d"]["value"])):
         return False
     section_by_key = {item["key"]: item for item in sections}
     formal_row_keys = {
-        row.get("key")
-        for row in section_by_key["formal-auctions-14d"].get("rows", [])
+        row.get("key") for row in section_by_key["formal-auctions-14d"].get("rows", [])
     }
     result_row_keys = {
-        row.get("key")
-        for row in section_by_key["recent-results-90d"].get("rows", [])
+        row.get("key") for row in section_by_key["recent-results-90d"].get("rows", [])
     }
     if formal_row_keys & result_row_keys:
         return False
@@ -24234,12 +22683,9 @@ def _auction_snapshot_contract_is_valid(
             or item.value != Decimal(str(metric["value"]))
             or item.source.key != metric["source_key"]
             or item.fallback_source_id is not None
-            or item.value_date
-            != _parse_payload_datetime(metric.get("value_date"))
-            or item.fetched_at
-            != _parse_payload_datetime(metric.get("fetched_at"))
-            or item.metadata.get("component_batch_id")
-            != metric.get("batch_id")
+            or item.value_date != _parse_payload_datetime(metric.get("value_date"))
+            or item.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
+            or item.metadata.get("component_batch_id") != metric.get("batch_id")
             or item.metadata.get("input_lineage")
             != (metric.get("metadata") or {}).get("input_lineage")
             or not item.license_scope
@@ -24263,33 +22709,23 @@ def _coordinate_auction_dashboard(
         .values_list("pk", flat=True)
     )
     now = timezone.now()
-    today_et = as_of_date or now.astimezone(
-        ZoneInfo("America/New_York")
-    ).date()
-    selected, states, triggered = _select_auction_run(
-        trigger_runs, today_et=today_et, now=now
-    )
+    today_et = as_of_date or now.astimezone(ZoneInfo("America/New_York")).date()
+    selected, states, triggered = _select_auction_run(trigger_runs, today_et=today_et, now=now)
     if not triggered:
         return [], set()
     if selected is None:
         _mark_auction_stale(
             states,
             reason=(
-                "最新拍卖刷新未形成当前 ET 日、完整且可公开的双窗口批次；"
-                "继续保留上一版完整快照。"
+                "最新拍卖刷新未形成当前 ET 日、完整且可公开的双窗口批次；继续保留上一版完整快照。"
             ),
         )
         return [], {"auctions"}
-    prepared, failures = _auction_page_data(
-        selected, today_et=today_et, now=now
-    )
+    prepared, failures = _auction_page_data(selected, today_et=today_et, now=now)
     if prepared is None:
         _mark_auction_stale(
             failures,
-            reason=(
-                "拍卖日历未通过精确批次、许可、日期或金额后置检查；"
-                "继续保留上一版。"
-            ),
+            reason=("拍卖日历未通过精确批次、许可、日期或金额后置检查；继续保留上一版。"),
         )
         return [], {"auctions"}
     metrics, charts, sections, extra_data = prepared
@@ -24300,9 +22736,7 @@ def _coordinate_auction_dashboard(
                 str((previous.data or {}).get("as_of_date_et") or "")
             )
         except ValueError:
-            previous_date = previous.as_of.astimezone(
-                ZoneInfo("America/New_York")
-            ).date()
+            previous_date = previous.as_of.astimezone(ZoneInfo("America/New_York")).date()
         if today_et < previous_date:
             _mark_auction_stale(
                 [
@@ -24347,10 +22781,7 @@ def _coordinate_auction_dashboard(
                     reason="publication postcondition failed",
                 )
             ],
-            reason=(
-                "拍卖 v1 发布后置条件未满足；新写入已回滚，继续保留"
-                "上一版完整快照。"
-            ),
+            reason=("拍卖 v1 发布后置条件未满足；新写入已回滚，继续保留上一版完整快照。"),
         )
         return [], {"auctions"}
     return ([snapshot] if snapshot is not None else []), set()
@@ -24386,21 +22817,14 @@ def _rrp_tga_run_state(
         "source": source_key,
         "dataset": dataset,
         "status": status or (run.status if run else "missing"),
-        "reason": (
-            reason
-            or (run.error if run else "required dataset run missing")
-        )[:320],
+        "reason": (reason or (run.error if run else "required dataset run missing"))[:320],
         "ingestion_run_id": run.pk if run else None,
         "batch_id": str(run.batch_id) if run else None,
         "row_count": run.row_count if run else 0,
         "refresh_cycle_id": (
-            str((run.metadata or {}).get("refresh_cycle_id") or "")
-            if run
-            else ""
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
         ),
-        "completed_at": (
-            run.completed_at.isoformat() if run and run.completed_at else None
-        ),
+        "completed_at": (run.completed_at.isoformat() if run and run.completed_at else None),
     }
 
 
@@ -24410,9 +22834,7 @@ def _select_rrp_tga_runs(
     today_et: date,
     now: datetime,
 ) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
-    relevant: dict[str, list[IngestionRun]] = {
-        identity: [] for identity in RRP_TGA_DATASETS
-    }
+    relevant: dict[str, list[IngestionRun]] = {identity: [] for identity in RRP_TGA_DATASETS}
     for run in trigger_runs:
         identity = _rrp_tga_run_identity(run)
         if identity:
@@ -24425,19 +22847,11 @@ def _select_rrp_tga_runs(
         latest = _latest_rrp_tga_attempt(identity)
         if latest is None or len(identity_runs) != 1 or identity_runs[0].pk != latest.pk:
             return None, [], False
-    selected = {
-        identity: _latest_rrp_tga_attempt(identity)
-        for identity in RRP_TGA_DATASETS
-    }
-    states = [
-        _rrp_tga_run_state(identity, selected[identity])
-        for identity in RRP_TGA_DATASETS
-    ]
+    selected = {identity: _latest_rrp_tga_attempt(identity) for identity in RRP_TGA_DATASETS}
+    states = [_rrp_tga_run_state(identity, selected[identity]) for identity in RRP_TGA_DATASETS]
     if any(run is None for run in selected.values()):
         return None, states, True
-    complete = {
-        identity: run for identity, run in selected.items() if run is not None
-    }
+    complete = {identity: run for identity, run in selected.items() if run is not None}
     for identity, run in complete.items():
         if run.status != IngestionRun.Status.SUCCESS:
             return None, states, True
@@ -24447,8 +22861,7 @@ def _select_rrp_tga_runs(
         if (
             fetched_at is None
             or fetched_at > now + timedelta(minutes=5)
-            or fetched_at.astimezone(ZoneInfo("America/New_York")).date()
-            != today_et
+            or fetched_at.astimezone(ZoneInfo("America/New_York")).date() != today_et
         ):
             return (
                 None,
@@ -24467,9 +22880,7 @@ def _select_rrp_tga_runs(
                 ],
                 True,
             )
-    auction_error = _auction_run_contract_error(
-        complete["auctions"], today_et=today_et, now=now
-    )
+    auction_error = _auction_run_contract_error(complete["auctions"], today_et=today_et, now=now)
     if auction_error:
         return (
             None,
@@ -24484,10 +22895,7 @@ def _select_rrp_tga_runs(
             ],
             True,
         )
-    cycles = {
-        str((run.metadata or {}).get("refresh_cycle_id") or "")
-        for run in complete.values()
-    }
+    cycles = {str((run.metadata or {}).get("refresh_cycle_id") or "") for run in complete.values()}
     if len(cycles) != 1 or not next(iter(cycles), ""):
         return (
             None,
@@ -24516,9 +22924,7 @@ def _rrp_tga_observation_metric(
     fresh_until: datetime,
 ) -> dict[str, Any]:
     value = observation.value * scale
-    lineage = _liquidity_input_lineage(
-        observation, component_fresh_until=fresh_until
-    )
+    lineage = _liquidity_input_lineage(observation, component_fresh_until=fresh_until)
     return {
         "key": key,
         "label": label,
@@ -24601,9 +23007,7 @@ def _rrp_tga_page_data(
             return None, [
                 _rrp_tga_run_state(
                     "onrrp" if series_key.startswith("ONRRP") else "tga",
-                    selected[
-                        "onrrp" if series_key.startswith("ONRRP") else "tga"
-                    ],
+                    selected["onrrp" if series_key.startswith("ONRRP") else "tga"],
                     status="missing",
                     reason=f"exact-batch {series_key} observations are missing",
                 )
@@ -24614,9 +23018,7 @@ def _rrp_tga_page_data(
                 return None, [
                     _rrp_tga_run_state(
                         "onrrp" if series_key.startswith("ONRRP") else "tga",
-                        selected[
-                            "onrrp" if series_key.startswith("ONRRP") else "tga"
-                        ],
+                        selected["onrrp" if series_key.startswith("ONRRP") else "tga"],
                         status="invalid",
                         reason=f"exact-batch {series_key} contains a future value date",
                     )
@@ -24625,11 +23027,7 @@ def _rrp_tga_page_data(
                 return None, [
                     _rrp_tga_run_state(
                         "onrrp" if series_key.startswith("ONRRP") else "tga",
-                        selected[
-                            "onrrp"
-                            if series_key.startswith("ONRRP")
-                            else "tga"
-                        ],
+                        selected["onrrp" if series_key.startswith("ONRRP") else "tga"],
                         status="invalid",
                         reason=(
                             f"exact-batch {series_key} contains duplicate "
@@ -24642,9 +23040,7 @@ def _rrp_tga_page_data(
             return None, [
                 _rrp_tga_run_state(
                     "onrrp" if series_key.startswith("ONRRP") else "tga",
-                    selected[
-                        "onrrp" if series_key.startswith("ONRRP") else "tga"
-                    ],
+                    selected["onrrp" if series_key.startswith("ONRRP") else "tga"],
                     status="invalid",
                     reason=f"exact-batch {series_key} has no non-future observation",
                 )
@@ -24674,9 +23070,7 @@ def _rrp_tga_page_data(
         observations[series_key] = ordered
         current = ordered[0]
         deadline = _fresh_until(current)
-        if (
-            deadline < now
-        ):
+        if deadline < now:
             return None, [
                 _rrp_tga_run_state(
                     "onrrp" if series_key.startswith("ONRRP") else "tga",
@@ -24713,22 +23107,14 @@ def _rrp_tga_page_data(
     )
     if auction_prepared is None:
         return None, auction_failures
-    auction_metrics, auction_charts, auction_sections, _auction_extra = (
-        auction_prepared
-    )
+    auction_metrics, auction_charts, auction_sections, _auction_extra = auction_prepared
     issue_metrics = {
         item["key"]: item
         for item in auction_metrics
         if item["key"] in {"issue-gross-7d", "issue-gross-14d"}
     }
-    issue_chart = next(
-        item for item in auction_charts if item["key"] == "gross-issue-calendar"
-    )
-    issue_section = next(
-        item
-        for item in auction_sections
-        if item["key"] == "issue-settlement-14d"
-    )
+    issue_chart = next(item for item in auction_charts if item["key"] == "gross-issue-calendar")
+    issue_section = next(item for item in auction_sections if item["key"] == "issue-settlement-14d")
 
     metrics = [
         _rrp_tga_observation_metric(
@@ -24808,12 +23194,9 @@ def _rrp_tga_page_data(
         "as_of_date_et": today_et.isoformat(),
         "timezone": "America/New_York",
         "coverage_complete": True,
-        "refresh_cycle_id": str(
-            (selected["auctions"].metadata or {}).get("refresh_cycle_id")
-        ),
+        "refresh_cycle_id": str((selected["auctions"].metadata or {}).get("refresh_cycle_id")),
         "component_snapshots": [
-            _rrp_tga_run_state(identity, run, status="valid")
-            for identity, run in selected.items()
+            _rrp_tga_run_state(identity, run, status="valid") for identity, run in selected.items()
         ],
         "model_disclaimer": (
             "The issue calendar is gross announced face amount, not actual cash, "
@@ -24839,9 +23222,7 @@ def _rrp_tga_page_data(
             "as_of": min(item["as_of"] for item in metrics),
             "fetched_at": max(item["fetched_at"] for item in metrics),
             "fresh_until": min(item["fresh_until"] for item in metrics),
-            "batch_id": ",".join(
-                sorted(str(run.batch_id) for run in selected.values())
-            ),
+            "batch_id": ",".join(sorted(str(run.batch_id) for run in selected.values())),
             "license_scope": ensure_source("internal").license_scope,
             "fallback_source": None,
             "full_width": True,
@@ -24863,9 +23244,7 @@ def _latest_rrp_tga_snapshot() -> DashboardSnapshot | None:
     )
 
 
-def _mark_rrp_tga_stale(
-    components: list[dict[str, Any]], *, reason: str
-) -> None:
+def _mark_rrp_tga_stale(components: list[dict[str, Any]], *, reason: str) -> None:
     latest = (
         DashboardSnapshot.objects.select_for_update()
         .filter(
@@ -24912,8 +23291,7 @@ def _rrp_tga_snapshot_contract_is_valid(
         or data.get("refresh_failure")
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or set(data.get("component_batches", [])) != expected_batches
-        or {str(item.get("key") or "") for item in metrics}
-        != set(RRP_TGA_REQUIRED_METRIC_KEYS)
+        or {str(item.get("key") or "") for item in metrics} != set(RRP_TGA_REQUIRED_METRIC_KEYS)
         or {str(item.get("key") or "") for item in charts}
         != {"rrp-tga-history", "gross-issue-calendar"}
     ):
@@ -24948,17 +23326,10 @@ def _rrp_tga_snapshot_contract_is_valid(
                 or str(lineage["value_date"])[:10] != str(row["date"])
             ):
                 return False
-    issue_chart_rows = list(
-        chart_by_key["gross-issue-calendar"].get("data", [])
-    )
-    expected_issue_dates = {
-        (today_et + timedelta(days=offset)).isoformat()
-        for offset in range(14)
-    }
+    issue_chart_rows = list(chart_by_key["gross-issue-calendar"].get("data", []))
+    expected_issue_dates = {(today_et + timedelta(days=offset)).isoformat() for offset in range(14)}
     issue_field = "Gross announced issue amount"
-    if {
-        str(row.get("date") or "") for row in issue_chart_rows
-    } != expected_issue_dates:
+    if {str(row.get("date") or "") for row in issue_chart_rows} != expected_issue_dates:
         return False
     for row in issue_chart_rows:
         lineage = (row.get("_lineage") or {}).get(issue_field)
@@ -24978,18 +23349,12 @@ def _rrp_tga_snapshot_contract_is_valid(
         date.fromisoformat(str(row["date"])): Decimal(str(row[issue_field]))
         for row in issue_chart_rows
     }
-    if (
-        sum(
-            (
-                issue_by_date[today_et + timedelta(days=offset)]
-                for offset in range(7)
-            ),
-            Decimal("0"),
-        )
-        != Decimal(str(metric_by_key["issue-gross-7d"]["value"]))
-        or sum(issue_by_date.values(), Decimal("0"))
-        != Decimal(str(metric_by_key["issue-gross-14d"]["value"]))
-    ):
+    if sum(
+        (issue_by_date[today_et + timedelta(days=offset)] for offset in range(7)),
+        Decimal("0"),
+    ) != Decimal(str(metric_by_key["issue-gross-7d"]["value"])) or sum(
+        issue_by_date.values(), Decimal("0")
+    ) != Decimal(str(metric_by_key["issue-gross-14d"]["value"])):
         return False
     for item in metrics:
         if (
@@ -25002,11 +23367,7 @@ def _rrp_tga_snapshot_contract_is_valid(
         ):
             return False
     issue_section = next(
-        (
-            item
-            for item in data.get("sections", [])
-            if item.get("key") == "issue-settlement-14d"
-        ),
+        (item for item in data.get("sections", []) if item.get("key") == "issue-settlement-14d"),
         None,
     )
     if issue_section is None:
@@ -25032,12 +23393,9 @@ def _rrp_tga_snapshot_contract_is_valid(
             or stored.value != Decimal(str(metric["value"]))
             or stored.source.key != metric["source_key"]
             or stored.fallback_source_id is not None
-            or stored.value_date
-            != _parse_payload_datetime(metric.get("value_date"))
-            or stored.fetched_at
-            != _parse_payload_datetime(metric.get("fetched_at"))
-            or stored.metadata.get("component_batch_id")
-            != metric.get("batch_id")
+            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.metadata.get("component_batch_id") != metric.get("batch_id")
             or stored.metadata.get("input_lineage")
             != (metric.get("metadata") or {}).get("input_lineage")
             or not stored.license_scope
@@ -25065,33 +23423,23 @@ def _coordinate_rrp_tga_dashboard(
         .values_list("pk", flat=True)
     )
     now = timezone.now()
-    today_et = as_of_date or now.astimezone(
-        ZoneInfo("America/New_York")
-    ).date()
-    selected, states, triggered = _select_rrp_tga_runs(
-        trigger_runs, today_et=today_et, now=now
-    )
+    today_et = as_of_date or now.astimezone(ZoneInfo("America/New_York")).date()
+    selected, states, triggered = _select_rrp_tga_runs(trigger_runs, today_et=today_et, now=now)
     if not triggered:
         return [], set()
     if selected is None:
         _mark_rrp_tga_stale(
             states,
             reason=(
-                "ON RRP、TGA 与拍卖日历未形成当前 ET 日同一刷新周期的"
-                "三个完整批次；继续保留上一版。"
+                "ON RRP、TGA 与拍卖日历未形成当前 ET 日同一刷新周期的三个完整批次；继续保留上一版。"
             ),
         )
         return [], {"rrp-tga"}
-    prepared, failures = _rrp_tga_page_data(
-        selected, today_et=today_et, now=now
-    )
+    prepared, failures = _rrp_tga_page_data(selected, today_et=today_et, now=now)
     if prepared is None:
         _mark_rrp_tga_stale(
             failures,
-            reason=(
-                "RRP/TGA 页面未通过精确批次、许可、新鲜度或血缘检查；"
-                "继续保留上一版完整快照。"
-            ),
+            reason=("RRP/TGA 页面未通过精确批次、许可、新鲜度或血缘检查；继续保留上一版完整快照。"),
         )
         return [], {"rrp-tga"}
     metrics, charts, sections, extra_data = prepared
@@ -25102,9 +23450,7 @@ def _coordinate_rrp_tga_dashboard(
                 str((previous.data or {}).get("as_of_date_et") or "")
             )
         except ValueError:
-            previous_date = previous.as_of.astimezone(
-                ZoneInfo("America/New_York")
-            ).date()
+            previous_date = previous.as_of.astimezone(ZoneInfo("America/New_York")).date()
         if today_et < previous_date:
             _mark_rrp_tga_stale(
                 [
@@ -25151,10 +23497,7 @@ def _coordinate_rrp_tga_dashboard(
                     reason="publication postcondition failed",
                 )
             ],
-            reason=(
-                "RRP/TGA v1 发布后置条件未满足；新写入已回滚，继续保留"
-                "上一版完整快照。"
-            ),
+            reason=("RRP/TGA v1 发布后置条件未满足；新写入已回滚，继续保留上一版完整快照。"),
         )
         return [], {"rrp-tga"}
     return ([snapshot] if snapshot is not None else []), set()
@@ -25169,8 +23512,7 @@ def _latest_treasury_contract_snapshot(page_key: str) -> DashboardSnapshot | Non
         )
         .exclude(source__key="demo-market")
         .select_related("source")
-        .order_by("-created_at", "-id")
-        [:50]
+        .order_by("-created_at", "-id")[:50]
     )
     return next(
         (
@@ -25203,8 +23545,7 @@ def _mark_treasury_curve_dashboards_stale(
             )
             .exclude(source__key="demo-market")
             .select_related("source")
-            .order_by("-created_at", "-id")
-            [:50]
+            .order_by("-created_at", "-id")[:50]
         )
         latest = next(
             (
@@ -25269,11 +23610,8 @@ def _mark_treasury_rates_for_fed_failure(
             and any(
                 item.get("component") == "fed-funds"
                 and item.get("snapshot_id") == fed_snapshot.pk
-                and item.get("publication_batch_id")
-                == str(fed_snapshot.batch_id)
-                for item in (candidate.data or {}).get(
-                    "component_snapshots", []
-                )
+                and item.get("publication_batch_id") == str(fed_snapshot.batch_id)
+                for item in (candidate.data or {}).get("component_snapshots", [])
                 if isinstance(item, dict)
             )
         ),
@@ -25326,8 +23664,7 @@ def _treasury_prepared_contract_is_buildable(
         or extra_data.get("formula_version") != TREASURY_CURVE_FORMULA_VERSION
         or not isinstance(extra_data.get("annual_runs"), list)
         or not isinstance(extra_data.get("all_annual_runs"), list)
-        or len(extra_data["all_annual_runs"])
-        != (TREASURY_CURVE_HISTORY_YEARS + 1) * 2
+        or len(extra_data["all_annual_runs"]) != (TREASURY_CURVE_HISTORY_YEARS + 1) * 2
         or len(extra_data["annual_runs"])
         != (
             TREASURY_CURVE_HISTORY_YEARS + 1
@@ -25335,8 +23672,7 @@ def _treasury_prepared_contract_is_buildable(
             else (TREASURY_CURVE_HISTORY_YEARS + 1) * 2
         )
         or any(
-            item.get("status") != IngestionRun.Status.SUCCESS
-            or not item.get("batch_id")
+            item.get("status") != IngestionRun.Status.SUCCESS or not item.get("batch_id")
             for item in extra_data["annual_runs"]
         )
         or any(
@@ -25347,7 +23683,10 @@ def _treasury_prepared_contract_is_buildable(
             or not item["artifact"].get("sha256")
             for item in extra_data["all_annual_runs"]
         )
-        or (required_metrics is not None and {item.get("key") for item in metrics} != set(required_metrics))
+        or (
+            required_metrics is not None
+            and {item.get("key") for item in metrics} != set(required_metrics)
+        )
         or (required_charts is not None and {item.get("key") for item in charts} != required_charts)
         or (
             required_sections is not None
@@ -25379,9 +23718,7 @@ def _treasury_prepared_contract_is_buildable(
             or item.get("status") != Observation.Quality.FRESH
             for item in sections
         )
-        or not publicly_displayable_source_keys(
-            _payload_source_keys([metrics, charts])
-        )
+        or not publicly_displayable_source_keys(_payload_source_keys([metrics, charts]))
     ):
         return False
     actual_batches = _payload_batch_ids([metrics, charts])
@@ -25410,9 +23747,7 @@ def _treasury_rates_overview_prepared(
     | None,
     dict[str, Any] | None,
 ]:
-    resolved_fed_component = fed_component or _liquidity_fed_funds_component(
-        now=timezone.now()
-    )
+    resolved_fed_component = fed_component or _liquidity_fed_funds_component(now=timezone.now())
     if isinstance(resolved_fed_component, dict):
         return None, resolved_fed_component
     policy_metrics, policy_reference = resolved_fed_component
@@ -25435,12 +23770,8 @@ def _treasury_rates_overview_prepared(
         **deepcopy(real_extra),
         "curve_scope": "rates-overview",
         "component_snapshots": [policy_reference],
-        "required_metric_keys": sorted(
-            str(item["key"]) for item in metrics
-        ),
-        "required_chart_keys": sorted(
-            str(item["key"]) for item in charts
-        ),
+        "required_metric_keys": sorted(str(item["key"]) for item in metrics),
+        "required_chart_keys": sorted(str(item["key"]) for item in charts),
         "required_section_keys": ["rates-composite-methodology"],
     }
     sections = [
@@ -25452,16 +23783,11 @@ def _treasury_rates_overview_prepared(
                 "继承同一 Treasury curve v2 合同。任一子组件失败时保留上一版。"
             ),
             "fresh_until": min(
-                str(item["fresh_until"])
-                for item in metrics
-                if item.get("fresh_until")
+                str(item["fresh_until"]) for item in metrics if item.get("fresh_until")
             ),
             "status": (
                 Observation.Quality.FRESH
-                if all(
-                    item.get("quality_status") == Observation.Quality.FRESH
-                    for item in metrics
-                )
+                if all(item.get("quality_status") == Observation.Quality.FRESH for item in metrics)
                 else Observation.Quality.ESTIMATED
             ),
             "full_width": True,
@@ -25497,9 +23823,7 @@ def _coordinate_treasury_curve_dashboards(
         .order_by("key")
         .values_list("pk", flat=True)
     )
-    selected, states, triggered = _select_treasury_curve_runs(
-        trigger_runs, end_year=end_year
-    )
+    selected, states, triggered = _select_treasury_curve_runs(trigger_runs, end_year=end_year)
     if not triggered:
         return [], set()
     if selected is None:
@@ -25519,16 +23843,13 @@ def _coordinate_treasury_curve_dashboards(
             {"yield-curve", "real-rates", "rates"},
             failures,
             reason=(
-                "Treasury 曲线未形成同日、跨年度批次明确且许可可公开的完整合同；"
-                "继续保留上一版。"
+                "Treasury 曲线未形成同日、跨年度批次明确且许可可公开的完整合同；继续保留上一版。"
             ),
         )
         return [], {"yield-curve", "real-rates", "rates"}
 
     expected_nominal_batches = {
-        str(run.batch_id)
-        for (component, _year), run in selected.items()
-        if component == "nominal"
+        str(run.batch_id) for (component, _year), run in selected.items() if component == "nominal"
     }
     expected_all_batches = {str(run.batch_id) for run in selected.values()}
     if not _treasury_prepared_contract_is_buildable(
@@ -25556,19 +23877,14 @@ def _coordinate_treasury_curve_dashboards(
         )
         return [], {"yield-curve", "real-rates", "rates"}
 
-    candidate_date = date.fromisoformat(
-        prepared["yield-curve"][3]["common_effective_date"]
-    )
+    candidate_date = date.fromisoformat(prepared["yield-curve"][3]["common_effective_date"])
     previous_snapshots = [
         snapshot
         for key in TREASURY_CURVE_PAGE_KEYS
         if (snapshot := _latest_treasury_contract_snapshot(key)) is not None
     ]
     if any(
-        candidate_date
-        < date.fromisoformat(
-            str((snapshot.data or {}).get("common_effective_date"))
-        )
+        candidate_date < date.fromisoformat(str((snapshot.data or {}).get("common_effective_date")))
         for snapshot in previous_snapshots
     ):
         failures = [
@@ -25591,9 +23907,7 @@ def _coordinate_treasury_curve_dashboards(
     rates_prepared, rates_failure = _treasury_rates_overview_prepared(
         prepared,
         fed_component=(
-            frozen_fed_component
-            if not isinstance(frozen_fed_component, dict)
-            else None
+            frozen_fed_component if not isinstance(frozen_fed_component, dict) else None
         ),
     )
     selected_keys = {"yield-curve", "real-rates"}
@@ -25619,26 +23933,20 @@ def _coordinate_treasury_curve_dashboards(
                 include_rates="rates" in selected_keys,
                 batch_id=uuid.uuid4(),
                 fed_component=(
-                    frozen_fed_component
-                    if not isinstance(frozen_fed_component, dict)
-                    else None
+                    frozen_fed_component if not isinstance(frozen_fed_component, dict) else None
                 ),
             )
             for key in ("yield-curve", "real-rates"):
                 latest = select_public_treasury_curve_snapshot(key)
                 expected_batches = (
-                    expected_nominal_batches
-                    if key == "yield-curve"
-                    else expected_all_batches
+                    expected_nominal_batches if key == "yield-curve" else expected_all_batches
                 )
                 if (
                     latest is None
                     or latest.data.get("publication_batch_id") != str(latest.batch_id)
-                    or latest.data.get("common_effective_date")
-                    != candidate_date.isoformat()
+                    or latest.data.get("common_effective_date") != candidate_date.isoformat()
                     or latest.data.get("refresh_failure")
-                    or set(latest.data.get("component_batches", []))
-                    != expected_batches
+                    or set(latest.data.get("component_batches", [])) != expected_batches
                     or not _treasury_prepared_contract_is_buildable(
                         key,
                         (
@@ -25650,20 +23958,15 @@ def _coordinate_treasury_curve_dashboards(
                         expected_batches=expected_batches,
                     )
                 ):
-                    raise ValueError(
-                        f"Treasury {key} publication postcondition failed"
-                    )
+                    raise ValueError(f"Treasury {key} publication postcondition failed")
             if "rates" in selected_keys:
                 latest_rates = select_public_treasury_curve_snapshot("rates")
                 if (
                     latest_rates is None
                     or latest_rates.data.get("refresh_failure")
-                    or latest_rates.data.get("common_effective_date")
-                    != candidate_date.isoformat()
+                    or latest_rates.data.get("common_effective_date") != candidate_date.isoformat()
                 ):
-                    raise ValueError(
-                        "Treasury rates publication postcondition failed"
-                    )
+                    raise ValueError("Treasury rates publication postcondition failed")
     except ValueError as exc:
         failures = [
             *[
@@ -25676,14 +23979,12 @@ def _coordinate_treasury_curve_dashboards(
                 "dataset": "treasury-curve-v1",
                 "status": "invalid",
                 "reason": str(exc),
-            }
+            },
         ]
         _mark_treasury_curve_dashboards_stale(
             {"yield-curve", "real-rates", "rates"},
             failures,
-            reason=(
-                "Treasury 发布后置条件未满足；新写入已回滚，继续保留上一版完整快照。"
-            ),
+            reason=("Treasury 发布后置条件未满足；新写入已回滚，继续保留上一版完整快照。"),
         )
         return [], {"yield-curve", "real-rates", "rates"}
     return dashboards, stale_keys
@@ -25731,8 +24032,7 @@ def _treasury_rates_fed_component_from_parent(
         or child_data.get("payload_integrity_hash") != payload_hash
         or reference.get("fingerprint") != fingerprint
         or reference.get("payload_integrity_hash") != payload_hash
-        or reference.get("component_batches")
-        != sorted(child_data.get("component_batches", []))
+        or reference.get("component_batches") != sorted(child_data.get("component_batches", []))
         or reference.get("fresh_until") != child_data.get("fresh_until")
     ):
         raise ValueError("Treasury rates Fed Funds payload no longer replays")
@@ -25756,14 +24056,11 @@ def _treasury_rates_fed_component_from_parent(
             .select_related("source", "fallback_source")
             .first()
         )
-        if (
-            normalized is None
-            or not _dashboard_metric_snapshot_matches_payload(
-                normalized,
-                metric,
-                fingerprint=fingerprint,
-                payload_integrity_hash=payload_hash,
-            )
+        if normalized is None or not _dashboard_metric_snapshot_matches_payload(
+            normalized,
+            metric,
+            fingerprint=fingerprint,
+            payload_integrity_hash=payload_hash,
         ):
             raise ValueError("Treasury rates Fed Funds normalized metric drifted")
         copied = deepcopy(metric)
@@ -25772,9 +24069,7 @@ def _treasury_rates_fed_component_from_parent(
         if not input_lineage:
             raise ValueError("Treasury rates Fed Funds lineage is missing")
         for lineage_item in input_lineage:
-            lineage_source = Source.objects.filter(
-                key=lineage_item.get("source_key")
-            ).first()
+            lineage_source = Source.objects.filter(key=lineage_item.get("source_key")).first()
             licence = (
                 _effective_source_license(lineage_source, require_public=True)
                 if lineage_source is not None
@@ -25807,9 +24102,7 @@ def _treasury_rates_fed_component_from_parent(
         copied["license_scope"] = metric_licence.scope
         copied_metrics.append(copied)
         metric_snapshot_ids.append(normalized.pk)
-        metric_date = _parse_payload_datetime(
-            copied.get("value_date") or copied.get("as_of")
-        )
+        metric_date = _parse_payload_datetime(copied.get("value_date") or copied.get("as_of"))
         if metric_date is None:
             raise ValueError("Treasury rates Fed Funds metric date is invalid")
         value_dates.add(metric_date.isoformat())
@@ -25881,10 +24174,7 @@ def _treasury_expected_page_payload(
     ]
     if len(stored_references) != len(TREASURY_CURVE_PAGE_KEYS):
         raise ValueError("Treasury rates child reference count is invalid")
-    stored_by_key = {
-        str(item.get("component_page_key")): item
-        for item in stored_references
-    }
+    stored_by_key = {str(item.get("component_page_key")): item for item in stored_references}
     if set(stored_by_key) != TREASURY_CURVE_PAGE_KEYS:
         raise ValueError("Treasury rates child reference keys are invalid")
     child_references = []
@@ -25894,9 +24184,7 @@ def _treasury_expected_page_payload(
             DashboardSnapshot.objects.filter(
                 pk=stored_reference.get("component_snapshot_id"),
                 key=child_key,
-                batch_id=stored_reference.get(
-                    "component_publication_batch_id"
-                ),
+                batch_id=stored_reference.get("component_publication_batch_id"),
                 is_published=True,
             )
             .exclude(source__key="demo-market")
@@ -25909,12 +24197,9 @@ def _treasury_expected_page_payload(
             else None
         )
         if child is None or replay is None:
-            raise ValueError(
-                f"Treasury rates parent cannot verify {child_key} child"
-            )
+            raise ValueError(f"Treasury rates parent cannot verify {child_key} child")
         if any(
-            replay.selected_runs[identity].pk != run.pk
-            for identity, run in selected_runs.items()
+            replay.selected_runs[identity].pk != run.pk for identity, run in selected_runs.items()
         ):
             raise ValueError("Treasury rates child run set is inconsistent")
         canonical_reference = {
@@ -25922,9 +24207,7 @@ def _treasury_expected_page_payload(
             "component_snapshot_id": child.pk,
             "component_publication_batch_id": str(child.batch_id),
             "component_fingerprint": child.data.get("fingerprint"),
-            "component_payload_integrity_hash": child.data.get(
-                "payload_integrity_hash"
-            ),
+            "component_payload_integrity_hash": child.data.get("payload_integrity_hash"),
             "component_contract_version": TREASURY_CURVE_CONTRACT_VERSION,
             "fresh_until": child.data.get("fresh_until"),
         }
@@ -25959,9 +24242,7 @@ def _normalized_treasury_snapshot_data(
         source_key = str(metric.get("source_key") or "")
         source = Source.objects.filter(key=source_key).first()
         licence = (
-            _effective_source_license(source, require_public=True)
-            if source is not None
-            else None
+            _effective_source_license(source, require_public=True) if source is not None else None
         )
         if source is None or licence is None:
             raise ValueError("Treasury metric source licence is unavailable")
@@ -25987,9 +24268,7 @@ def _normalized_treasury_snapshot_data(
         if len(scopes) != len(source_keys):
             raise ValueError("Treasury chart declares an unknown source")
         chart["license_scopes"] = scopes
-        chart["fallback_sources"] = sorted(
-            _payload_fallback_source_keys(chart)
-        )
+        chart["fallback_sources"] = sorted(_payload_fallback_source_keys(chart))
         normalized_charts.append(chart)
     if not normalized_charts:
         raise ValueError("Treasury strict pages require explicit charts")
@@ -26000,13 +24279,9 @@ def _normalized_treasury_snapshot_data(
     ]
     if not as_of_values:
         raise ValueError("Treasury page has no component as-of time")
-    as_of = min(
-        item.replace(tzinfo=UTC) if item.tzinfo is None else item
-        for item in as_of_values
-    )
+    as_of = min(item.replace(tzinfo=UTC) if item.tzinfo is None else item for item in as_of_values)
     component_qualities = {
-        item.get("quality_status")
-        for item in [*normalized_metrics, *normalized_charts]
+        item.get("quality_status") for item in [*normalized_metrics, *normalized_charts]
     }
     if Observation.Quality.ERROR in component_qualities:
         quality = Observation.Quality.ERROR
@@ -26019,9 +24294,7 @@ def _normalized_treasury_snapshot_data(
     component_batches = sorted(
         _payload_batch_ids([normalized_metrics, normalized_charts, sections])
     )
-    source_keys = sorted(
-        _payload_source_keys([normalized_metrics, normalized_charts, sections])
-    )
+    source_keys = sorted(_payload_source_keys([normalized_metrics, normalized_charts, sections]))
     snapshot_data = {
         "demo": False,
         "metrics": normalized_metrics,
@@ -26069,11 +24342,7 @@ def _treasury_snapshot_runs(
             run_id = int(raw_witness.get("ingestion_run_id"))
         except (TypeError, ValueError) as exc:
             raise ValueError("Treasury annual run id is invalid") from exc
-        run = (
-            IngestionRun.objects.filter(pk=run_id)
-            .select_related("source")
-            .first()
-        )
+        run = IngestionRun.objects.filter(pk=run_id).select_related("source").first()
         if run is None or _treasury_run_witness(run) != raw_witness:
             raise ValueError("Treasury annual run witness no longer replays")
         identity = _treasury_curve_identity(run.dataset)
@@ -26094,11 +24363,7 @@ def _treasury_snapshot_runs(
             )
         )
         or set(selected)
-        != {
-            (component, year)
-            for year in years
-            for component in TREASURY_CURVE_DATASET_PREFIXES
-        }
+        != {(component, year) for year in years for component in TREASURY_CURVE_DATASET_PREFIXES}
     ):
         raise ValueError("Treasury snapshot annual run coverage is not exact")
     current_cycles = {
@@ -26126,29 +24391,21 @@ def _treasury_snapshot_input_state(
     terminal_failures = [
         run
         for run in newer
-        if run.status in {
+        if run.status
+        in {
             IngestionRun.Status.FAILED,
             IngestionRun.Status.PARTIAL,
         }
-        or (
-            run.status == IngestionRun.Status.SUCCESS
-            and run.row_count <= 0
-        )
+        or (run.status == IngestionRun.Status.SUCCESS and run.row_count <= 0)
     ]
-    running_attempts = [
-        run for run in newer if run.status == IngestionRun.Status.RUNNING
-    ]
+    running_attempts = [run for run in newer if run.status == IngestionRun.Status.RUNNING]
     wall_now = timezone.now()
-    if any(
-        run.started_at < wall_now - TREASURY_CURVE_RUNNING_TIMEOUT
-        for run in running_attempts
-    ):
+    if any(run.started_at < wall_now - TREASURY_CURVE_RUNNING_TIMEOUT for run in running_attempts):
         raise ValueError("Treasury running attempt exceeded its transition timeout")
     raw_marker = (snapshot.data or {}).get("refresh_failure")
     marker = (
         None
-        if isinstance(raw_marker, dict)
-        and raw_marker.get("kind") == "fed-funds-child"
+        if isinstance(raw_marker, dict) and raw_marker.get("kind") == "fed-funds-child"
         else raw_marker
     )
 
@@ -26160,8 +24417,7 @@ def _treasury_snapshot_input_state(
         if (
             checked_at is None
             or checked_at < snapshot.created_at
-            or checked_at
-            > max(timezone.now(), datetime.now(UTC)) + timedelta(minutes=5)
+            or checked_at > max(timezone.now(), datetime.now(UTC)) + timedelta(minutes=5)
             or not isinstance(components, list)
         ):
             return None
@@ -26179,10 +24435,7 @@ def _treasury_snapshot_input_state(
                 or item.get("dataset") != run.dataset
                 or item.get("batch_id") != str(run.batch_id)
                 or item.get("status") != run.status
-                or (
-                    run.completed_at is not None
-                    and checked_at < run.completed_at
-                )
+                or (run.completed_at is not None and checked_at < run.completed_at)
             ):
                 return None
             bound.append(run)
@@ -26195,10 +24448,7 @@ def _treasury_snapshot_input_state(
     )
     marker_matches_terminal = bool(
         bound_attempts is not None
-        and all(
-            any(bound.pk == run.pk for bound in bound_attempts)
-            for run in terminal_failures
-        )
+        and all(any(bound.pk == run.pk for bound in bound_attempts) for run in terminal_failures)
     )
     if terminal_failures:
         state = "retained_failure"
@@ -26208,9 +24458,7 @@ def _treasury_snapshot_input_state(
         if marker_matches_newer:
             state = "retained_failure"
         else:
-            raise ValueError(
-                "Treasury snapshot is superseded by an unpublished successful run"
-            )
+            raise ValueError("Treasury snapshot is superseded by an unpublished successful run")
     else:
         deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
         if deadline is None:
@@ -26271,10 +24519,7 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
         referenced_runs[identity] = matches[0]
     if {str(run.batch_id) for run in referenced_runs.values()} != component_batches:
         raise ValueError("rates parent Fed Funds batch coverage is not exact")
-    latest_runs = {
-        identity: _latest_fed_funds_attempt(identity)
-        for identity in FED_FUNDS_DATASETS
-    }
+    latest_runs = {identity: _latest_fed_funds_attempt(identity) for identity in FED_FUNDS_DATASETS}
     if any(run is None for run in latest_runs.values()):
         raise ValueError("rates parent latest Fed Funds attempt is missing")
     newer = [
@@ -26304,8 +24549,7 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
         if (
             checked_at is None
             or checked_at < owner_created_at
-            or checked_at
-            > max(timezone.now(), datetime.now(UTC)) + timedelta(minutes=5)
+            or checked_at > max(timezone.now(), datetime.now(UTC)) + timedelta(minutes=5)
             or not isinstance(items, list)
         ):
             return None
@@ -26325,10 +24569,7 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
             if (
                 run is None
                 or item.get("status") != run.status
-                or (
-                    run.completed_at is not None
-                    and checked_at < run.completed_at
-                )
+                or (run.completed_at is not None and checked_at < run.completed_at)
             ):
                 return None
             bound.append(run)
@@ -26351,8 +24592,7 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
         and parent_marker.get("kind") == "fed-funds-child"
         and parent_marker.get("fed_snapshot_id") == child.pk
         and parent_marker.get("fed_publication_batch_id") == str(child.batch_id)
-        and parent_marker.get("components")
-        == (child_marker or {}).get("sources")
+        and parent_marker.get("components") == (child_marker or {}).get("sources")
         and {run.pk for run in child_bound} == {run.pk for run in parent_bound}
     )
     marker_matches = bool(
@@ -26366,7 +24606,8 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
     terminal = [
         run
         for run in newer
-        if run.status in {
+        if run.status
+        in {
             IngestionRun.Status.FAILED,
             IngestionRun.Status.PARTIAL,
         }
@@ -26374,10 +24615,7 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
     ]
     running = [run for run in newer if run.status == IngestionRun.Status.RUNNING]
     wall_now = timezone.now()
-    if any(
-        run.started_at < wall_now - TREASURY_CURVE_RUNNING_TIMEOUT
-        for run in running
-    ):
+    if any(run.started_at < wall_now - TREASURY_CURVE_RUNNING_TIMEOUT for run in running):
         raise ValueError("rates parent Fed Funds attempt exceeded its transition timeout")
     if terminal:
         marker_matches_terminal = bool(
@@ -26392,9 +24630,7 @@ def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
             raise ValueError("rates parent Fed Funds failure marker is invalid")
         return "retained_failure"
     if running:
-        if (
-            child_marker is not None or parent_marker is not None
-        ) and not marker_pair_valid:
+        if (child_marker is not None or parent_marker is not None) and not marker_pair_valid:
             raise ValueError("rates parent carries an invalid prior Fed marker")
         return "transition_pending"
     if newer:
@@ -26446,13 +24682,11 @@ def _treasury_rate_snapshot_static_replay(
             selected_runs,
             snapshot=snapshot,
         )
-        expected_data, expected_as_of, expected_quality = (
-            _normalized_treasury_snapshot_data(
-                title=title,
-                summary=summary,
-                batch_id=snapshot.batch_id,
-                prepared=prepared,
-            )
+        expected_data, expected_as_of, expected_quality = _normalized_treasury_snapshot_data(
+            title=title,
+            summary=summary,
+            batch_id=snapshot.batch_id,
+            prepared=prepared,
         )
         actual_without_marker = dict(data)
         actual_without_marker.pop("refresh_failure", None)
@@ -26466,17 +24700,13 @@ def _treasury_rate_snapshot_static_replay(
                 key__startswith=f"{page_key}-",
             ).select_related("source", "fallback_source")
         }
-        expected_metric_keys = {
-            f"{page_key}-{item['key']}" for item in metrics
-        }
+        expected_metric_keys = {f"{page_key}-{item['key']}" for item in metrics}
         if set(stored_metrics) != expected_metric_keys or any(
             not _dashboard_metric_snapshot_matches_payload(
                 stored_metrics[f"{page_key}-{metric['key']}"],
                 metric,
                 fingerprint=str(expected_data["fingerprint"]),
-                payload_integrity_hash=str(
-                    expected_data["payload_integrity_hash"]
-                ),
+                payload_integrity_hash=str(expected_data["payload_integrity_hash"]),
             )
             for metric in metrics
         ):
@@ -26530,11 +24760,7 @@ def treasury_rate_snapshot_is_publicly_displayable(
         if state in {"current_candidate", "transition_pending"}:
             if snapshot.quality_status not in {
                 replay.expected_quality,
-                *(
-                    {Observation.Quality.STALE}
-                    if state == "transition_pending"
-                    else set()
-                ),
+                *({Observation.Quality.STALE} if state == "transition_pending" else set()),
             }:
                 return False
         elif state == "retained_failure":
@@ -26590,8 +24816,9 @@ def select_public_treasury_curve_snapshot(
     return None
 
 
-def _rebuild_treasury_rates_parent_from_latest_components(
-) -> tuple[list[DashboardSnapshot], set[str]]:
+def _rebuild_treasury_rates_parent_from_latest_components() -> tuple[
+    list[DashboardSnapshot], set[str]
+]:
     """Recompose only ``rates`` after a successful Fed Funds revision."""
 
     has_treasury_contract = DashboardSnapshot.objects.filter(
@@ -26606,20 +24833,15 @@ def _rebuild_treasury_rates_parent_from_latest_components(
     if yield_snapshot is None or real_snapshot is None:
         return [], {"rates"}
     if (
-        getattr(yield_snapshot, "treasury_publication_state", None)
-        != "current_candidate"
-        or getattr(real_snapshot, "treasury_publication_state", None)
-        != "current_candidate"
+        getattr(yield_snapshot, "treasury_publication_state", None) != "current_candidate"
+        or getattr(real_snapshot, "treasury_publication_state", None) != "current_candidate"
     ):
         return [], {"rates"}
     selected = _treasury_snapshot_runs(real_snapshot)
     yield_selected = _treasury_snapshot_runs(yield_snapshot)
     if any(
-        yield_selected[("nominal", year)].pk
-        != selected[("nominal", year)].pk
-        for year in {
-            period for component, period in selected if component == "nominal"
-        }
+        yield_selected[("nominal", year)].pk != selected[("nominal", year)].pk
+        for year in {period for component, period in selected if component == "nominal"}
     ):
         return [], {"rates"}
     fed_component = _liquidity_fed_funds_component(now=timezone.now())
@@ -26650,10 +24872,8 @@ def _rebuild_treasury_rates_parent_from_latest_components(
         len(fed_references) != 1
         or fed_references[0].get("snapshot_id") != latest_fed.pk
         or set(child_references) != TREASURY_CURVE_PAGE_KEYS
-        or child_references["yield-curve"].get("component_snapshot_id")
-        != yield_snapshot.pk
-        or child_references["real-rates"].get("component_snapshot_id")
-        != real_snapshot.pk
+        or child_references["yield-curve"].get("component_snapshot_id") != yield_snapshot.pk
+        or child_references["real-rates"].get("component_snapshot_id") != real_snapshot.pk
     ):
         raise ValueError("rates parent-only child references are not exact")
     return [item for item in published if item.key == "rates"], set()
@@ -26722,9 +24942,7 @@ def _gdp_vintage_chart_and_section() -> tuple[
             "batch_id": str(item.batch_id),
             "quality_status": item.quality_status,
             "license_scope": item.license_scope,
-            "fallback_source": (
-                item.fallback_source.key if item.fallback_source_id else None
-            ),
+            "fallback_source": (item.fallback_source.key if item.fallback_source_id else None),
         }
 
     latest_entries = periods[latest_period]
@@ -26738,9 +24956,7 @@ def _gdp_vintage_chart_and_section() -> tuple[
         for item in latest_entries
     ]
     latest_item = latest_entries[-1]
-    quarter_label = (
-        f"{latest_period.year}Q{((latest_period.month - 1) // 3) + 1}"
-    )
+    quarter_label = f"{latest_period.year}Q{((latest_period.month - 1) // 3) + 1}"
     chart = {
         "key": "gdp-vintage-trail",
         "title": f"{quarter_label} 实际 GDP 估算修订",
@@ -26851,9 +25067,7 @@ def _sofr_market_metrics() -> list[dict[str, Any]]:
                 "source_key": latest.source.key,
                 "source_keys": latest_source_keys,
                 "fallback_source": (
-                    latest.fallback_source.key
-                    if latest.fallback_source_id
-                    else None
+                    latest.fallback_source.key if latest.fallback_source_id else None
                 ),
                 "as_of": latest.as_of.isoformat(),
                 "value_date": latest.value_date.isoformat(),
@@ -26877,9 +25091,7 @@ def _sofr_market_metrics() -> list[dict[str, Any]]:
                 "quality_status": Observation.Quality.ESTIMATED,
                 "source": f"Atlas Macro 计算：{latest.source.name}",
                 "source_key": "internal",
-                "source_keys": sorted(
-                    _observation_source_keys(latest) | {"internal"}
-                ),
+                "source_keys": sorted(_observation_source_keys(latest) | {"internal"}),
                 "as_of": latest.as_of.isoformat(),
                 "value_date": latest.value_date.isoformat(),
                 "fetched_at": latest.fetched_at.isoformat(),
@@ -26891,9 +25103,7 @@ def _sofr_market_metrics() -> list[dict[str, Any]]:
                 },
             }
         )
-        iorb = _real_observations("IORB").filter(
-            value_date__date=latest.value_date.date()
-        ).first()
+        iorb = _real_observations("IORB").filter(value_date__date=latest.value_date.date()).first()
         if iorb is not None:
             iorb_tail = (Decimal(str(percentile_99)) - iorb.value) * Decimal("100")
             iorb_fresh_until = min(fresh_until, _fresh_until(iorb))
@@ -26926,12 +25136,8 @@ def _sofr_market_metrics() -> list[dict[str, Any]]:
                         "formula": "SOFR percentPercentile99 - IORB",
                         "source_keys": sorted(input_source_keys),
                         "input_series": ["iorb", "sofr"],
-                        "input_batch_ids": sorted(
-                            {str(latest.batch_id), str(iorb.batch_id)}
-                        ),
-                        "input_value_dates": [
-                            latest.value_date.isoformat()
-                        ],
+                        "input_batch_ids": sorted({str(latest.batch_id), str(iorb.batch_id)}),
+                        "input_value_dates": [latest.value_date.isoformat()],
                     },
                 }
             )
@@ -26940,9 +25146,7 @@ def _sofr_market_metrics() -> list[dict[str, Any]]:
 
 def _sofr_market_history(*, limit: int = 120) -> list[dict[str, Any]]:
     rows = []
-    for observation in reversed(
-        _latest_observations_by_value_date("SOFR", limit=limit)
-    ):
+    for observation in reversed(_latest_observations_by_value_date("SOFR", limit=limit)):
         row: dict[str, Any] = {
             "date": observation.value_date.date().isoformat(),
             "SOFR": float(observation.value),
@@ -26982,9 +25186,9 @@ def _prepare_board_release_metadata(result, *, dataset: str) -> None:
     else:
         raise ValueError("release-aware Board metadata is limited to H.4.1 and H.8")
     result_metadata = dict(result.metadata or {})
-    raw_release_time = result_metadata.get(
-        "source_release_time"
-    ) or result_metadata.get("prepared_at")
+    raw_release_time = result_metadata.get("source_release_time") or result_metadata.get(
+        "prepared_at"
+    )
     if dataset == "h41":
         observation_dates_by_series: dict[str, list[str]] = {}
         raw_requested_series = result_metadata.get("requested_series")
@@ -27004,10 +25208,7 @@ def _prepare_board_release_metadata(result, *, dataset: str) -> None:
             if not series_id:
                 continue
             dates = observation_dates_by_series.setdefault(series_id, [])
-            if (
-                record.get("value") is not None
-                and record.get("status") in {None, "", "A"}
-            ):
+            if record.get("value") is not None and record.get("status") in {None, "", "A"}:
                 dates.append(str(record.get("date") or ""))
         source_release_time = validate_h41_release_time(
             raw_release_time,
@@ -27021,8 +25222,7 @@ def _prepare_board_release_metadata(result, *, dataset: str) -> None:
             observation_dates=(
                 str(record.get("date") or "")
                 for record in result.records
-                if record.get("value") is not None
-                and record.get("status") in {None, "", "A"}
+                if record.get("value") is not None and record.get("status") in {None, "", "A"}
             ),
         )
     canonical_release_time = source_release_time.isoformat()
@@ -27052,9 +25252,7 @@ def _guard_latest_board_archive_persistence(result, source, run) -> None:
         .first()
     )
     if latest_attempt is None or latest_attempt.pk != run.pk:
-        raise ValueError(
-            f"superseded {run.dataset} ingestion run cannot persist observations"
-        )
+        raise ValueError(f"superseded {run.dataset} ingestion run cannot persist observations")
     candidate_release_time = _parse_payload_datetime(
         (result.metadata or {}).get("source_release_time")
     )
@@ -27068,9 +25266,7 @@ def _guard_latest_board_archive_persistence(result, source, run) -> None:
             return
         parsed = _parse_payload_datetime(raw_value)
         if parsed is None:
-            raise ValueError(
-                f"{run.dataset} has invalid nonempty {context} release watermark"
-            )
+            raise ValueError(f"{run.dataset} has invalid nonempty {context} release watermark")
         release_watermarks.append(parsed)
 
     prior_runs = (
@@ -27101,16 +25297,13 @@ def _guard_latest_board_archive_persistence(result, source, run) -> None:
 
     if release_watermarks and candidate_release_time < max(release_watermarks):
         raise ValueError(
-            f"{run.dataset} source release time regressed behind the durable "
-            "release watermark"
+            f"{run.dataset} source release time regressed behind the durable release watermark"
         )
 
     run.metadata = {
         **dict(run.metadata or {}),
         "source_release_time": candidate_release_time.isoformat(),
-        "release_freshness_days": (result.metadata or {}).get(
-            "release_freshness_days"
-        ),
+        "release_freshness_days": (result.metadata or {}).get("release_freshness_days"),
     }
     run.save(update_fields=["metadata", "updated_at"])
 
@@ -27128,11 +25321,440 @@ def _store_series_with_artifacts(result, source, run) -> int:
             run=run,
             uri=f"{url}#sha256={digest}",
             sha256=digest,
-            content_type=str(
-                artifact.get("content_type") or "application/octet-stream"
-            ),
+            content_type=str(artifact.get("content_type") or "application/octet-stream"),
             size_bytes=int(artifact.get("size") or 0),
         )
+    return row_count
+
+
+def _successful_acquisition_metadata(
+    source: Source,
+    dataset: str,
+    *,
+    exclude_run_id: int,
+) -> Iterable[dict[str, Any]]:
+    """Yield only committed-success metadata for durable acquisition guards.
+
+    ``record_provider_result`` deliberately records the provider metadata on a
+    failed attempt for diagnostics.  That diagnostic payload is not a durable
+    data watermark: the surrounding database transaction has rolled back its
+    observations and artifact.  Watermark and coverage guards must therefore
+    never learn from RUNNING, PARTIAL, or FAILED attempts.
+    """
+
+    return (
+        IngestionRun.objects.filter(
+            source=source,
+            dataset=dataset,
+            status=IngestionRun.Status.SUCCESS,
+        )
+        .exclude(pk=exclude_run_id)
+        .values_list("metadata", flat=True)
+    )
+
+
+def _successful_acquisition_batch_ids(
+    source: Source,
+    dataset: str,
+    *,
+    exclude_run_id: int,
+):
+    """Return batch ids whose normalized rows reached terminal SUCCESS."""
+
+    return (
+        IngestionRun.objects.filter(
+            source=source,
+            dataset=dataset,
+            status=IngestionRun.Status.SUCCESS,
+        )
+        .exclude(pk=exclude_run_id)
+        .values_list("batch_id", flat=True)
+    )
+
+
+def _series_date_coverage(
+    records: Iterable[Mapping[str, Any]],
+    *,
+    context: str,
+) -> dict[str, dict[str, str | int]]:
+    """Return a canonical per-series date range for shrinkage detection."""
+
+    dates_by_series: dict[str, set[date]] = defaultdict(set)
+    for record in records:
+        series_key = str(record.get("series_id") or "").strip().lower()
+        raw_period = str(record.get("date") or "")
+        try:
+            period = date.fromisoformat(raw_period)
+        except ValueError as exc:
+            raise ValueError(f"{context} series coverage contains an invalid date") from exc
+        if not series_key or raw_period != period.isoformat():
+            raise ValueError(f"{context} series coverage identity is invalid")
+        dates_by_series[series_key].add(period)
+    return {
+        series_key: {
+            "start": min(periods).isoformat(),
+            "end": max(periods).isoformat(),
+            "count": len(periods),
+        }
+        for series_key, periods in sorted(dates_by_series.items())
+    }
+
+
+def _guard_series_coverage_not_shrunk(
+    *,
+    context: str,
+    candidate: Mapping[str, Mapping[str, Any]],
+    previous_metadata: Iterable[Mapping[str, Any]],
+) -> None:
+    """Reject a candidate that narrows any prior successful exact batch."""
+
+    for metadata in previous_metadata:
+        previous = metadata.get("series_date_coverage")
+        if previous in (None, {}):
+            continue
+        if not isinstance(previous, Mapping):
+            raise ValueError(f"durable {context} series coverage is invalid")
+        for raw_series_key, raw_policy in previous.items():
+            series_key = str(raw_series_key).lower()
+            policy = candidate.get(series_key)
+            if not isinstance(raw_policy, Mapping) or not isinstance(policy, Mapping):
+                raise ValueError(f"{context} series coverage shrank")
+            try:
+                prior_start = date.fromisoformat(str(raw_policy.get("start") or ""))
+                prior_end = date.fromisoformat(str(raw_policy.get("end") or ""))
+                prior_count = int(raw_policy.get("count"))
+                candidate_start = date.fromisoformat(str(policy.get("start") or ""))
+                candidate_end = date.fromisoformat(str(policy.get("end") or ""))
+                candidate_count = int(policy.get("count"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"durable {context} series coverage is invalid") from exc
+            if (
+                prior_count <= 0
+                or candidate_count <= 0
+                or prior_start > prior_end
+                or candidate_start > candidate_end
+            ):
+                raise ValueError(f"durable {context} series coverage is invalid")
+            if (
+                candidate_end < prior_end
+                or candidate_count < prior_count
+                or (candidate_end == prior_end and candidate_start > prior_start)
+            ):
+                raise ValueError(f"{context} series coverage shrank")
+
+
+def _guard_year_window_not_shrunk(
+    *,
+    context: str,
+    start_year: int,
+    end_year: int,
+    previous_metadata: Iterable[Mapping[str, Any]],
+    start_key: str,
+    end_key: str,
+) -> None:
+    for metadata in previous_metadata:
+        raw_start = metadata.get(start_key)
+        raw_end = metadata.get(end_key)
+        if raw_start in (None, "") and raw_end in (None, ""):
+            continue
+        try:
+            prior_start = int(raw_start)
+            prior_end = int(raw_end)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"durable {context} coverage window is invalid") from exc
+        if prior_start > prior_end:
+            raise ValueError(f"durable {context} coverage window is invalid")
+        if end_year < prior_end or (end_year - start_year) < (prior_end - prior_start):
+            raise ValueError(f"{context} coverage window shrank")
+
+
+def _validated_bls_raw_contract(
+    result: ProviderResult,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw_bytes = result.raw_bytes
+    if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
+        raise ValueError("BLS exact JSON bytes are required")
+    payload = bytes(raw_bytes)
+    metadata = dict(result.metadata or {})
+    endpoint = urlparse(str(metadata.get("endpoint") or ""))
+    request_witness = metadata.get("request_witness")
+    if (
+        endpoint.scheme != "https"
+        or endpoint.netloc.lower() != "api.bls.gov"
+        or endpoint.path != "/publicAPI/v2/timeseries/data/"
+        or endpoint.query
+        or not isinstance(request_witness, dict)
+        or set(request_witness) != {"series_ids", "start_year", "end_year"}
+    ):
+        raise ValueError("BLS endpoint or credential-free request witness is invalid")
+    series_ids = request_witness.get("series_ids")
+    try:
+        start_year = int(request_witness.get("start_year"))
+        end_year = int(request_witness.get("end_year"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("BLS request years are invalid") from exc
+    if not isinstance(series_ids, list) or any(
+        not isinstance(series_id, str) or not series_id for series_id in series_ids
+    ):
+        raise ValueError("BLS request series witness is invalid")
+    if result.dataset != "series:" + ",".join(series_ids):
+        raise ValueError("BLS dataset does not match the request witness")
+    digest = hashlib.sha256(payload).hexdigest()
+    content_type = str(metadata.get("content_type") or "").lower()
+    registration_key = os.getenv("BLS_REGISTRATION_KEY", "")
+    if (
+        int(metadata.get("byte_length") or 0) != len(payload)
+        or str(metadata.get("sha256") or "").lower() != digest
+        or "json" not in content_type
+    ):
+        raise ValueError("BLS response hash, size or content type is inconsistent")
+    if registration_key and registration_key.encode() in payload:
+        result.metadata = {
+            **metadata,
+            "messages": ["BLS upstream response message redacted"],
+        }
+        raise ValueError("BLS response echoed the configured registration credential")
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("BLS fetch time is in the future")
+    replay_records, replay_metadata = BLSProvider.parse_series_json_bytes(
+        payload,
+        series_ids=series_ids,
+        start_year=start_year,
+        end_year=end_year,
+        fetched_at=fetched_at,
+    )
+    if json.dumps(
+        replay_records,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ) != json.dumps(
+        result.records,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ):
+        raise ValueError("BLS normalized records do not match the exact JSON")
+    replay_keys = {
+        "requested_series",
+        "returned_series",
+        "missing_series",
+        "messages",
+        "quality_status",
+        "start_year",
+        "end_year",
+        "latest_value_dates",
+    }
+    if any(metadata.get(key) != replay_metadata.get(key) for key in replay_keys):
+        raise ValueError("BLS replay metadata does not match the exact JSON")
+    requested = set(replay_metadata["requested_series"])
+    if (
+        replay_metadata["missing_series"]
+        or set(replay_metadata["returned_series"]) != requested
+        or set(replay_metadata["latest_value_dates"]) != requested
+        or not replay_records
+    ):
+        raise ValueError("BLS exact JSON lacks required requested-series coverage")
+    return replay_records, replay_metadata
+
+
+def _persist_or_reuse_v2_exact_batch_artifact(
+    *,
+    result: ProviderResult,
+    source: Source,
+    run: IngestionRun,
+    expected_observation_count: int,
+    expected_vintage_count: int = 0,
+) -> tuple[RawArtifact, bool]:
+    """Create one artifact or validate the complete rows from an interrupted retry."""
+
+    existing_artifacts = list(
+        RawArtifact.objects.select_for_update().filter(run=run).order_by("pk")
+    )
+    existing_observations = list(
+        Observation.objects.select_for_update()
+        .filter(source=source, batch_id=run.batch_id)
+        .values_list("pk", flat=True)
+    )
+    existing_vintages = list(
+        ReleaseVintageObservation.objects.select_for_update()
+        .filter(source=source, batch_id=run.batch_id)
+        .values_list("pk", flat=True)
+    )
+    artifact = persist_private_raw_artifact(
+        run=run,
+        result=result,
+        namespace=source.key,
+    )
+    reused = bool(existing_artifacts)
+    if reused:
+        if (
+            len(existing_observations) != expected_observation_count
+            or len(existing_vintages) != expected_vintage_count
+        ):
+            raise ValueError("existing v2 artifact does not have its complete exact-batch rows")
+    elif existing_observations or existing_vintages:
+        raise ValueError("v2 exact-batch rows exist without their private raw artifact")
+    return artifact, reused
+
+
+def _store_bls_observations_v2(result, source, run) -> int:
+    """Persist one BLS response as a private, append-only exact batch."""
+
+    if (
+        source.key != "bls"
+        or result.provider != "bls"
+        or run.source_id != source.pk
+        or run.dataset != result.dataset
+    ):
+        raise ValueError("BLS persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("BLS source lacks historical-storage permission")
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded BLS run cannot persist observations")
+
+    replay_records, replay_metadata = _validated_bls_raw_contract(result)
+    successful_metadata = list(
+        _successful_acquisition_metadata(
+            source,
+            run.dataset,
+            exclude_run_id=run.pk,
+        )
+    )
+    _guard_year_window_not_shrunk(
+        context="BLS",
+        start_year=int(replay_metadata["start_year"]),
+        end_year=int(replay_metadata["end_year"]),
+        previous_metadata=successful_metadata,
+        start_key="start_year",
+        end_key="end_year",
+    )
+    series_date_coverage = _series_date_coverage(
+        replay_records,
+        context="BLS",
+    )
+    _guard_series_coverage_not_shrunk(
+        context="BLS",
+        candidate=series_date_coverage,
+        previous_metadata=successful_metadata,
+    )
+    durable_latest: dict[str, date] = {}
+    for previous_metadata in successful_metadata:
+        for series_id, raw_period in (
+            (previous_metadata or {}).get("latest_value_dates") or {}
+        ).items():
+            try:
+                period = date.fromisoformat(str(raw_period))
+            except ValueError as exc:
+                raise ValueError("durable BLS value-date watermark is invalid") from exc
+            series_key = str(series_id).lower()
+            durable_latest[series_key] = max(
+                period,
+                durable_latest.get(series_key, period),
+            )
+    successful_batches = _successful_acquisition_batch_ids(
+        source,
+        run.dataset,
+        exclude_run_id=run.pk,
+    )
+    for series_key, raw_period in Observation.objects.filter(
+        source=source,
+        batch_id__in=successful_batches,
+        series__key__in={key.lower() for key in replay_metadata["requested_series"]},
+    ).values_list("series__key", "value_date"):
+        period = raw_period.date()
+        durable_latest[str(series_key)] = max(
+            period,
+            durable_latest.get(str(series_key), period),
+        )
+    candidate_latest = {
+        str(series_id).lower(): date.fromisoformat(str(raw_period))
+        for series_id, raw_period in replay_metadata["latest_value_dates"].items()
+    }
+    if any(
+        series_id not in candidate_latest or candidate_latest[series_id] < period
+        for series_id, period in durable_latest.items()
+    ):
+        raise ValueError("BLS latest value date regressed")
+
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "series_date_coverage": series_date_coverage,
+    }
+    artifact, reused = _persist_or_reuse_v2_exact_batch_artifact(
+        result=result,
+        source=source,
+        run=run,
+        expected_observation_count=len(replay_records),
+    )
+    if reused:
+        row_count = len(replay_records)
+    else:
+        row_count = store_series_observations(
+            result,
+            source,
+            run,
+            preserve_batches=True,
+        )
+        Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+            fallback_source=None
+        )
+    expected_contract = sorted(
+        (
+            str(record["series_id"]).lower(),
+            str(record["date"]),
+            f"{Decimal(str(record['value'])):.8f}",
+            str(
+                record.get("quality_status")
+                if record.get("quality_status") in Observation.Quality.values
+                else Observation.Quality.FRESH
+            ),
+            _canonical_provider_payload(record.get("metadata") or {}),
+        )
+        for record in replay_records
+    )
+    stored_contract = sorted(
+        (
+            item.series.key,
+            item.value_date.date().isoformat(),
+            f"{item.value:.8f}",
+            item.quality_status,
+            _canonical_provider_payload(item.metadata or {}),
+        )
+        for item in Observation.objects.filter(
+            source=source,
+            batch_id=run.batch_id,
+        ).select_related("series")
+        if item.instrument_id is None
+        and item.as_of == item.value_date
+        and item.source_id == source.pk
+        and item.series.source_id == source.pk
+        and item.series.frequency == "monthly"
+        and item.fallback_source_id is None
+    )
+    if (
+        row_count <= 0
+        or row_count != result.row_count
+        or expected_contract != stored_contract
+        or RawArtifact.objects.filter(run=run).count() != 1
+        or artifact.sha256 != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError("BLS exact-batch persistence postcondition failed")
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "raw_artifact_sha256": artifact.sha256,
+        "raw_artifact_uri": artifact.uri,
+    }
     return row_count
 
 
@@ -27199,9 +25821,9 @@ def _store_treasury_curve_observations(result, source, run) -> int:
     if (
         endpoint.scheme != "https"
         or endpoint.netloc.lower() != "home.treasury.gov"
-        or endpoint.path
-        != "/resource-center/data-chart-center/interest-rates/pages/xml"
-        or parse_qs(endpoint.query) != {
+        or endpoint.path != "/resource-center/data-chart-center/interest-rates/pages/xml"
+        or parse_qs(endpoint.query)
+        != {
             "data": [curve],
             "field_tdr_date_value": [str(requested_year)],
         }
@@ -27247,15 +25869,11 @@ def _store_treasury_curve_observations(result, source, run) -> int:
         or len(incoming) != len(incoming_identities)
         or sorted(incoming) != sorted(replay_contract)
     ):
-        raise ValueError(
-            "Treasury normalized observations do not replay from the exact XML"
-        )
+        raise ValueError("Treasury normalized observations do not replay from the exact XML")
 
     Source.objects.select_for_update().get(pk=source.pk)
     if _effective_source_license(source, lock=True, require_storage=True) is None:
-        raise ValueError(
-            "Treasury curve source lacks a current historical-storage licence"
-        )
+        raise ValueError("Treasury curve source lacks a current historical-storage licence")
     latest_attempt = (
         IngestionRun.objects.filter(source=source, dataset=run.dataset)
         .order_by("-started_at", "-id")
@@ -27284,9 +25902,7 @@ def _store_treasury_curve_observations(result, source, run) -> int:
             )
         except ValueError:
             continue
-        parsed_release = _parse_payload_datetime(
-            previous_metadata.get("feed_updated_time")
-        )
+        parsed_release = _parse_payload_datetime(previous_metadata.get("feed_updated_time"))
         if parsed_release is not None:
             previous_release_times.append(parsed_release)
     if previous_latest_dates and candidate_latest < max(previous_latest_dates):
@@ -27308,17 +25924,12 @@ def _store_treasury_curve_observations(result, source, run) -> int:
         if (
             artifact.sha256 != digest
             or artifact.size_bytes != len(result.raw_bytes)
-            or artifact.uri
-            != f"private://{source.key}/{digest[:2]}/{digest}.bin"
+            or artifact.uri != f"private://{source.key}/{digest[:2]}/{digest}.bin"
         ):
             raise ValueError("Treasury curve existing raw artifact is inconsistent")
     else:
-        artifact = persist_private_raw_artifact(
-            run=run, result=result, namespace=source.key
-        )
-    count = store_series_observations(
-        result, source, run, preserve_batches=True
-    )
+        artifact = persist_private_raw_artifact(run=run, result=result, namespace=source.key)
+    count = store_series_observations(result, source, run, preserve_batches=True)
     rows = list(
         Observation.objects.filter(batch_id=run.batch_id)
         .select_related("series", "source", "fallback_source")
@@ -27395,8 +26006,7 @@ def _store_treasury_bill_observations(result, source, run) -> int:
             or record.get("value") is None
             or not Decimal(str(record["value"])).is_finite()
             or period.year not in requested_years
-            or record_metadata.get("quote_convention")
-            != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
+            or record_metadata.get("quote_convention") != RESERVES_RATE_SPREADS_QUOTE_CONVENTION
             or record_metadata.get("treasury_field")
             != TreasuryRatesProvider.BILL_13W_COUPON_EQUIVALENT_FIELD
             or record_metadata.get("bank_discount_rate") in {None, ""}
@@ -27412,8 +26022,7 @@ def _store_treasury_bill_observations(result, source, run) -> int:
     artifacts = list(metadata.get("artifacts") or [])
     if (
         len(artifacts) != 2
-        or {item.get("requested_year") for item in artifacts}
-        != set(requested_years)
+        or {item.get("requested_year") for item in artifacts} != set(requested_years)
         or any(
             not item.get("url")
             or len(str(item.get("sha256") or "")) != 64
@@ -27432,26 +26041,20 @@ def _store_treasury_bill_observations(result, source, run) -> int:
         raise ValueError("Treasury bill feed update watermark is invalid or future")
 
     Source.objects.select_for_update().get(pk=source.pk)
-    storage_licence = _effective_source_license(
-        source, lock=True, require_storage=True
-    )
+    storage_licence = _effective_source_license(source, lock=True, require_storage=True)
     if storage_licence is None:
-        raise ValueError(
-            "Treasury bill source lacks a current historical-storage licence"
-        )
+        raise ValueError("Treasury bill source lacks a current historical-storage licence")
     latest_attempt = (
         IngestionRun.objects.filter(source=source, dataset=run.dataset)
         .order_by("-started_at", "-id")
         .first()
     )
     if latest_attempt is None or latest_attempt.pk != run.pk:
-        raise ValueError(
-            "superseded Treasury bill ingestion run cannot persist observations"
-        )
+        raise ValueError("superseded Treasury bill ingestion run cannot persist observations")
     durable_feed_updates: list[datetime] = []
-    for previous in IngestionRun.objects.filter(
-        source=source, dataset=run.dataset
-    ).exclude(pk=run.pk):
+    for previous in IngestionRun.objects.filter(source=source, dataset=run.dataset).exclude(
+        pk=run.pk
+    ):
         raw_value = (previous.metadata or {}).get("feed_updated_time")
         if raw_value in {None, ""}:
             continue
@@ -27474,14 +26077,10 @@ def _store_treasury_bill_observations(result, source, run) -> int:
             raise ValueError("Treasury bill observation has an invalid feed watermark")
         durable_feed_updates.append(parsed)
     if durable_feed_updates and feed_updated < max(durable_feed_updates):
-        raise ValueError(
-            "Treasury bill feed update regressed behind the durable watermark"
-        )
+        raise ValueError("Treasury bill feed update regressed behind the durable watermark")
     existing_latest = existing.order_by("-value_date", "-id").first()
     if existing_latest is not None and max(record_dates) < existing_latest.value_date.date():
-        raise ValueError(
-            "Treasury bill latest quote regressed behind stored observations"
-        )
+        raise ValueError("Treasury bill latest quote regressed behind stored observations")
     run.metadata = {
         **dict(run.metadata or {}),
         "feed_updated_time": feed_updated.isoformat(),
@@ -27517,11 +26116,7 @@ def _store_h41_observations(result, source, run) -> int:
 def _store_h8_observations(result, source, run) -> int:
     """Persist H.8 history with its official weekly USD-million definition."""
 
-    if (
-        source.key != "federal-reserve"
-        or result.dataset != "h8"
-        or run.dataset != "h8"
-    ):
+    if source.key != "federal-reserve" or result.dataset != "h8" or run.dataset != "h8":
         raise ValueError("H.8 persistence source/run identity mismatch")
     _prepare_board_release_metadata(result, dataset="h8")
     _guard_latest_board_archive_persistence(result, source, run)
@@ -27571,25 +26166,14 @@ def _guard_fed_balance_sheet_component_persistence(
     if specification is None:
         raise ValueError("unsupported fed-balance-sheet guarded dataset")
     expected_source, required_series, allowed_series = specification
-    if (
-        source.key != expected_source
-        or run.source_id != source.pk
-        or run.dataset != result.dataset
-    ):
-        raise ValueError(
-            "fed-balance-sheet component persistence source/run identity mismatch"
-        )
+    if source.key != expected_source or run.source_id != source.pk or run.dataset != result.dataset:
+        raise ValueError("fed-balance-sheet component persistence source/run identity mismatch")
 
     # The source row is the cross-dataset insertion fence on PostgreSQL; the
     # latest attempt row supplies a deterministic SQLite-testable guard.
     Source.objects.select_for_update().get(pk=source.pk)
-    if (
-        _effective_source_license(source, lock=True, require_storage=True)
-        is None
-    ):
-        raise ValueError(
-            f"{run.dataset} lacks a current historical-storage licence"
-        )
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError(f"{run.dataset} lacks a current historical-storage licence")
     latest_attempt = (
         IngestionRun.objects.select_for_update()
         .filter(source=source, dataset=run.dataset)
@@ -27597,9 +26181,7 @@ def _guard_fed_balance_sheet_component_persistence(
         .first()
     )
     if latest_attempt is None or latest_attempt.pk != run.pk:
-        raise ValueError(
-            f"superseded {run.dataset} ingestion run cannot persist observations"
-        )
+        raise ValueError(f"superseded {run.dataset} ingestion run cannot persist observations")
 
     fetched_at = result.fetched_at
     if timezone.is_naive(fetched_at):
@@ -27608,9 +26190,7 @@ def _guard_fed_balance_sheet_component_persistence(
         raise ValueError("fed-balance-sheet component fetched_at is future-dated")
     seen: set[tuple[str, date]] = set()
     observed_series: set[str] = set()
-    today_et = timezone.now().astimezone(
-        ZoneInfo("America/New_York")
-    ).date()
+    today_et = timezone.now().astimezone(ZoneInfo("America/New_York")).date()
     for record in result.records:
         if record.get("value") is None:
             continue
@@ -27648,9 +26228,7 @@ def _guard_fed_balance_sheet_component_persistence(
         seen.add(identity)
         observed_series.add(series_key)
     if not required_series <= observed_series:
-        raise ValueError(
-            "fed-balance-sheet component exact batch lacks its required series"
-        )
+        raise ValueError("fed-balance-sheet component exact batch lacks its required series")
 
 
 def _store_fed_balance_sheet_component_observations(
@@ -27663,13 +26241,10 @@ def _store_fed_balance_sheet_component_observations(
     _guard_fed_balance_sheet_component_persistence(result, source, run)
     row_count = store_series_observations(result, source, run)
     _guard_fed_balance_sheet_component_persistence(result, source, run)
-    exact_count = Observation.objects.filter(
-        source=source, batch_id=run.batch_id
-    ).count()
+    exact_count = Observation.objects.filter(source=source, batch_id=run.batch_id).count()
     if row_count <= 0 or exact_count != row_count:
         raise ValueError(
-            "fed-balance-sheet component persistence did not retain one complete "
-            "exact batch"
+            "fed-balance-sheet component persistence did not retain one complete exact batch"
         )
     return row_count
 
@@ -27693,30 +26268,22 @@ def _guard_daily_rate_persistence(
     ):
         raise ValueError("daily rate persistence source/run identity mismatch")
     Source.objects.select_for_update().get(pk=source.pk)
-    storage_licence = _effective_source_license(
-        source, lock=True, require_storage=True
-    )
+    storage_licence = _effective_source_license(source, lock=True, require_storage=True)
     if storage_licence is None:
-        raise ValueError(
-            f"{expected_dataset} lacks a current historical-storage licence"
-        )
+        raise ValueError(f"{expected_dataset} lacks a current historical-storage licence")
     latest_attempt = (
         IngestionRun.objects.filter(source=source, dataset=run.dataset)
         .order_by("-started_at", "-id")
         .first()
     )
     if latest_attempt is None or latest_attempt.pk != run.pk:
-        raise ValueError(
-            f"superseded {run.dataset} ingestion run cannot persist observations"
-        )
+        raise ValueError(f"superseded {run.dataset} ingestion run cannot persist observations")
     fetched_at = result.fetched_at
     if timezone.is_naive(fetched_at):
         fetched_at = fetched_at.replace(tzinfo=UTC)
     business_now = timezone.now()
     wall_now = datetime.now(UTC)
-    numeric_records = [
-        record for record in result.records if record.get("value") is not None
-    ]
+    numeric_records = [record for record in result.records if record.get("value") is not None]
     periods: list[date] = []
     for record in numeric_records:
         try:
@@ -27746,9 +26313,7 @@ def _guard_daily_rate_persistence(
         .first()
     )
     if existing_latest is not None and max(periods) < existing_latest.value_date.date():
-        raise ValueError(
-            f"{expected_dataset} latest date regressed behind stored observations"
-        )
+        raise ValueError(f"{expected_dataset} latest date regressed behind stored observations")
     run.metadata = {
         **dict(run.metadata or {}),
         "latest_value_date": max(periods).isoformat(),
@@ -27801,9 +26366,7 @@ def _guard_subsurface_ny_fed_persistence(result, source, run) -> str:
         .first()
     )
     if latest is None or latest.pk != run.pk:
-        raise ValueError(
-            f"superseded {run.dataset} ingestion run cannot persist observations"
-        )
+        raise ValueError(f"superseded {run.dataset} ingestion run cannot persist observations")
     fetched_at = result.fetched_at
     if timezone.is_naive(fetched_at):
         fetched_at = fetched_at.replace(tzinfo=UTC)
@@ -27857,8 +26420,7 @@ def _guard_subsurface_ny_fed_persistence(result, source, run) -> str:
             or row_identity in seen
         ):
             raise ValueError(
-                "subsurface NY Fed exact batch has unknown, negative, future, "
-                "or duplicate row"
+                "subsurface NY Fed exact batch has unknown, negative, future, or duplicate row"
             )
         seen.add(row_identity)
         observed.add(series_key.lower())
@@ -27872,22 +26434,15 @@ def _store_subsurface_ny_fed_observations(result, source, run) -> int:
 
     identity = _guard_subsurface_ny_fed_persistence(result, source, run)
     if identity == "sofr":
-        row_count = _store_ny_fed_reference_rate_observations(
-            result, source, run
-        )
+        row_count = _store_ny_fed_reference_rate_observations(result, source, run)
     else:
         row_count = store_series_observations(result, source, run)
-    Observation.objects.filter(source=source, batch_id=run.batch_id).update(
-        fallback_source=None
-    )
+    Observation.objects.filter(source=source, batch_id=run.batch_id).update(fallback_source=None)
     persist_private_raw_artifact(run=run, result=result)
     _guard_subsurface_ny_fed_persistence(result, source, run)
     if (
         row_count <= 0
-        or Observation.objects.filter(
-            source=source, batch_id=run.batch_id
-        ).count()
-        != row_count
+        or Observation.objects.filter(source=source, batch_id=run.batch_id).count() != row_count
         or RawArtifact.objects.filter(run=run).count() != 1
     ):
         raise ValueError("subsurface NY Fed exact-batch postcondition failed")
@@ -27930,9 +26485,7 @@ def _guard_operations_ny_fed_persistence(
         .first()
     )
     if latest is None or latest.pk != run.pk:
-        raise ValueError(
-            f"superseded {run.dataset} ingestion run cannot persist observations"
-        )
+        raise ValueError(f"superseded {run.dataset} ingestion run cannot persist observations")
     fetched_at = result.fetched_at
     if timezone.is_naive(fetched_at):
         fetched_at = fetched_at.replace(tzinfo=UTC)
@@ -27966,8 +26519,7 @@ def _guard_operations_ny_fed_persistence(
             or row_identity in seen
         ):
             raise ValueError(
-                "operations exact batch has an unknown, negative, future, or "
-                "duplicate row"
+                "operations exact batch has an unknown, negative, future, or duplicate row"
             )
         seen.add(row_identity)
         observed.add(series_key)
@@ -27997,9 +26549,7 @@ def _guard_operations_ny_fed_persistence(
     if complete_date_series:
         date_sets = [dates_by_series[key] for key in sorted(complete_date_series)]
         if not date_sets or any(item != date_sets[0] for item in date_sets[1:]):
-            raise ValueError(
-                "operations exact batch required series do not share one date set"
-            )
+            raise ValueError("operations exact batch required series do not share one date set")
     primary_series = {
         "treasury": "treasury-purchases",
         "onrrp": "onrrp",
@@ -28059,8 +26609,7 @@ def _store_operations_ny_fed_observations(result, source, run) -> int:
     _guard_operations_ny_fed_persistence(result, source, run)
     if (
         row_count <= 0
-        or Observation.objects.filter(source=source, batch_id=run.batch_id).count()
-        != row_count
+        or Observation.objects.filter(source=source, batch_id=run.batch_id).count() != row_count
         or RawArtifact.objects.filter(run=run).count() != 1
     ):
         raise ValueError("operations NY Fed exact-batch postcondition failed")
@@ -28078,9 +26627,7 @@ def _store_prates_observations(result, source, run) -> int:
         allow_future_periods=True,
     )
     row_count = _store_board_archive_observations(result, source, run)
-    Observation.objects.filter(source=source, batch_id=run.batch_id).update(
-        fallback_source=None
-    )
+    Observation.objects.filter(source=source, batch_id=run.batch_id).update(fallback_source=None)
     return row_count
 
 
@@ -28171,9 +26718,7 @@ def _guard_h10_persistence(result: Any, source: Source, run: IngestionRun) -> No
     raw_records, raw_metadata = _validated_h10_raw_contract(result)
     numeric = [item for item in raw_records if item.get("value") is not None]
     exact_series = {str(item.get("series_id") or "").lower() for item in numeric}
-    expected_series = {
-        str(item["series_id"]).lower() for item in H10_TARGET_SERIES.values()
-    }
+    expected_series = {str(item["series_id"]).lower() for item in H10_TARGET_SERIES.values()}
     if exact_series != expected_series:
         raise ValueError("H.10 exact batch lacks required numeric series")
 
@@ -28215,9 +26760,7 @@ def _guard_h10_persistence(result: Any, source: Source, run: IngestionRun) -> No
     }
     if latest_dates != declared_latest:
         raise ValueError("H.10 latest-valid-date metadata does not match rows")
-    if prepared.astimezone(ZoneInfo("America/New_York")).date() < max(
-        latest_dates.values()
-    ):
+    if prepared.astimezone(ZoneInfo("America/New_York")).date() < max(latest_dates.values()):
         raise ValueError("H.10 Prepared date precedes latest valid observations")
 
     prepared_watermarks: list[datetime] = []
@@ -28231,9 +26774,7 @@ def _guard_h10_persistence(result: Any, source: Source, run: IngestionRun) -> No
         previous_prepared = _h10_prepared_watermark(previous_metadata)
         if previous_prepared is not None:
             prepared_watermarks.append(previous_prepared)
-        for board_id, raw_period in (
-            previous_metadata.get("latest_valid_dates") or {}
-        ).items():
+        for board_id, raw_period in (previous_metadata.get("latest_valid_dates") or {}).items():
             target = H10_TARGET_SERIES.get(str(board_id))
             if target is None:
                 continue
@@ -28277,9 +26818,7 @@ def _store_h10_observations(result, source, run) -> int:
         run,
         preserve_batches=True,
     )
-    Observation.objects.filter(source=source, batch_id=run.batch_id).update(
-        fallback_source=None
-    )
+    Observation.objects.filter(source=source, batch_id=run.batch_id).update(fallback_source=None)
     persist_private_raw_artifact(
         run=run,
         result=result,
@@ -28288,8 +26827,7 @@ def _store_h10_observations(result, source, run) -> int:
     _guard_h10_persistence(result, source, run)
     if (
         row_count <= 0
-        or Observation.objects.filter(source=source, batch_id=run.batch_id).count()
-        != row_count
+        or Observation.objects.filter(source=source, batch_id=run.batch_id).count() != row_count
         or RawArtifact.objects.filter(run=run).count() != 1
     ):
         raise ValueError("H.10 exact-batch persistence postcondition failed")
@@ -28371,8 +26909,7 @@ def _validated_global_dollar_swap_coverage_contract(
         or parsed_endpoint.netloc.lower() != "markets.newyorkfed.org"
         or parsed_endpoint.path != "/api/fxs/usdollar/search.json"
         or endpoint_query != expected_query
-        or coverage_end
-        != fetched_at.astimezone(ZoneInfo("America/New_York")).date()
+        or coverage_end != fetched_at.astimezone(ZoneInfo("America/New_York")).date()
     ):
         raise ValueError("global-dollar USD swap official search proof is invalid")
     digest = hashlib.sha256(raw_bytes).hexdigest()
@@ -28394,22 +26931,17 @@ def _validated_global_dollar_swap_coverage_contract(
         operations,
         coverage_end=coverage_end,
     )
-    if (
-        int(metadata.get("returned_count") or -1) != len(operations)
-        or any(
-            item["trade_date"] is None
-            or item["trade_date"] < coverage_start
-            or item["trade_date"] > coverage_end
-            for item in operations
-        )
+    if int(metadata.get("returned_count") or -1) != len(operations) or any(
+        item["trade_date"] is None
+        or item["trade_date"] < coverage_start
+        or item["trade_date"] > coverage_end
+        for item in operations
     ):
         raise ValueError("global-dollar USD swap coverage does not match raw rows")
     for operation in operations:
         raw_updated = operation["source"].get("lastUpdated")
         try:
-            updated = datetime.fromisoformat(
-                str(raw_updated or "").replace("Z", "+00:00")
-            )
+            updated = datetime.fromisoformat(str(raw_updated or "").replace("Z", "+00:00"))
         except ValueError as exc:
             raise ValueError("global-dollar USD swap lastUpdated is invalid") from exc
         if updated.tzinfo is None:
@@ -28431,12 +26963,10 @@ def _store_global_dollar_swap_observations(result, source, run) -> int:
         raise ValueError("global-dollar USD swap search coverage is incomplete")
     if not isinstance(result.raw_bytes, (bytes, bytearray)) or not result.raw_bytes:
         raise ValueError("global-dollar USD swap exact JSON bytes are required")
-    parsed, _coverage_start, as_of_date = (
-        _validated_global_dollar_swap_coverage_contract(
-            metadata=metadata,
-            fetched_at=result.fetched_at,
-            raw_bytes=bytes(result.raw_bytes),
-        )
+    parsed, _coverage_start, as_of_date = _validated_global_dollar_swap_coverage_contract(
+        metadata=metadata,
+        fetched_at=result.fetched_at,
+        raw_bytes=bytes(result.raw_bytes),
     )
     durable_coverage_dates: list[date] = []
     for previous in (
@@ -28469,8 +26999,8 @@ def _store_global_dollar_swap_observations(result, source, run) -> int:
     return row_count
 
 
-def _store_release_workbook_observations(result, source, run) -> int:
-    """Persist normalized release rows plus immutable HTML/XLSX fingerprints."""
+def _bind_calculated_record_lineage(result, source, run) -> None:
+    """Attach the exact acquisition batch to first-party derived records."""
 
     for record in result.records:
         metadata = dict(record.get("metadata") or {})
@@ -28497,6 +27027,12 @@ def _store_release_workbook_observations(result, source, run) -> int:
         ]
         record["metadata"] = metadata
 
+
+def _store_release_workbook_observations(result, source, run) -> int:
+    """Persist normalized release rows plus immutable HTML/XLSX fingerprints."""
+
+    _bind_calculated_record_lineage(result, source, run)
+
     incoming_series = {
         str(record.get("series_id") or "").lower()
         for record in result.records
@@ -28517,9 +27053,7 @@ def _store_release_workbook_observations(result, source, run) -> int:
         and existing_latest is not None
         and max(incoming_dates).date() < existing_latest.value_date.date()
     ):
-        raise ValueError(
-            "release latest value date regressed behind the stored official source"
-        )
+        raise ValueError("release latest value date regressed behind the stored official source")
     row_count = store_series_observations(result, source, run)
     vintage_count = store_release_vintage_observations(result, source, run)
     if result.dataset == "gdp-release-workbooks" and vintage_count == 0:
@@ -28537,6 +27071,1198 @@ def _store_release_workbook_observations(result, source, run) -> int:
             content_type=str(artifact.get("content_type") or "application/octet-stream"),
             size_bytes=int(artifact.get("size") or 0),
         )
+    return row_count
+
+
+def _canonical_provider_payload(value: Any) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _validate_bea_gdp_semantic_alignment(
+    records: Iterable[Mapping[str, Any]],
+    vintages: Iterable[Mapping[str, Any]],
+    metadata: Mapping[str, Any],
+) -> None:
+    """Reject a GDP bundle assembled from different BEA release rounds."""
+
+    latest_by_series: dict[str, date] = {}
+    for record in records:
+        key = str(record.get("series_id") or "").lower()
+        try:
+            period = date.fromisoformat(str(record.get("date") or ""))
+        except ValueError as exc:
+            raise ValueError("BEA GDP observation period is invalid") from exc
+        latest_by_series[key] = max(period, latest_by_series.get(key, period))
+
+    real_gdp_vintages: list[tuple[date, date, str]] = []
+    for record in vintages:
+        if str(record.get("series_id") or "").lower() != "bea-a191rl":
+            continue
+        try:
+            period = date.fromisoformat(str(record.get("date") or ""))
+            release_date = date.fromisoformat(str(record.get("release_date") or ""))
+        except ValueError as exc:
+            raise ValueError("BEA GDP release-vintage identity is invalid") from exc
+        estimate_round = str(record.get("estimate_round") or "").strip()
+        if not estimate_round:
+            raise ValueError("BEA GDP release-vintage estimate round is missing")
+        real_gdp_vintages.append((period, release_date, estimate_round))
+    if not real_gdp_vintages:
+        raise ValueError("BEA GDP release-vintage evidence lacks real GDP")
+
+    latest_period = max(item[0] for item in real_gdp_vintages)
+    latest_period_vintages = [item for item in real_gdp_vintages if item[0] == latest_period]
+    latest_release_date = max(item[1] for item in latest_period_vintages)
+    latest_rounds = {item[2] for item in latest_period_vintages if item[1] == latest_release_date}
+    expected_quarter = f"{latest_period.year}Q{((latest_period.month - 1) // 3) + 1}"
+    if (
+        len(latest_rounds) != 1
+        or metadata.get("comparison_quarter") != expected_quarter
+        or metadata.get("comparison_release_date") != latest_release_date.isoformat()
+        or metadata.get("comparison_estimate_round") != next(iter(latest_rounds), None)
+        or set(latest_by_series.values()) != {latest_period}
+    ):
+        raise ValueError("BEA GDP comparison workbook does not match the latest vintage release")
+
+
+def _validated_bea_release_bundle(
+    result: ProviderResult,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, list[dict[str, Any]]],
+    dict[str, Any],
+    dict[str, date],
+    date,
+]:
+    """Replay a BEA release bundle and prove its normalized payload exactly."""
+
+    identities: dict[
+        tuple[str, str],
+        tuple[type[BEAGDPReleaseProvider] | type[BEAPIOReleaseProvider], set[str]],
+    ] = {
+        (
+            "bea-release",
+            "gdp-release-workbooks",
+        ): (
+            BEAGDPReleaseProvider,
+            {"release-page", "vintage-workbook", "comparison-workbook"},
+        ),
+        (
+            "bea-pio-release",
+            "personal-income-outlays-release",
+        ): (
+            BEAPIOReleaseProvider,
+            {"release-page", "summary-workbook", "section2-workbook"},
+        ),
+    }
+    identity = (str(result.provider), str(result.dataset))
+    contract = identities.get(identity)
+    if contract is None:
+        raise ValueError("BEA release provider or dataset is outside the v2 contract")
+    provider, expected_roles = contract
+    if not isinstance(result.raw_bytes, (bytes, bytearray)) or not result.raw_bytes:
+        raise ValueError("BEA release exact evidence bundle is required")
+    raw_bytes = bytes(result.raw_bytes)
+    metadata = dict(result.metadata or {})
+    evidence = parse_evidence_bundle(
+        raw_bytes,
+        expected_provider=identity[0],
+        expected_dataset=identity[1],
+    )
+    actual_roles = set(evidence.responses)
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    if (
+        actual_roles != expected_roles
+        or metadata.get("content_type") != EVIDENCE_BUNDLE_CONTENT_TYPE
+        or int(metadata.get("byte_length") or 0) != len(raw_bytes)
+        or str(metadata.get("sha256") or "").lower() != digest
+        or metadata.get("evidence_bundle_schema") != evidence.manifest["schema_version"]
+        or metadata.get("evidence_roles") != sorted(actual_roles)
+        or int(metadata.get("response_count") or 0) != len(actual_roles)
+        or int(metadata.get("unique_blob_count") or 0) != len(evidence.manifest["blobs"])
+    ):
+        raise ValueError("BEA release bundle metadata does not match exact evidence")
+
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("BEA release fetch time is in the future")
+    fetched_date = fetched_at.astimezone(UTC).date()
+
+    if provider is BEAGDPReleaseProvider:
+        replay_records, replay_supplemental, replay_metadata = (
+            BEAGDPReleaseProvider.replay_evidence_bundle(raw_bytes)
+        )
+    else:
+        replay_records, replay_metadata = BEAPIOReleaseProvider.replay_evidence_bundle(raw_bytes)
+        replay_supplemental = {}
+    if _canonical_provider_payload(result.records) != _canonical_provider_payload(replay_records):
+        raise ValueError("BEA normalized observations do not match exact evidence")
+    if _canonical_provider_payload(result.supplemental_records) != _canonical_provider_payload(
+        replay_supplemental
+    ):
+        raise ValueError("BEA supplemental observations do not match exact evidence")
+    if any(metadata.get(key) != value for key, value in replay_metadata.items()):
+        raise ValueError("BEA replay metadata does not match exact evidence")
+
+    latest_by_series: dict[str, date] = {}
+    seen_observations: set[tuple[str, date]] = set()
+    release_dates: list[date] = []
+    for record in replay_records:
+        series_id = str(record.get("series_id") or "").strip()
+        raw_period = str(record.get("date") or "")
+        try:
+            period = date.fromisoformat(raw_period)
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("BEA exact evidence contains a malformed observation") from exc
+        identity_key = (series_id.lower(), period)
+        if (
+            not series_id
+            or raw_period != period.isoformat()
+            or period > fetched_date
+            or not value.is_finite()
+            or identity_key in seen_observations
+        ):
+            raise ValueError("BEA exact evidence contains a duplicate or invalid observation")
+        seen_observations.add(identity_key)
+        latest_by_series[identity_key[0]] = max(
+            period,
+            latest_by_series.get(identity_key[0], period),
+        )
+        raw_release = (record.get("metadata") or {}).get("source_revision_date")
+        try:
+            release_date = date.fromisoformat(str(raw_release or ""))
+        except ValueError as exc:
+            raise ValueError("BEA observation release date is invalid") from exc
+        if release_date < period or release_date > fetched_date:
+            raise ValueError("BEA observation release date is future or impossible")
+        release_dates.append(release_date)
+
+    vintage_identities: set[tuple[str, date, date, str]] = set()
+    for record in replay_supplemental.get("release_vintages", []):
+        try:
+            period = date.fromisoformat(str(record.get("date") or ""))
+            release_date = date.fromisoformat(str(record.get("release_date") or ""))
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("BEA exact evidence contains a malformed vintage") from exc
+        vintage_identity = (
+            str(record.get("series_id") or "").lower(),
+            period,
+            release_date,
+            str(record.get("estimate_round") or ""),
+        )
+        if (
+            not all((vintage_identity[0], vintage_identity[3]))
+            or period > fetched_date
+            or release_date < period
+            or release_date > fetched_date
+            or not value.is_finite()
+            or vintage_identity in vintage_identities
+        ):
+            raise ValueError("BEA exact evidence contains a duplicate or invalid vintage")
+        vintage_identities.add(vintage_identity)
+        release_dates.append(release_date)
+    if not latest_by_series or not release_dates:
+        raise ValueError("BEA exact evidence lacks value-date or release-date coverage")
+    if provider is BEAGDPReleaseProvider:
+        _validate_bea_gdp_semantic_alignment(
+            replay_records,
+            replay_supplemental.get("release_vintages", []),
+            replay_metadata,
+        )
+    return (
+        replay_records,
+        replay_supplemental,
+        replay_metadata,
+        latest_by_series,
+        max(release_dates),
+    )
+
+
+def _store_bea_release_observations_v2(result, source, run) -> int:
+    """Persist a replayable BEA release as an append-only acquisition batch."""
+
+    if source.key != result.provider or run.source_id != source.pk or run.dataset != result.dataset:
+        raise ValueError("BEA release persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("BEA release source lacks historical-storage permission")
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded BEA release run cannot persist observations")
+
+    (
+        replay_records,
+        replay_supplemental,
+        _replay_metadata,
+        latest_by_series,
+        latest_release_date,
+    ) = _validated_bea_release_bundle(result)
+    successful_metadata = list(
+        _successful_acquisition_metadata(
+            source,
+            run.dataset,
+            exclude_run_id=run.pk,
+        )
+    )
+    successful_batches = _successful_acquisition_batch_ids(
+        source,
+        run.dataset,
+        exclude_run_id=run.pk,
+    )
+    series_date_coverage = _series_date_coverage(
+        replay_records,
+        context="BEA release",
+    )
+    _guard_series_coverage_not_shrunk(
+        context="BEA release",
+        candidate=series_date_coverage,
+        previous_metadata=successful_metadata,
+    )
+    prior_latest: dict[str, date] = {}
+    for series_key in latest_by_series:
+        previous = (
+            Observation.objects.filter(source=source, series__key=series_key)
+            .filter(batch_id__in=successful_batches)
+            .order_by("-value_date", "-id")
+            .first()
+        )
+        if previous is not None:
+            prior_latest[series_key] = previous.value_date.date()
+    prior_release_dates: list[date] = []
+    for previous_metadata in successful_metadata:
+        for series_key, raw_period in (
+            (previous_metadata or {}).get("latest_value_dates") or {}
+        ).items():
+            try:
+                period = date.fromisoformat(str(raw_period))
+            except ValueError as exc:
+                raise ValueError("durable BEA value-date watermark is invalid") from exc
+            key = str(series_key).lower()
+            prior_latest[key] = max(period, prior_latest.get(key, period))
+        raw_release = (previous_metadata or {}).get("latest_release_date")
+        if raw_release not in (None, ""):
+            try:
+                prior_release_dates.append(date.fromisoformat(str(raw_release)))
+            except ValueError as exc:
+                raise ValueError("durable BEA release-date watermark is invalid") from exc
+    latest_vintage = (
+        ReleaseVintageObservation.objects.filter(
+            source=source,
+            batch_id__in=successful_batches,
+        )
+        .order_by("-release_date", "-id")
+        .first()
+    )
+    if latest_vintage is not None:
+        prior_release_dates.append(latest_vintage.release_date)
+    for observation_metadata in Observation.objects.filter(
+        source=source,
+        batch_id__in=successful_batches,
+    ).values_list("metadata", flat=True):
+        raw_release = (observation_metadata or {}).get("source_revision_date")
+        if raw_release in (None, ""):
+            continue
+        try:
+            prior_release_dates.append(date.fromisoformat(str(raw_release)))
+        except ValueError as exc:
+            raise ValueError("durable BEA observation release date is invalid") from exc
+    if any(
+        series_key in prior_latest and period < prior_latest[series_key]
+        for series_key, period in latest_by_series.items()
+    ):
+        raise ValueError("BEA release latest value date regressed")
+    if prior_release_dates and latest_release_date < max(prior_release_dates):
+        raise ValueError("BEA release date regressed")
+
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "latest_value_dates": {
+            key: value.isoformat() for key, value in sorted(latest_by_series.items())
+        },
+        "latest_release_date": latest_release_date.isoformat(),
+        "series_date_coverage": series_date_coverage,
+    }
+    expected_vintage_count = len(replay_supplemental.get("release_vintages", []))
+    expected_frequency = "quarterly" if result.dataset == "gdp-release-workbooks" else "monthly"
+    if result.dataset == "gdp-release-workbooks" and expected_vintage_count == 0:
+        raise ValueError("BEA GDP exact evidence contains no release vintages")
+    artifact, reused = _persist_or_reuse_v2_exact_batch_artifact(
+        result=result,
+        source=source,
+        run=run,
+        expected_observation_count=len(replay_records),
+        expected_vintage_count=expected_vintage_count,
+    )
+    if reused:
+        observation_count = len(replay_records)
+        vintage_count = expected_vintage_count
+    else:
+        observation_count = store_series_observations(
+            result,
+            source,
+            run,
+            preserve_batches=True,
+        )
+        vintage_count = store_release_vintage_observations(
+            result,
+            source,
+            run,
+            preserve_batches=True,
+        )
+        Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+            fallback_source=None
+        )
+
+    stored_observations = list(
+        Observation.objects.filter(source=source, batch_id=run.batch_id)
+        .select_related("series")
+        .order_by("series__key", "value_date", "pk")
+    )
+    expected_observation_contract = sorted(
+        (
+            str(record["series_id"]).lower(),
+            str(record["date"]),
+            f"{Decimal(str(record['value'])):.8f}",
+            _canonical_provider_payload(record.get("metadata") or {}),
+        )
+        for record in replay_records
+    )
+    stored_observation_contract = sorted(
+        (
+            item.series.key,
+            item.value_date.date().isoformat(),
+            f"{item.value:.8f}",
+            _canonical_provider_payload(item.metadata or {}),
+        )
+        for item in stored_observations
+        if item.instrument_id is None
+        and item.as_of == item.value_date
+        and item.source_id == source.pk
+        and item.series.source_id == source.pk
+        and item.series.frequency == expected_frequency
+        and item.quality_status == Observation.Quality.FRESH
+        and item.fallback_source_id is None
+    )
+    stored_vintages = list(
+        ReleaseVintageObservation.objects.filter(
+            source=source,
+            batch_id=run.batch_id,
+        )
+        .select_related("series")
+        .order_by("series__key", "value_date", "release_date", "estimate_round")
+    )
+    expected_vintage_contract = sorted(
+        (
+            str(record["series_id"]).lower(),
+            str(record["date"]),
+            str(record["release_date"]),
+            str(record["estimate_round"]),
+            str(record["vintage_label"]),
+            f"{Decimal(str(record['value'])):.8f}",
+            _canonical_provider_payload(record.get("metadata") or {}),
+        )
+        for record in replay_supplemental.get("release_vintages", [])
+    )
+    stored_vintage_contract = sorted(
+        (
+            item.series.key,
+            item.value_date.date().isoformat(),
+            item.release_date.isoformat(),
+            item.estimate_round,
+            item.vintage_label,
+            f"{item.value:.8f}",
+            _canonical_provider_payload(item.metadata or {}),
+        )
+        for item in stored_vintages
+        if item.as_of.date() == item.release_date
+        and item.source_id == source.pk
+        and item.series.source_id == source.pk
+        and item.series.frequency == expected_frequency
+        and item.quality_status == Observation.Quality.FRESH
+        and item.fallback_source_id is None
+        and item.license_scope == source.license_scope[:240]
+    )
+    if (
+        observation_count != len(replay_records)
+        or vintage_count != expected_vintage_count
+        or expected_observation_contract != stored_observation_contract
+        or expected_vintage_contract != stored_vintage_contract
+        or RawArtifact.objects.filter(run=run).count() != 1
+        or artifact.sha256 != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError("BEA exact-batch persistence postcondition failed")
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "raw_artifact_sha256": artifact.sha256,
+        "raw_artifact_uri": artifact.uri,
+    }
+    return observation_count + vintage_count
+
+
+def _validated_consumer_credit_release_bundle(
+    result: ProviderResult,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, date]]:
+    identities: dict[
+        tuple[str, str],
+        tuple[
+            type[FederalReserveG19Provider] | type[NYFedHouseholdDebtProvider],
+            set[str],
+            set[str],
+        ],
+    ] = {
+        (
+            "federal-reserve-g19",
+            "consumer-credit",
+        ): (
+            FederalReserveG19Provider,
+            {"choose-page", "output-csv"},
+            {series_id for series_id, _unit in G19_SERIES.values()},
+        ),
+        (
+            "ny-fed-household-credit",
+            "household-debt-credit",
+        ): (
+            NYFedHouseholdDebtProvider,
+            {"databank-page", "household-debt-workbook"},
+            {*HHDC_BALANCE_SERIES.values(), *HHDC_DELINQUENCY_SERIES.values()},
+        ),
+    }
+    identity = (str(result.provider), str(result.dataset))
+    contract = identities.get(identity)
+    if contract is None:
+        raise ValueError("consumer-credit provider or dataset is outside the v2 contract")
+    provider, expected_roles, expected_series = contract
+    if not isinstance(result.raw_bytes, (bytes, bytearray)) or not result.raw_bytes:
+        raise ValueError("consumer-credit exact evidence bundle is required")
+    raw_bytes = bytes(result.raw_bytes)
+    metadata = dict(result.metadata or {})
+    evidence = parse_evidence_bundle(
+        raw_bytes,
+        expected_provider=identity[0],
+        expected_dataset=identity[1],
+    )
+    actual_roles = set(evidence.responses)
+    if (
+        actual_roles != expected_roles
+        or metadata.get("content_type") != EVIDENCE_BUNDLE_CONTENT_TYPE
+        or int(metadata.get("byte_length") or 0) != len(raw_bytes)
+        or str(metadata.get("sha256") or "").lower() != hashlib.sha256(raw_bytes).hexdigest()
+        or metadata.get("evidence_bundle_schema") != evidence.manifest["schema_version"]
+        or metadata.get("evidence_roles") != sorted(actual_roles)
+        or int(metadata.get("response_count") or 0) != len(actual_roles)
+        or int(metadata.get("unique_blob_count") or 0) != len(evidence.manifest["blobs"])
+    ):
+        raise ValueError("consumer-credit bundle metadata does not match exact evidence")
+    replay_records, replay_metadata = provider.replay_evidence_bundle(raw_bytes)
+    if _canonical_provider_payload(result.records) != _canonical_provider_payload(replay_records):
+        raise ValueError("consumer-credit normalized observations do not match exact evidence")
+    if result.supplemental_records:
+        raise ValueError("consumer-credit evidence unexpectedly contains supplemental rows")
+    if any(metadata.get(key) != value for key, value in replay_metadata.items()):
+        raise ValueError("consumer-credit replay metadata does not match exact evidence")
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("consumer-credit fetch time is in the future")
+
+    latest_by_series: dict[str, date] = {}
+    seen: set[tuple[str, date]] = set()
+    for record in replay_records:
+        series_id = str(record.get("series_id") or "")
+        raw_period = str(record.get("date") or "")
+        try:
+            period = date.fromisoformat(raw_period)
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("consumer-credit exact evidence contains a malformed row") from exc
+        row_identity = (series_id, period)
+        if (
+            series_id not in expected_series
+            or raw_period != period.isoformat()
+            or not value.is_finite()
+            or row_identity in seen
+        ):
+            raise ValueError("consumer-credit exact evidence contains a duplicate or invalid row")
+        seen.add(row_identity)
+        latest_by_series[series_id.lower()] = max(
+            period,
+            latest_by_series.get(series_id.lower(), period),
+        )
+    if set(latest_by_series) != {item.lower() for item in expected_series}:
+        raise ValueError("consumer-credit exact evidence lacks required series")
+    if set(latest_by_series.values()) != {
+        date.fromisoformat(str(replay_metadata["latest_value_date"]))
+    }:
+        raise ValueError("consumer-credit latest-period metadata is inconsistent")
+    return replay_records, replay_metadata, latest_by_series
+
+
+def _store_consumer_credit_observations_v2(result, source, run) -> int:
+    """Persist G.19 or HHDC as one replayable, append-only acquisition batch."""
+
+    if source.key != result.provider or run.source_id != source.pk or run.dataset != result.dataset:
+        raise ValueError("consumer-credit persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("consumer-credit source lacks historical-storage permission")
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded consumer-credit run cannot persist observations")
+
+    replay_records, _replay_metadata, latest_by_series = _validated_consumer_credit_release_bundle(
+        result
+    )
+    successful_metadata = list(
+        _successful_acquisition_metadata(
+            source,
+            run.dataset,
+            exclude_run_id=run.pk,
+        )
+    )
+    successful_batches = _successful_acquisition_batch_ids(
+        source,
+        run.dataset,
+        exclude_run_id=run.pk,
+    )
+    prior_latest: dict[str, date] = {}
+    for series_key in latest_by_series:
+        previous = (
+            Observation.objects.filter(
+                source=source,
+                series__key=series_key,
+                batch_id__in=successful_batches,
+            )
+            .order_by("-value_date", "-id")
+            .first()
+        )
+        if previous is not None:
+            prior_latest[series_key] = previous.value_date.date()
+    for previous_metadata in successful_metadata:
+        for series_key, raw_period in (
+            (previous_metadata or {}).get("latest_value_dates") or {}
+        ).items():
+            try:
+                period = date.fromisoformat(str(raw_period))
+            except ValueError as exc:
+                raise ValueError("durable consumer-credit value-date watermark is invalid") from exc
+            key = str(series_key).lower()
+            prior_latest[key] = max(period, prior_latest.get(key, period))
+    if any(
+        series_key in prior_latest and period < prior_latest[series_key]
+        for series_key, period in latest_by_series.items()
+    ):
+        raise ValueError("consumer-credit latest value date regressed")
+
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "latest_value_dates": {
+            key: value.isoformat() for key, value in sorted(latest_by_series.items())
+        },
+    }
+    artifact, reused = _persist_or_reuse_v2_exact_batch_artifact(
+        result=result,
+        source=source,
+        run=run,
+        expected_observation_count=len(replay_records),
+    )
+    if reused:
+        row_count = len(replay_records)
+    else:
+        row_count = store_series_observations(
+            result,
+            source,
+            run,
+            preserve_batches=True,
+        )
+        Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+            fallback_source=None
+        )
+    expected_contract = sorted(
+        (
+            str(record["series_id"]).lower(),
+            str(record["date"]),
+            f"{Decimal(str(record['value'])):.8f}",
+            _canonical_provider_payload(record.get("metadata") or {}),
+        )
+        for record in replay_records
+    )
+    stored_contract = sorted(
+        (
+            item.series.key,
+            item.value_date.date().isoformat(),
+            f"{item.value:.8f}",
+            _canonical_provider_payload(item.metadata or {}),
+        )
+        for item in Observation.objects.filter(
+            source=source,
+            batch_id=run.batch_id,
+        ).select_related("series")
+        if item.instrument_id is None
+        and item.as_of == item.value_date
+        and item.source_id == source.pk
+        and item.series.source_id == source.pk
+        and item.quality_status == Observation.Quality.FRESH
+        and item.fallback_source_id is None
+    )
+    if (
+        row_count != len(replay_records)
+        or expected_contract != stored_contract
+        or RawArtifact.objects.filter(run=run).count() != 1
+        or artifact.sha256 != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError("consumer-credit exact-batch persistence postcondition failed")
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "raw_artifact_sha256": artifact.sha256,
+        "raw_artifact_uri": artifact.uri,
+    }
+    return row_count
+
+
+def _validated_census_marts_bundle(
+    result: ProviderResult,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, date]]:
+    identity = (str(result.provider), str(result.dataset))
+    if identity[0] == "census" and re.fullmatch(r"marts:[0-9A-Z]+:SM:(?:yes|no)", identity[1]):
+        evidence = parse_evidence_bundle(
+            bytes(result.raw_bytes or b""),
+            expected_provider=identity[0],
+            expected_dataset=identity[1],
+        )
+        expected_roles = {"marts-api-response"}
+        replay_records, replay_metadata = CensusMARTSProvider.replay_evidence_bundle(
+            bytes(result.raw_bytes or b""),
+            expected_dataset=identity[1],
+        )
+        dataset_match = re.fullmatch(r"marts:([0-9A-Z]+):SM:(yes|no)", identity[1])
+        if dataset_match is None:
+            raise ValueError("Census MARTS API dataset is invalid")
+        category, seasonal_value = dataset_match.groups()
+        adjustment = "SA" if seasonal_value == "yes" else "NSA"
+        expected_series = {
+            f"CENSUS-MRTS-{category}-SM-{adjustment}",
+            f"CENSUS-MRTS-{category}-SM-{adjustment}-MOM",
+            f"CENSUS-MRTS-{category}-SM-{adjustment}-YOY",
+        }
+    elif identity == ("census-release", "marts:retail-food-services"):
+        evidence = parse_evidence_bundle(
+            bytes(result.raw_bytes or b""),
+            expected_provider=identity[0],
+            expected_dataset=identity[1],
+        )
+        expected_roles = (
+            {"current-workbook"}
+            if set(evidence.responses) == {"current-workbook"}
+            else {"archive-index", "archive-workbook"}
+        )
+        replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
+            bytes(result.raw_bytes or b"")
+        )
+        expected_series = {
+            "CENSUS-MRTS-44X72-SM-SA",
+            "CENSUS-MRTS-44X72-SM-SA-MOM",
+            "CENSUS-MRTS-44X72-SM-SA-YOY",
+        }
+    else:
+        raise ValueError("Census MARTS provider or dataset is outside the v2 contract")
+    if not isinstance(result.raw_bytes, (bytes, bytearray)) or not result.raw_bytes:
+        raise ValueError("Census MARTS exact evidence bundle is required")
+    raw_bytes = bytes(result.raw_bytes)
+    metadata = dict(result.metadata or {})
+    actual_roles = set(evidence.responses)
+    if (
+        actual_roles != expected_roles
+        or metadata.get("content_type") != EVIDENCE_BUNDLE_CONTENT_TYPE
+        or int(metadata.get("byte_length") or 0) != len(raw_bytes)
+        or str(metadata.get("sha256") or "").lower() != hashlib.sha256(raw_bytes).hexdigest()
+        or metadata.get("evidence_bundle_schema") != evidence.manifest["schema_version"]
+        or metadata.get("evidence_roles") != sorted(actual_roles)
+        or int(metadata.get("response_count") or 0) != len(actual_roles)
+        or int(metadata.get("unique_blob_count") or 0) != len(evidence.manifest["blobs"])
+    ):
+        raise ValueError("Census MARTS bundle metadata does not match exact evidence")
+    if _canonical_provider_payload(result.records) != _canonical_provider_payload(replay_records):
+        raise ValueError("Census MARTS normalized observations do not match exact evidence")
+    if result.supplemental_records:
+        raise ValueError("Census MARTS evidence unexpectedly contains supplemental rows")
+    if any(metadata.get(key) != value for key, value in replay_metadata.items()):
+        raise ValueError("Census MARTS replay metadata does not match exact evidence")
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("Census MARTS fetch time is in the future")
+    fetched_month = fetched_at.astimezone(UTC).date().replace(day=1)
+
+    latest_by_series: dict[str, date] = {}
+    seen: set[tuple[str, date]] = set()
+    for record in replay_records:
+        series_id = str(record.get("series_id") or "")
+        raw_period = str(record.get("date") or "")
+        try:
+            period = date.fromisoformat(raw_period)
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("Census MARTS exact evidence contains a malformed row") from exc
+        row_identity = (series_id, period)
+        if (
+            series_id not in expected_series
+            or raw_period != period.isoformat()
+            or period > fetched_month
+            or not value.is_finite()
+            or row_identity in seen
+        ):
+            raise ValueError("Census MARTS exact evidence contains a duplicate or invalid row")
+        seen.add(row_identity)
+        latest_by_series[series_id.lower()] = max(
+            period,
+            latest_by_series.get(series_id.lower(), period),
+        )
+    if set(latest_by_series) != {item.lower() for item in expected_series}:
+        raise ValueError("Census MARTS exact evidence lacks required series")
+    try:
+        declared_latest = date.fromisoformat(str(replay_metadata["latest_value_date"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("Census MARTS latest-period metadata is invalid") from exc
+    if declared_latest > fetched_month:
+        raise ValueError("Census MARTS latest period is in the future")
+    if any(period != declared_latest for period in latest_by_series.values()):
+        raise ValueError("Census MARTS latest-period metadata is inconsistent")
+    return replay_records, replay_metadata, latest_by_series
+
+
+def _store_census_marts_observations_v2(result, source, run) -> int:
+    """Persist Census API or release evidence as an append-only exact batch."""
+
+    if source.key != result.provider or run.source_id != source.pk or run.dataset != result.dataset:
+        raise ValueError("Census MARTS persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("Census MARTS source lacks historical-storage permission")
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded Census MARTS run cannot persist observations")
+    replay_records, replay_metadata, latest_by_series = _validated_census_marts_bundle(result)
+    successful_metadata = list(
+        _successful_acquisition_metadata(
+            source,
+            run.dataset,
+            exclude_run_id=run.pk,
+        )
+    )
+    successful_batches = _successful_acquisition_batch_ids(
+        source,
+        run.dataset,
+        exclude_run_id=run.pk,
+    )
+    if result.provider == "census":
+        require_complete_history = replay_metadata.get("require_complete_history")
+        if not isinstance(require_complete_history, bool):
+            raise ValueError("Census MARTS API coverage policy is invalid")
+        if any(
+            previous.get("require_complete_history") is True and not require_complete_history
+            for previous in successful_metadata
+        ):
+            raise ValueError("Census MARTS complete-history policy shrank")
+    series_date_coverage = _series_date_coverage(
+        replay_records,
+        context="Census MARTS",
+    )
+    _guard_series_coverage_not_shrunk(
+        context="Census MARTS",
+        candidate=series_date_coverage,
+        previous_metadata=successful_metadata,
+    )
+    prior_latest: dict[str, date] = {}
+    for series_key in latest_by_series:
+        previous = (
+            Observation.objects.filter(
+                source=source,
+                series__key=series_key,
+                batch_id__in=successful_batches,
+            )
+            .order_by("-value_date", "-id")
+            .first()
+        )
+        if previous is not None:
+            prior_latest[series_key] = previous.value_date.date()
+    for previous_metadata in successful_metadata:
+        for series_key, raw_period in (
+            (previous_metadata or {}).get("latest_value_dates") or {}
+        ).items():
+            try:
+                period = date.fromisoformat(str(raw_period))
+            except ValueError as exc:
+                raise ValueError("durable Census MARTS value-date watermark is invalid") from exc
+            key = str(series_key).lower()
+            prior_latest[key] = max(period, prior_latest.get(key, period))
+    if any(
+        series_key in prior_latest and period < prior_latest[series_key]
+        for series_key, period in latest_by_series.items()
+    ):
+        raise ValueError("Census MARTS latest value date regressed")
+
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "latest_value_dates": {
+            key: value.isoformat() for key, value in sorted(latest_by_series.items())
+        },
+        "series_date_coverage": series_date_coverage,
+    }
+    persist_result = deepcopy(result)
+    _bind_calculated_record_lineage(persist_result, source, run)
+    artifact, reused = _persist_or_reuse_v2_exact_batch_artifact(
+        result=result,
+        source=source,
+        run=run,
+        expected_observation_count=len(replay_records),
+    )
+    if reused:
+        row_count = len(replay_records)
+    else:
+        row_count = store_series_observations(
+            persist_result,
+            source,
+            run,
+            preserve_batches=True,
+        )
+        Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+            fallback_source=None
+        )
+    expected_contract = sorted(
+        (
+            str(record["series_id"]).lower(),
+            str(record["date"]),
+            f"{Decimal(str(record['value'])):.8f}",
+            _canonical_provider_payload(record.get("metadata") or {}),
+        )
+        for record in persist_result.records
+    )
+    stored_contract = sorted(
+        (
+            item.series.key,
+            item.value_date.date().isoformat(),
+            f"{item.value:.8f}",
+            _canonical_provider_payload(item.metadata or {}),
+        )
+        for item in Observation.objects.filter(
+            source=source,
+            batch_id=run.batch_id,
+        ).select_related("series")
+        if item.instrument_id is None
+        and item.as_of == item.value_date
+        and item.source_id == source.pk
+        and item.series.source_id == source.pk
+        and item.quality_status == Observation.Quality.FRESH
+        and item.fallback_source_id is None
+    )
+    if (
+        row_count != len(replay_records)
+        or expected_contract != stored_contract
+        or RawArtifact.objects.filter(run=run).count() != 1
+        or artifact.sha256 != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError("Census MARTS exact-batch persistence postcondition failed")
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "raw_artifact_sha256": artifact.sha256,
+        "raw_artifact_uri": artifact.uri,
+    }
+    return row_count
+
+
+def _validated_dol_claims_bundle(
+    result: ProviderResult,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, date]]:
+    if (
+        result.provider != "dol-eta-ui"
+        or result.dataset != "national-weekly-claims"
+        or not isinstance(result.raw_bytes, (bytes, bytearray))
+        or not result.raw_bytes
+    ):
+        raise ValueError("DOL claims exact evidence identity is invalid")
+    raw_bytes = bytes(result.raw_bytes)
+    evidence = parse_evidence_bundle(
+        raw_bytes,
+        expected_provider="dol-eta-ui",
+        expected_dataset="national-weekly-claims",
+    )
+    actual_roles = set(evidence.responses)
+    year_roles = {role for role in actual_roles if re.fullmatch(r"history-xml-\d{4}", role)}
+    expected_roles = {
+        *year_roles,
+        "current-release-pdf",
+        "archive-release-pdf",
+    }
+    metadata = dict(result.metadata or {})
+    if (
+        actual_roles != expected_roles
+        or not year_roles
+        or metadata.get("content_type") != EVIDENCE_BUNDLE_CONTENT_TYPE
+        or int(metadata.get("byte_length") or 0) != len(raw_bytes)
+        or str(metadata.get("sha256") or "").lower() != hashlib.sha256(raw_bytes).hexdigest()
+        or metadata.get("evidence_bundle_schema") != evidence.manifest["schema_version"]
+        or metadata.get("evidence_roles") != sorted(actual_roles)
+        or int(metadata.get("response_count") or 0) != len(actual_roles)
+        or int(metadata.get("unique_blob_count") or 0) != len(evidence.manifest["blobs"])
+    ):
+        raise ValueError("DOL claims bundle metadata does not match exact evidence")
+    replay_records, replay_metadata = DOLWeeklyClaimsProvider.replay_evidence_bundle(raw_bytes)
+    if _canonical_provider_payload(result.records) != _canonical_provider_payload(replay_records):
+        raise ValueError("DOL claims normalized observations do not match exact evidence")
+    if result.supplemental_records:
+        raise ValueError("DOL claims evidence unexpectedly contains supplemental rows")
+    if any(metadata.get(key) != value for key, value in replay_metadata.items()):
+        raise ValueError("DOL claims replay metadata does not match exact evidence")
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("DOL claims fetch time is in the future")
+    fetched_date = fetched_at.astimezone(UTC).date()
+
+    try:
+        release_date = date.fromisoformat(str(replay_metadata["release_date"]))
+        xml_run_date = date.fromisoformat(str(replay_metadata["xml_run_date"]))
+    except (KeyError, ValueError) as exc:
+        raise ValueError("DOL claims release chronology is invalid") from exc
+    if release_date > fetched_date or xml_run_date > fetched_date:
+        raise ValueError("DOL claims release chronology is future-dated")
+
+    latest_by_series: dict[str, date] = {}
+    seen: set[tuple[str, date]] = set()
+    expected_series = set(DOL_REQUIRED_SERIES)
+    for record in replay_records:
+        series_id = str(record.get("series_id") or "")
+        raw_period = str(record.get("date") or "")
+        try:
+            period = date.fromisoformat(raw_period)
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("DOL claims exact evidence contains a malformed row") from exc
+        row_identity = (series_id, period)
+        quality = record.get("quality_status", Observation.Quality.FRESH)
+        if (
+            series_id not in expected_series
+            or raw_period != period.isoformat()
+            or period.weekday() != 5
+            or period > fetched_date
+            or not value.is_finite()
+            or value < 0
+            or row_identity in seen
+            or quality not in Observation.Quality.values
+        ):
+            raise ValueError("DOL claims exact evidence contains a duplicate or invalid row")
+        seen.add(row_identity)
+        latest_by_series[series_id.lower()] = max(
+            period,
+            latest_by_series.get(series_id.lower(), period),
+        )
+    if set(latest_by_series) != {item.lower() for item in expected_series}:
+        raise ValueError("DOL claims exact evidence lacks required series")
+    try:
+        initial_latest = date.fromisoformat(replay_metadata["release_initial_week"])
+        continued_latest = date.fromisoformat(replay_metadata["release_continued_week"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("DOL claims release-tail metadata is invalid") from exc
+    if (
+        initial_latest > release_date
+        or continued_latest > release_date
+        or latest_by_series[INITIAL_SA.lower()] != initial_latest
+        or latest_by_series[INITIAL_4WK.lower()] != initial_latest
+        or any(
+            latest_by_series[key.lower()] != continued_latest
+            for key in (CONTINUED_SA, CONTINUED_4WK, IUR_SA)
+        )
+    ):
+        raise ValueError("DOL claims release-tail metadata is inconsistent")
+    return replay_records, replay_metadata, latest_by_series
+
+
+def _store_dol_claims_observations_v2(result, source, run) -> int:
+    """Persist one complete DOL history/release bundle as an exact batch."""
+
+    if (
+        source.key != "dol-eta-ui"
+        or source.key != result.provider
+        or run.source_id != source.pk
+        or run.dataset != result.dataset
+    ):
+        raise ValueError("DOL claims persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("DOL claims source lacks historical-storage permission")
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded DOL claims run cannot persist observations")
+    replay_records, replay_metadata, latest_by_series = _validated_dol_claims_bundle(result)
+    successful_metadata = list(
+        _successful_acquisition_metadata(
+            source,
+            run.dataset,
+            exclude_run_id=run.pk,
+        )
+    )
+    successful_batches = _successful_acquisition_batch_ids(
+        source,
+        run.dataset,
+        exclude_run_id=run.pk,
+    )
+    _guard_year_window_not_shrunk(
+        context="DOL claims",
+        start_year=int(replay_metadata["requested_start_year"]),
+        end_year=int(replay_metadata["requested_end_year"]),
+        previous_metadata=successful_metadata,
+        start_key="requested_start_year",
+        end_key="requested_end_year",
+    )
+    series_date_coverage = _series_date_coverage(
+        replay_records,
+        context="DOL claims",
+    )
+    _guard_series_coverage_not_shrunk(
+        context="DOL claims",
+        candidate=series_date_coverage,
+        previous_metadata=successful_metadata,
+    )
+    prior_latest: dict[str, date] = {}
+    for series_key in latest_by_series:
+        previous = (
+            Observation.objects.filter(
+                source=source,
+                series__key=series_key,
+                batch_id__in=successful_batches,
+            )
+            .order_by("-value_date", "-id")
+            .first()
+        )
+        if previous is not None:
+            prior_latest[series_key] = previous.value_date.date()
+    prior_release_dates: list[date] = []
+    for previous_metadata in successful_metadata:
+        for series_key, raw_period in (
+            (previous_metadata or {}).get("latest_value_dates") or {}
+        ).items():
+            try:
+                period = date.fromisoformat(str(raw_period))
+            except ValueError as exc:
+                raise ValueError("durable DOL claims value-date watermark is invalid") from exc
+            key = str(series_key).lower()
+            prior_latest[key] = max(period, prior_latest.get(key, period))
+        raw_release = (previous_metadata or {}).get("release_date")
+        if raw_release not in (None, ""):
+            try:
+                prior_release_dates.append(date.fromisoformat(str(raw_release)))
+            except ValueError as exc:
+                raise ValueError("durable DOL claims release watermark is invalid") from exc
+    if any(
+        series_key in prior_latest and period < prior_latest[series_key]
+        for series_key, period in latest_by_series.items()
+    ):
+        raise ValueError("DOL claims latest value date regressed")
+    candidate_release_date = date.fromisoformat(str(replay_metadata["release_date"]))
+    if prior_release_dates and candidate_release_date < max(prior_release_dates):
+        raise ValueError("DOL claims release date regressed")
+
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "latest_value_dates": {
+            key: value.isoformat() for key, value in sorted(latest_by_series.items())
+        },
+        "series_date_coverage": series_date_coverage,
+    }
+    artifact, reused = _persist_or_reuse_v2_exact_batch_artifact(
+        result=result,
+        source=source,
+        run=run,
+        expected_observation_count=len(replay_records),
+    )
+    if reused:
+        row_count = len(replay_records)
+    else:
+        row_count = store_series_observations(
+            result,
+            source,
+            run,
+            preserve_batches=True,
+        )
+        Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+            fallback_source=None
+        )
+    expected_contract = sorted(
+        (
+            str(record["series_id"]).lower(),
+            str(record["date"]),
+            f"{Decimal(str(record['value'])):.8f}",
+            str(
+                record.get("quality_status")
+                if record.get("quality_status") in Observation.Quality.values
+                else Observation.Quality.FRESH
+            ),
+            _canonical_provider_payload(record.get("metadata") or {}),
+        )
+        for record in replay_records
+    )
+    stored_contract = sorted(
+        (
+            item.series.key,
+            item.value_date.date().isoformat(),
+            f"{item.value:.8f}",
+            item.quality_status,
+            _canonical_provider_payload(item.metadata or {}),
+        )
+        for item in Observation.objects.filter(
+            source=source,
+            batch_id=run.batch_id,
+        ).select_related("series")
+        if item.instrument_id is None
+        and item.as_of == item.value_date
+        and item.source_id == source.pk
+        and item.series.source_id == source.pk
+        and item.fallback_source_id is None
+    )
+    if (
+        row_count != len(replay_records)
+        or expected_contract != stored_contract
+        or RawArtifact.objects.filter(run=run).count() != 1
+        or artifact.sha256 != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError("DOL claims exact-batch persistence postcondition failed")
+    result.metadata = {
+        **dict(result.metadata or {}),
+        "raw_artifact_sha256": artifact.sha256,
+        "raw_artifact_uri": artifact.uri,
+    }
     return row_count
 
 
@@ -28641,11 +28367,7 @@ def _payload_fallback_source_keys(value: Any) -> set[str]:
 
 def _payload_batch_ids(value: Any) -> set[str]:
     def normalized(raw: Any) -> set[str]:
-        return {
-            item.strip()
-            for item in str(raw or "").split(",")
-            if item.strip()
-        }
+        return {item.strip() for item in str(raw or "").split(",") if item.strip()}
 
     if isinstance(value, dict):
         batches = normalized(value.get("batch_id"))
@@ -28988,17 +28710,13 @@ def _dashboard_metric_snapshot_metadata(
         "input_lineage": component_metadata.get("input_lineage", []),
         "active_operations": component_metadata.get("active_operations"),
         "all_active_operations": component_metadata.get("all_active_operations"),
-        "small_value_active_operations": component_metadata.get(
-            "small_value_active_operations"
-        ),
+        "small_value_active_operations": component_metadata.get("small_value_active_operations"),
         "swap_as_of": component_metadata.get("swap_as_of"),
         "swap_total": component_metadata.get("swap_total"),
         "swap_small_value": component_metadata.get("swap_small_value"),
         "previous_value": component_metadata.get("previous_value"),
         "previous_value_date": component_metadata.get("previous_value_date"),
-        "previous_input_lineage": component_metadata.get(
-            "previous_input_lineage", []
-        ),
+        "previous_input_lineage": component_metadata.get("previous_input_lineage", []),
         "model_label": component_metadata.get("model_label"),
         "freshness_basis": component_metadata.get("freshness_basis"),
         "seasonal_basis": component_metadata.get("seasonal_basis"),
@@ -29023,38 +28741,24 @@ def _dashboard_metric_snapshot_metadata(
         "sample_count": component_metadata.get("sample_count"),
         "population_mean": component_metadata.get("population_mean"),
         "population_std": component_metadata.get("population_std"),
-        "population_standard_deviation": component_metadata.get(
-            "population_standard_deviation"
-        ),
+        "population_standard_deviation": component_metadata.get("population_standard_deviation"),
         "sample_changes": component_metadata.get("sample_changes", []),
         "current_8w_change": component_metadata.get("current_8w_change"),
         "component_page_key": component_metadata.get("component_page_key"),
         "component_snapshot_id": component_metadata.get("component_snapshot_id"),
-        "component_publication_batch_id": component_metadata.get(
-            "component_publication_batch_id"
-        ),
+        "component_publication_batch_id": component_metadata.get("component_publication_batch_id"),
         "component_fingerprint": component_metadata.get("component_fingerprint"),
         "component_payload_integrity_hash": component_metadata.get(
             "component_payload_integrity_hash"
         ),
-        "component_contract_version": component_metadata.get(
-            "component_contract_version"
-        ),
-        "component_metric_snapshot_id": component_metadata.get(
-            "component_metric_snapshot_id"
-        ),
-        "component_metric_snapshot_key": component_metadata.get(
-            "component_metric_snapshot_key"
-        ),
+        "component_contract_version": component_metadata.get("component_contract_version"),
+        "component_metric_snapshot_id": component_metadata.get("component_metric_snapshot_id"),
+        "component_metric_snapshot_key": component_metadata.get("component_metric_snapshot_key"),
         "component_metric_snapshot_batch_id": component_metadata.get(
             "component_metric_snapshot_batch_id"
         ),
-        "component_input_runs": component_metadata.get(
-            "component_input_runs", []
-        ),
-        "component_all_input_runs": component_metadata.get(
-            "component_all_input_runs", []
-        ),
+        "component_input_runs": component_metadata.get("component_input_runs", []),
+        "component_all_input_runs": component_metadata.get("component_all_input_runs", []),
         "artifact_evidence": component_metadata.get("artifact_evidence", []),
         "component_all_artifact_evidence": component_metadata.get(
             "component_all_artifact_evidence", []
@@ -29097,9 +28801,7 @@ def _dashboard_metric_snapshot_matches_payload(
         expected_value_date = _parse_payload_datetime(
             metric.get("value_date") or metric.get("as_of")
         )
-        expected_as_of = _parse_payload_datetime(
-            metric.get("as_of") or metric.get("value_date")
-        )
+        expected_as_of = _parse_payload_datetime(metric.get("as_of") or metric.get("value_date"))
         expected_fetched_at = _parse_payload_datetime(metric.get("fetched_at"))
         return bool(
             value is not None
@@ -29108,30 +28810,17 @@ def _dashboard_metric_snapshot_matches_payload(
             and stored.value.quantize(Decimal("0.00000001"))
             == Decimal(str(value)).quantize(Decimal("0.00000001"))
             and stored.display_value == str(metric.get("display_value") or "")
-            and (
-                stored.change.quantize(Decimal("0.000001"))
-                if stored.change is not None
-                else None
-            )
-            == (
-                Decimal(str(change)).quantize(Decimal("0.000001"))
-                if change is not None
-                else None
-            )
+            and (stored.change.quantize(Decimal("0.000001")) if stored.change is not None else None)
+            == (Decimal(str(change)).quantize(Decimal("0.000001")) if change is not None else None)
             and stored.unit == str(metric.get("unit") or "")
             and stored.value_date == expected_value_date
             and stored.as_of == expected_as_of
             and stored.fetched_at == expected_fetched_at
             and stored.source.key == metric.get("source_key")
-            and (
-                stored.fallback_source.key
-                if stored.fallback_source is not None
-                else None
-            )
+            and (stored.fallback_source.key if stored.fallback_source is not None else None)
             == expected_fallback
             and stored.quality_status == metric.get("quality_status")
-            and stored.license_scope
-            == str(metric.get("license_scope") or "")[:120]
+            and stored.license_scope == str(metric.get("license_scope") or "")[:120]
             and stored.metadata
             == _dashboard_metric_snapshot_metadata(
                 metric,
@@ -29164,6 +28853,8 @@ def _publish_dashboard_core(
     snapshot_fresh_until: str | None = None,
     _publish_capability: object | None = None,
 ) -> DashboardSnapshot | None:
+    if key in {"gdp", "employment", "inflation"}:
+        raise ValueError(f"{key} must be published by its dedicated macro v2 publisher")
     if key in CREDIT_PUBLICATION_KEYS:
         raise ValueError(f"{key} must be published by its dedicated Credit Official v1 publisher")
     if key in FX_VOL_PUBLICATION_KEYS:
@@ -29172,33 +28863,21 @@ def _publish_dashboard_core(
         key in TREASURY_RATE_PUBLICATION_KEYS
         and _publish_capability is not _TREASURY_CURVE_CORE_PUBLISH_CAPABILITY
     ):
-        raise ValueError(
-            f"{key} must be published by its dedicated Treasury curve v2 publisher"
-        )
-    if (
-        key == "assets-fx"
-        and _publish_capability is not _ASSETS_FX_CORE_PUBLISH_CAPABILITY
-    ):
+        raise ValueError(f"{key} must be published by its dedicated Treasury curve v2 publisher")
+    if key == "assets-fx" and _publish_capability is not _ASSETS_FX_CORE_PUBLISH_CAPABILITY:
         raise ValueError("assets-fx must be published by its dedicated v1 publisher")
     if (
         key == "transmission-chain"
-        and _publish_capability
-        is not _TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY
+        and _publish_capability is not _TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY
     ):
-        raise ValueError(
-            "transmission-chain must be published by its dedicated v1 publisher"
-        )
+        raise ValueError("transmission-chain must be published by its dedicated v1 publisher")
     if not metrics:
         return None
     source = ensure_source("internal")
     metric_source_keys = {
-        str(item.get("source_key") or "internal")
-        for item in metrics
-        if isinstance(item, dict)
+        str(item.get("source_key") or "internal") for item in metrics if isinstance(item, dict)
     }
-    metric_sources = {
-        item.key: item for item in Source.objects.filter(key__in=metric_source_keys)
-    }
+    metric_sources = {item.key: item for item in Source.objects.filter(key__in=metric_source_keys)}
     source_scopes: dict[str, str] = {}
     for source_key, component_source in metric_sources.items():
         licence = _effective_source_license(
@@ -29218,9 +28897,7 @@ def _publish_dashboard_core(
             raise ValueError("dashboard metric lacks an explicit source key")
         metric_source_key = declared_source_key
         if metric_source_key not in source_scopes:
-            raise ValueError(
-                f"dashboard metric declares unknown source key: {metric_source_key}"
-            )
+            raise ValueError(f"dashboard metric declares unknown source key: {metric_source_key}")
         metric["source_key"] = metric_source_key
         metric["license_scope"] = source_scopes[metric_source_key]
         normalized_metrics.append(metric)
@@ -29279,8 +28956,7 @@ def _publish_dashboard_core(
         )
         chart["source_keys"] = sorted(chart_source_keys)
         chart_sources = {
-            item.key: item
-            for item in Source.objects.filter(key__in=chart_source_keys)
+            item.key: item for item in Source.objects.filter(key__in=chart_source_keys)
         }
         chart_licence_scopes: dict[str, str] = {}
         for source_key, chart_source in chart_sources.items():
@@ -29298,23 +28974,17 @@ def _publish_dashboard_core(
             for key in sorted(chart_sources)
         ]
         chart["license_scopes"] = effective_chart_scopes
-        chart["fallback_sources"] = sorted(
-            _payload_fallback_source_keys(chart)
-        )
+        chart["fallback_sources"] = sorted(_payload_fallback_source_keys(chart))
 
     as_of_values = [
         datetime.fromisoformat(item["as_of"])
         for item in [*metrics, *normalized_charts]
         if item.get("as_of")
     ]
-    as_of = snapshot_as_of or (
-        min(as_of_values) if as_of_values else timezone.now()
-    )
+    as_of = snapshot_as_of or (min(as_of_values) if as_of_values else timezone.now())
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=UTC)
-    component_qualities = {
-        item.get("quality_status") for item in [*metrics, *normalized_charts]
-    }
+    component_qualities = {item.get("quality_status") for item in [*metrics, *normalized_charts]}
     if Observation.Quality.ERROR in component_qualities:
         quality = Observation.Quality.ERROR
     elif Observation.Quality.STALE in component_qualities:
@@ -29323,12 +28993,8 @@ def _publish_dashboard_core(
         quality = Observation.Quality.FRESH
     else:
         quality = Observation.Quality.ESTIMATED
-    component_batches = sorted(
-        _payload_batch_ids([metrics, normalized_charts, sections or []])
-    )
-    source_keys = sorted(
-        _payload_source_keys([metrics, normalized_charts, sections or []])
-    )
+    component_batches = sorted(_payload_batch_ids([metrics, normalized_charts, sections or []]))
+    source_keys = sorted(_payload_source_keys([metrics, normalized_charts, sections or []]))
     normalized_extra_data = deepcopy(extra_data or {})
     reserved_extra_keys = {
         "demo",
@@ -29410,16 +29076,11 @@ def _publish_dashboard_core(
         item_value = item.get("value")
         if item_value is None:
             return
-        component_source = (
-            Source.objects.filter(key=item.get("source_key", "")).first()
-            or source
-        )
+        component_source = Source.objects.filter(key=item.get("source_key", "")).first() or source
         component_fallback_source = Source.objects.filter(
             key=item.get("fallback_source", "")
         ).first()
-        value_date = parsed_datetime(
-            item.get("value_date") or item.get("as_of"), as_of
-        )
+        value_date = parsed_datetime(item.get("value_date") or item.get("as_of"), as_of)
         item_as_of = parsed_datetime(item.get("as_of"), value_date)
         fetched_at = parsed_datetime(item.get("fetched_at"), timezone.now())
         MetricSnapshot.objects.update_or_create(
@@ -29430,9 +29091,7 @@ def _publish_dashboard_core(
                 "value": Decimal(str(item_value)),
                 "display_value": item.get("display_value", ""),
                 "change": (
-                    Decimal(str(item["change"]))
-                    if item.get("change") is not None
-                    else None
+                    Decimal(str(item["change"])) if item.get("change") is not None else None
                 ),
                 "unit": item.get("unit", ""),
                 "value_date": value_date,
@@ -29440,9 +29099,7 @@ def _publish_dashboard_core(
                 "fetched_at": fetched_at,
                 "source": component_source,
                 "fallback_source": component_fallback_source,
-                "quality_status": item.get(
-                    "quality_status", Observation.Quality.FRESH
-                ),
+                "quality_status": item.get("quality_status", Observation.Quality.FRESH),
                 "license_scope": source_scopes.get(
                     component_source.key,
                     (
@@ -29468,11 +29125,7 @@ def _publish_dashboard_core(
             latest_query = latest_query.filter(
                 data__contract_version=normalized_extra_data["contract_version"]
             )
-        latest = (
-            latest_query.exclude(source__key="demo-market")
-            .order_by("-created_at")
-            .first()
-        )
+        latest = latest_query.exclude(source__key="demo-market").order_by("-created_at").first()
     if latest and latest.data.get("fingerprint") == fingerprint:
         idempotent_data = deepcopy(snapshot_data)
         idempotent_data["publication_batch_id"] = str(latest.batch_id)
@@ -29502,11 +29155,10 @@ def _publish_dashboard_core(
                 and latest.summary == summary
                 and audited_latest_data == idempotent_data
             ):
-                if (
-                    "refresh_failure" not in (latest.data or {})
-                    and latest.quality_status
-                    not in {Observation.Quality.ERROR, Observation.Quality.STALE}
-                ):
+                if "refresh_failure" not in (latest.data or {}) and latest.quality_status not in {
+                    Observation.Quality.ERROR,
+                    Observation.Quality.STALE,
+                }:
                     return None
                 if key in TREASURY_RATE_PUBLICATION_KEYS:
                     latest.data = idempotent_data
@@ -29523,15 +29175,11 @@ def _publish_dashboard_core(
                     return None
         else:
             snapshot_data = idempotent_data
-            payload_integrity_hash = str(
-                snapshot_data["payload_integrity_hash"]
-            )
+            payload_integrity_hash = str(snapshot_data["payload_integrity_hash"])
             latest.data = snapshot_data
             latest.as_of = as_of
             latest.quality_status = quality
-            latest.save(
-                update_fields=["data", "as_of", "quality_status", "updated_at"]
-            )
+            latest.save(update_fields=["data", "as_of", "quality_status", "updated_at"])
             for item in metrics:
                 store_metric(item, latest.batch_id)
             return None
@@ -29565,6 +29213,8 @@ def _publish_dashboard(
 ) -> DashboardSnapshot | None:
     """Publish generic dashboards; independent contracts are never writable here."""
 
+    if key in {"gdp", "employment", "inflation"}:
+        raise ValueError(f"{key} must be published by its dedicated macro v2 publisher")
     if key in {
         "assets-fx",
         "transmission-chain",
@@ -29600,9 +29250,7 @@ def _publish_assets_fx_revision(
     if prepared is None:
         raise ValueError("assets-fx v1 payload is not buildable")
     metrics, charts, sections, extra_data = prepared
-    metric_dates = [
-        _parse_payload_datetime(item.get("value_date")) for item in metrics
-    ]
+    metric_dates = [_parse_payload_datetime(item.get("value_date")) for item in metrics]
     if any(value is None for value in metric_dates):
         raise ValueError("assets-fx metric value dates are incomplete")
     snapshot_as_of = min(value for value in metric_dates if value is not None)
@@ -29690,9 +29338,7 @@ def _publish_treasury_curve_revisions(
     for (component, year), run in selected_runs.items():
         latest = _latest_treasury_attempt(component, year)
         if latest is None or latest.pk != run.pk:
-            raise ValueError(
-                "Treasury curve publisher received a superseded annual run"
-            )
+            raise ValueError("Treasury curve publisher received a superseded annual run")
         _validate_treasury_curve_run(run)
 
     prepared, failures = _treasury_curve_page_data(selected_runs)
@@ -29767,18 +29413,14 @@ def _publish_treasury_curve_revisions(
         for page_key in sorted(TREASURY_CURVE_PAGE_KEYS):
             child = select_public_treasury_curve_snapshot(page_key)
             if child is None:
-                raise ValueError(
-                    f"Treasury rates parent lacks the {page_key} v2 child"
-                )
+                raise ValueError(f"Treasury rates parent lacks the {page_key} v2 child")
             child_references.append(
                 {
                     "component_page_key": page_key,
                     "component_snapshot_id": child.pk,
                     "component_publication_batch_id": str(child.batch_id),
                     "component_fingerprint": child.data.get("fingerprint"),
-                    "component_payload_integrity_hash": child.data.get(
-                        "payload_integrity_hash"
-                    ),
+                    "component_payload_integrity_hash": child.data.get("payload_integrity_hash"),
                     "component_contract_version": TREASURY_CURVE_CONTRACT_VERSION,
                     "fresh_until": child.data.get("fresh_until"),
                 }
@@ -29796,9 +29438,7 @@ def _publish_treasury_curve_revisions(
             charts=charts,
             sections=sections,
             extra_data=extra_data,
-            required_metric_keys=frozenset(
-                str(item["key"]) for item in metrics
-            ),
+            required_metric_keys=frozenset(str(item["key"]) for item in metrics),
             batch_id=batch_id,
             _publish_capability=_TREASURY_CURVE_CORE_PUBLISH_CAPABILITY,
         )
@@ -29881,32 +29521,14 @@ def publish_official_dashboards(
     normalized_dataset_batches = dict(dataset_batches or {})
     treasury_prepared = dict(prepared_treasury_curve_data or {})
     rates_prepared = treasury_prepared.get("rates", ([], [], [], {}))
-    yield_curve_prepared = treasury_prepared.get(
-        "yield-curve", ([], [], [], {})
-    )
-    real_rates_prepared = treasury_prepared.get(
-        "real-rates", ([], [], [], {})
-    )
-    if source_batches is None and (
-        selected_keys is None or "inflation" in selected_keys
-    ):
-        latest_bls_batch = _latest_successful_source_batch("bls")
-        if latest_bls_batch is not None:
-            normalized_source_batches["bls"] = latest_bls_batch
-    if source_batches is None and (
-        selected_keys is None or "consumer" in selected_keys
-    ):
+    yield_curve_prepared = treasury_prepared.get("yield-curve", ([], [], [], {}))
+    real_rates_prepared = treasury_prepared.get("real-rates", ([], [], [], {}))
+    if source_batches is None and (selected_keys is None or "consumer" in selected_keys):
         latest_census_release_batch = _latest_successful_source_batch("census-release")
         if latest_census_release_batch is not None:
             normalized_source_batches["census-release"] = latest_census_release_batch
     consumer_metrics: list[dict[str, Any]] = []
     consumer_charts: list[dict[str, Any]] = []
-    employment_metrics: list[dict[str, Any]] = []
-    employment_charts: list[dict[str, Any]] = []
-    employment_sections: list[dict[str, Any]] = []
-    inflation_metrics: list[dict[str, Any]] = []
-    inflation_charts: list[dict[str, Any]] = []
-    inflation_sections: list[dict[str, Any]] = []
     fed_funds_metrics: list[dict[str, Any]] = []
     fed_funds_charts: list[dict[str, Any]] = []
     fed_funds_sections: list[dict[str, Any]] = []
@@ -30029,10 +29651,7 @@ def publish_official_dashboards(
                 _history_chart(
                     key="consumer-credit-composition",
                     title="G.19 消费者信贷结构",
-                    description=(
-                        "季调月度余额，单位：百万美元；"
-                        "不含以房地产抵押的贷款"
-                    ),
+                    description=("季调月度余额，单位：百万美元；不含以房地产抵押的贷款"),
                     series={
                         "G19-REVOLVING-CREDIT-OUTSTANDING-SA": "循环信贷",
                         "G19-NONREVOLVING-CREDIT-OUTSTANDING-SA": "非循环信贷",
@@ -30043,8 +29662,7 @@ def publish_official_dashboards(
                     key="household-debt-composition",
                     title="家庭债务结构",
                     description=(
-                        "纽约联储 Consumer Credit Panel / Equifax 季度数据，"
-                        "单位：万亿美元"
+                        "纽约联储 Consumer Credit Panel / Equifax 季度数据，单位：万亿美元"
                     ),
                     series={
                         "HHDC-MORTGAGE-BALANCE": "抵押贷款",
@@ -30070,21 +29688,6 @@ def publish_official_dashboards(
             )
             if chart is not None
         ]
-    if selected_keys is None or "employment" in selected_keys:
-        (
-            employment_metrics,
-            employment_charts,
-            employment_sections,
-        ) = _employment_page_data()
-    if selected_keys is None or "inflation" in selected_keys:
-        (
-            inflation_metrics,
-            inflation_charts,
-            inflation_sections,
-        ) = _inflation_page_data(
-            batch_id=normalized_source_batches.get("bls"),
-            bea_pio_batch_id=normalized_source_batches.get("bea-pio-release"),
-        )
     if selected_keys is None or "fed-funds" in selected_keys:
         if prepared_fed_funds_data is not None:
             (
@@ -30097,13 +29700,8 @@ def publish_official_dashboards(
                 fed_funds_metrics,
                 fed_funds_charts,
                 fed_funds_sections,
-            ) = _fed_funds_page_data(
-                dataset_batches=normalized_dataset_batches
-            )
-    if (
-        (selected_keys is None or "economy" in selected_keys)
-        and prepared_economy_data is not None
-    ):
+            ) = _fed_funds_page_data(dataset_batches=normalized_dataset_batches)
+    if (selected_keys is None or "economy" in selected_keys) and prepared_economy_data is not None:
         (
             economy_metrics,
             economy_charts,
@@ -30111,9 +29709,8 @@ def publish_official_dashboards(
             economy_extra_data,
         ) = prepared_economy_data
     if (
-        (selected_keys is None or "liquidity" in selected_keys)
-        and prepared_liquidity_data is not None
-    ):
+        selected_keys is None or "liquidity" in selected_keys
+    ) and prepared_liquidity_data is not None:
         (
             liquidity_metrics,
             liquidity_charts,
@@ -30121,9 +29718,8 @@ def publish_official_dashboards(
             liquidity_extra_data,
         ) = prepared_liquidity_data
     if (
-        (selected_keys is None or "reserves" in selected_keys)
-        and prepared_reserves_data is not None
-    ):
+        selected_keys is None or "reserves" in selected_keys
+    ) and prepared_reserves_data is not None:
         (
             reserves_metrics,
             reserves_charts,
@@ -30271,34 +29867,6 @@ def publish_official_dashboards(
             "sections": _existing(gdp_vintage_section),
         },
         {
-            "key": "employment",
-            "title": "就业",
-            "summary": (
-                "BLS 非农、家庭调查与 JOLTS 和 DOL 周度受保失业申领"
-                "分组发布。非农新增、3M 均值和时薪同比为可复算派生；"
-                "所有组件分别保留数值日、抓取时间、批次、初值/修订状态与来源。"
-            ),
-            "metrics": employment_metrics,
-            "charts": employment_charts,
-            "sections": employment_sections,
-            "required_metric_keys": EMPLOYMENT_REQUIRED_METRIC_KEYS,
-        },
-        {
-            "key": "inflation",
-            "title": "通胀",
-            "summary": (
-                "总体 CPI、核心 CPI、Shelter、核心商品、不含能源服务的服务 CPI "
-                "与最终需求 PPI 的环比和短期动能来自"
-                "BLS 季调指数，同比来自对应未季调指数。所有变化率按精确"
-                "自然月透明计算并绑定同一 BLS 抓取批次；PCE、市场"
-                "预期与完整 vintage 缺口在数据台账中单列。"
-            ),
-            "metrics": inflation_metrics,
-            "charts": inflation_charts,
-            "sections": inflation_sections,
-            "required_metric_keys": INFLATION_REQUIRED_METRIC_KEYS,
-        },
-        {
             "key": "consumer",
             "title": "消费与零售",
             "summary": (
@@ -30427,6 +29995,7 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                         "start_year": max(year - 5, 2000),
                         "end_year": year,
                     },
+                    _store_bls_observations_v2,
                 ),
             ),
         ),
@@ -30436,7 +30005,7 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                 (
                     "personal_income_outlays",
                     {},
-                    _store_release_workbook_observations,
+                    _store_bea_release_observations_v2,
                 ),
             ),
         ),
@@ -30449,7 +30018,7 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                         "start_year": max(year - 5, 1967),
                         "end_year": year,
                     },
-                    _store_series_with_artifacts,
+                    _store_dol_claims_observations_v2,
                 ),
             ),
         ),
@@ -30500,135 +30069,56 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
         if _has_publishable_run(core_runs)
         else []
     )
-    employment_completed = _publishable_keys_for_source_groups(
-        runs, EMPLOYMENT_PUBLICATION_GROUPS
-    )
-    employment_publishable = _keys_with_current_required_batches(
-        employment_completed, runs
-    )
-    if employment_publishable and not _employment_page_is_buildable():
-        employment_publishable = set()
-    stale_employment_keys = set(EMPLOYMENT_PUBLICATION_GROUPS) - set(
-        employment_publishable
-    )
-    _mark_latest_dashboards_stale(
-        stale_employment_keys,
-        runs,
-        groups=EMPLOYMENT_PUBLICATION_GROUPS,
-    )
-    if employment_publishable:
-        dashboards.extend(
-            publish_official_dashboards(keys=employment_publishable)
-        )
-    inflation_completed = _publishable_keys_for_source_groups(
-        runs, INFLATION_PUBLICATION_GROUPS
-    )
-    inflation_publishable = _keys_with_current_required_batches(
-        inflation_completed, runs
-    )
-    inflation_bls_runs = [run for run in runs if run.source.key == "bls"]
-    inflation_bea_pio_runs = [
-        run for run in runs if run.source.key == "bea-pio-release"
-    ]
-    inflation_batch_id = (
-        inflation_bls_runs[0].batch_id
-        if len(inflation_bls_runs) == 1
-        else None
-    )
-    inflation_bea_pio_batch_id = (
-        inflation_bea_pio_runs[0].batch_id
-        if len(inflation_bea_pio_runs) == 1
-        else None
-    )
-    if inflation_publishable and not _inflation_page_is_buildable(
-        batch_id=inflation_batch_id,
-        bea_pio_batch_id=inflation_bea_pio_batch_id,
-    ):
-        inflation_publishable = set()
-    stale_inflation_keys = set(INFLATION_PUBLICATION_GROUPS) - set(
-        inflation_publishable
-    )
-    _mark_latest_dashboards_stale(
-        stale_inflation_keys,
-        runs,
-        groups=INFLATION_PUBLICATION_GROUPS,
-    )
-    if (
-        inflation_publishable
-        and inflation_batch_id is not None
-        and inflation_bea_pio_batch_id is not None
-    ):
-        dashboards.extend(
-            publish_official_dashboards(
-                keys=inflation_publishable,
-                source_batches={
-                    "bls": inflation_batch_id,
-                    "bea-pio-release": inflation_bea_pio_batch_id,
-                },
-            )
-        )
+    employment_dashboards, stale_employment_keys = coordinate_employment_dashboard(runs)
+    dashboards.extend(employment_dashboards)
+    inflation_dashboards, stale_inflation_keys = coordinate_inflation_dashboard(runs)
+    dashboards.extend(inflation_dashboards)
     stale_dashboard_keys = stale_employment_keys | stale_inflation_keys
-    fed_funds_dashboards, stale_fed_funds_keys = (
-        _coordinate_fed_funds_dashboard(runs)
-    )
+    fed_funds_dashboards, stale_fed_funds_keys = _coordinate_fed_funds_dashboard(runs)
     dashboards.extend(fed_funds_dashboards)
     stale_dashboard_keys |= stale_fed_funds_keys
-    rate_spread_dashboards, stale_rate_spread_keys = (
-        _coordinate_reserves_rate_spreads_dashboard(runs)
+    rate_spread_dashboards, stale_rate_spread_keys = _coordinate_reserves_rate_spreads_dashboard(
+        runs
     )
     dashboards.extend(rate_spread_dashboards)
     stale_dashboard_keys |= stale_rate_spread_keys
-    treasury_dashboards, stale_treasury_keys = (
-        _coordinate_treasury_curve_dashboards(runs, end_year=year)
+    treasury_dashboards, stale_treasury_keys = _coordinate_treasury_curve_dashboards(
+        runs, end_year=year
     )
     dashboards.extend(treasury_dashboards)
     stale_dashboard_keys |= stale_treasury_keys
-    liquidity_dashboards, stale_liquidity_keys = (
-        _coordinate_liquidity_dashboard(liquidity_trigger_runs)
+    liquidity_dashboards, stale_liquidity_keys = _coordinate_liquidity_dashboard(
+        liquidity_trigger_runs
     )
     dashboards.extend(liquidity_dashboards)
     stale_dashboard_keys |= stale_liquidity_keys
-    fed_balance_dashboards, stale_fed_balance_keys = (
-        _coordinate_fed_balance_sheet_dashboard(runs)
-    )
+    fed_balance_dashboards, stale_fed_balance_keys = _coordinate_fed_balance_sheet_dashboard(runs)
     dashboards.extend(fed_balance_dashboards)
     stale_dashboard_keys |= stale_fed_balance_keys
-    subsurface_dashboards, stale_subsurface_keys = (
-        _coordinate_subsurface_dashboard(runs)
-    )
+    subsurface_dashboards, stale_subsurface_keys = _coordinate_subsurface_dashboard(runs)
     dashboards.extend(subsurface_dashboards)
     stale_dashboard_keys |= stale_subsurface_keys
-    operations_dashboards, stale_operations_keys = (
-        _coordinate_operations_dashboard(runs)
-    )
+    operations_dashboards, stale_operations_keys = _coordinate_operations_dashboard(runs)
     dashboards.extend(operations_dashboards)
     stale_dashboard_keys |= stale_operations_keys
-    assets_fx_dashboards, stale_assets_fx_keys = (
-        _coordinate_assets_fx_dashboard(runs)
-    )
+    assets_fx_dashboards, stale_assets_fx_keys = _coordinate_assets_fx_dashboard(runs)
     dashboards.extend(assets_fx_dashboards)
     stale_dashboard_keys |= stale_assets_fx_keys
     fx_vol_dashboards, stale_fx_vol_keys = coordinate_fx_vol_dashboard(runs)
     dashboards.extend(fx_vol_dashboards)
     stale_dashboard_keys |= stale_fx_vol_keys
-    global_dollar_dashboards, stale_global_dollar_keys = (
-        _coordinate_global_dollar_dashboard(runs)
-    )
+    global_dollar_dashboards, stale_global_dollar_keys = _coordinate_global_dollar_dashboard(runs)
     dashboards.extend(global_dollar_dashboards)
     stale_dashboard_keys |= stale_global_dollar_keys
-    transmission_dashboards, stale_transmission_keys = (
-        _coordinate_transmission_chain_dashboard(runs)
+    transmission_dashboards, stale_transmission_keys = _coordinate_transmission_chain_dashboard(
+        runs
     )
     dashboards.extend(transmission_dashboards)
     stale_dashboard_keys |= stale_transmission_keys
-    auction_dashboards, stale_auction_keys = _coordinate_auction_dashboard(
-        runs
-    )
+    auction_dashboards, stale_auction_keys = _coordinate_auction_dashboard(runs)
     dashboards.extend(auction_dashboards)
     stale_dashboard_keys |= stale_auction_keys
-    rrp_tga_dashboards, stale_rrp_tga_keys = _coordinate_rrp_tga_dashboard(
-        runs
-    )
+    rrp_tga_dashboards, stale_rrp_tga_keys = _coordinate_rrp_tga_dashboard(runs)
     dashboards.extend(rrp_tga_dashboards)
     stale_dashboard_keys |= stale_rrp_tga_keys
     economy_dashboards, stale_economy_keys = _coordinate_economy_dashboard()
@@ -30660,9 +30150,7 @@ def refresh_treasury_curve_data(
 
     resolved_end = end_year or timezone.now().year
     resolved_start = (
-        start_year
-        if start_year is not None
-        else resolved_end - TREASURY_CURVE_HISTORY_YEARS
+        start_year if start_year is not None else resolved_end - TREASURY_CURVE_HISTORY_YEARS
     )
     if resolved_start > resolved_end:
         raise ValueError("Treasury curve start year must not exceed end year")
@@ -30778,20 +30266,14 @@ def refresh_h41_data() -> dict[str, Any]:
         "reserves_refresh_component": "h41",
     }
     run.save(update_fields=["metadata", "updated_at"])
-    dashboards, stale_fed_balance_keys = (
-        _coordinate_fed_balance_sheet_dashboard([run])
-    )
-    reserves_dashboards, stale_reserves_keys = (
-        _coordinate_reserves_dashboard([run])
-    )
+    dashboards, stale_fed_balance_keys = _coordinate_fed_balance_sheet_dashboard([run])
+    reserves_dashboards, stale_reserves_keys = _coordinate_reserves_dashboard([run])
     dashboards.extend(reserves_dashboards)
-    transmission_dashboards, stale_transmission_keys = (
-        _coordinate_transmission_chain_dashboard([run])
+    transmission_dashboards, stale_transmission_keys = _coordinate_transmission_chain_dashboard(
+        [run]
     )
     dashboards.extend(transmission_dashboards)
-    liquidity_dashboards, stale_liquidity_keys = (
-        _coordinate_liquidity_dashboard([run])
-    )
+    liquidity_dashboards, stale_liquidity_keys = _coordinate_liquidity_dashboard([run])
     dashboards.extend(liquidity_dashboards)
     return {
         "runs": [
@@ -30836,8 +30318,8 @@ def refresh_h8_data() -> dict[str, Any]:
     }
     run.save(update_fields=["metadata", "updated_at"])
     dashboards, stale_keys = _coordinate_reserves_dashboard([run])
-    transmission_dashboards, stale_transmission_keys = (
-        _coordinate_transmission_chain_dashboard([run])
+    transmission_dashboards, stale_transmission_keys = _coordinate_transmission_chain_dashboard(
+        [run]
     )
     dashboards.extend(transmission_dashboards)
     stale_keys |= stale_transmission_keys
@@ -30875,24 +30357,18 @@ def refresh_prates_data() -> dict[str, Any]:
         if _has_publishable_run([run])
         else []
     )
-    fed_funds_dashboards, stale_fed_funds_keys = (
-        _coordinate_fed_funds_dashboard([run])
-    )
+    fed_funds_dashboards, stale_fed_funds_keys = _coordinate_fed_funds_dashboard([run])
     dashboards.extend(fed_funds_dashboards)
-    liquidity_dashboards, stale_liquidity_keys = (
-        _coordinate_liquidity_dashboard([run])
-    )
+    liquidity_dashboards, stale_liquidity_keys = _coordinate_liquidity_dashboard([run])
     dashboards.extend(liquidity_dashboards)
-    rate_spread_dashboards, stale_rate_spread_keys = (
-        _coordinate_reserves_rate_spreads_dashboard([run])
+    rate_spread_dashboards, stale_rate_spread_keys = _coordinate_reserves_rate_spreads_dashboard(
+        [run]
     )
     dashboards.extend(rate_spread_dashboards)
-    subsurface_dashboards, stale_subsurface_keys = (
-        _coordinate_subsurface_dashboard([run])
-    )
+    subsurface_dashboards, stale_subsurface_keys = _coordinate_subsurface_dashboard([run])
     dashboards.extend(subsurface_dashboards)
-    transmission_dashboards, stale_transmission_keys = (
-        _coordinate_transmission_chain_dashboard([run])
+    transmission_dashboards, stale_transmission_keys = _coordinate_transmission_chain_dashboard(
+        [run]
     )
     dashboards.extend(transmission_dashboards)
     return {
@@ -30926,17 +30402,13 @@ def refresh_h10_data() -> dict[str, Any]:
         run = record_provider_result(result, persist=_store_h10_observations)
     finally:
         provider.close()
-    dashboards, stale_assets_fx_keys = _coordinate_assets_fx_dashboard(
-        [run]
-    )
+    dashboards, stale_assets_fx_keys = _coordinate_assets_fx_dashboard([run])
     fx_vol_dashboards, stale_fx_vol_keys = coordinate_fx_vol_dashboard([run])
     dashboards.extend(fx_vol_dashboards)
-    global_dollar_dashboards, stale_global_dollar_keys = (
-        _coordinate_global_dollar_dashboard([run])
-    )
+    global_dollar_dashboards, stale_global_dollar_keys = _coordinate_global_dollar_dashboard([run])
     dashboards.extend(global_dollar_dashboards)
-    transmission_dashboards, stale_transmission_keys = (
-        _coordinate_transmission_chain_dashboard([run])
+    transmission_dashboards, stale_transmission_keys = _coordinate_transmission_chain_dashboard(
+        [run]
     )
     dashboards.extend(transmission_dashboards)
     return {
@@ -31009,6 +30481,63 @@ def refresh_credit_official_data() -> dict[str, Any]:
     }
 
 
+def _record_and_coordinate_gdp_result(
+    result: ProviderResult,
+    persist,
+) -> tuple[IngestionRun, list[DashboardSnapshot], set[str]]:
+    """Atomically expose a GDP revision or a durable retained-failure state."""
+
+    publication_error: Exception | None = None
+    outcome: tuple[IngestionRun, list[DashboardSnapshot], set[str]]
+    with transaction.atomic():
+        attempt = begin_ingestion(
+            result.provider,
+            result.dataset,
+            metadata={
+                "provider": result.provider,
+                "fetched_at": result.fetched_at.isoformat(),
+            },
+        )
+        try:
+            # This nested atomic block is a savepoint. A publication exception
+            # rolls acquisition rows and the provisional SUCCESS back to the
+            # outer RUNNING attempt without creating a visibility gap.
+            with transaction.atomic():
+                run = record_provider_result(
+                    result,
+                    persist=persist,
+                    run=attempt,
+                )
+                published, stale = coordinate_gdp_dashboard([run])
+            outcome = run, published, stale
+        except Exception as exc:
+            logger.exception("GDP publication failed after acquisition; retaining prior revision")
+            publication_error = exc
+            attempt.refresh_from_db()
+            failure_metadata = {
+                "provider": result.provider,
+                "fetched_at": result.fetched_at.isoformat(),
+                "publication_failure": True,
+                "publication_exception_type": type(exc).__name__,
+                "rolled_back_payload_sha256": (result.metadata or {}).get("sha256"),
+                "attempted_row_count": result.row_count,
+            }
+            failed = finish_ingestion(
+                attempt,
+                status=IngestionRun.Status.FAILED,
+                error=(
+                    "GDP publication failed after acquisition rollback: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                metadata=failure_metadata,
+            )
+            published, stale = coordinate_gdp_dashboard([failed])
+            outcome = failed, published, stale
+    if publication_error is not None:
+        raise publication_error
+    return outcome
+
+
 def refresh_macro_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     """Refresh official growth and consumer sources with page-level quality gates."""
 
@@ -31018,54 +30547,63 @@ def refresh_macro_official_data(*, current_year: int | None = None) -> dict[str,
             BEAGDPReleaseProvider(),
             "gdp_pce",
             {},
-            _store_release_workbook_observations,
+            _store_bea_release_observations_v2,
         ),
         (
             CensusMARTSProvider(),
             "monthly_retail_sales",
             {"time": "from 1992", "require_complete_history": True},
-            _store_release_workbook_observations,
+            _store_census_marts_observations_v2,
         ),
         (
             CensusMARTSReleaseProvider(),
             "monthly_retail_sales",
             {},
-            _store_release_workbook_observations,
+            _store_census_marts_observations_v2,
         ),
         (
             BEAPIOReleaseProvider(),
             "personal_income_outlays",
             {},
-            _store_release_workbook_observations,
+            _store_bea_release_observations_v2,
         ),
         (
             FederalReserveG19Provider(),
             "consumer_credit",
             {},
-            _store_release_workbook_observations,
+            _store_consumer_credit_observations_v2,
         ),
         (
             NYFedHouseholdDebtProvider(),
             "household_debt",
             {},
-            _store_release_workbook_observations,
+            _store_consumer_credit_observations_v2,
         ),
     ]
     runs: list[IngestionRun] = []
+    gdp_dashboards: list[DashboardSnapshot] = []
+    stale_gdp_keys: set[str] = set()
     try:
         for provider, method_name, kwargs, persist in providers:
             result = getattr(provider, method_name)(**kwargs)
-            runs.append(record_provider_result(result, persist=persist))
+            if result.provider == "bea-release" and result.dataset == "gdp-release-workbooks":
+                run, published, stale = _record_and_coordinate_gdp_result(
+                    result,
+                    persist,
+                )
+                runs.append(run)
+                gdp_dashboards.extend(published)
+                stale_gdp_keys.update(stale)
+            else:
+                runs.append(record_provider_result(result, persist=persist))
     finally:
         for provider, _, _, _ in providers:
             provider.close()
     _record_census_revision_witness(runs)
-    completed_keys = _publishable_keys_for_source_groups(
-        runs, MACRO_PUBLICATION_GROUPS
-    )
+    completed_keys = _publishable_keys_for_source_groups(runs, MACRO_PUBLICATION_GROUPS)
     publishable_keys = _keys_with_current_required_batches(completed_keys, runs)
     stale_keys = set(MACRO_PUBLICATION_GROUPS) - publishable_keys
-    _mark_latest_dashboards_stale(stale_keys, runs)
+    _mark_latest_dashboards_stale(stale_keys - {"gdp"}, runs)
     dashboards = (
         publish_official_dashboards(
             keys=publishable_keys,
@@ -31074,6 +30612,11 @@ def refresh_macro_official_data(*, current_year: int | None = None) -> dict[str,
         if publishable_keys
         else []
     )
+    dashboards.extend(gdp_dashboards)
+    stale_keys |= stale_gdp_keys
+    inflation_dashboards, stale_inflation_keys = coordinate_inflation_dashboard(runs)
+    dashboards.extend(inflation_dashboards)
+    stale_keys |= stale_inflation_keys
     economy_dashboards, stale_economy_keys = _coordinate_economy_dashboard()
     dashboards.extend(economy_dashboards)
     stale_keys |= stale_economy_keys

@@ -8,6 +8,7 @@ be persisted as ingestion metadata instead of crashing a Celery worker.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import time
@@ -158,6 +159,49 @@ class HTTPProvider:
             return response.json(), None
         except (httpx.HTTPError, ValueError) as exc:
             return None, ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
+
+    def _post_json_with_raw(
+        self,
+        dataset: str,
+        path: str,
+        *,
+        json: Mapping[str, Any],
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[Any | None, bytes | None, dict[str, Any], ProviderResult | None]:
+        """Decode a JSON POST response while retaining its exact bytes.
+
+        Request bodies are deliberately excluded from the transport witness so
+        optional credentials cannot leak into durable ingestion metadata.
+        Callers must add a provider-specific, credential-free request witness.
+        """
+
+        try:
+            response = self.client.post(path, json=dict(json), headers=headers)
+            response.raise_for_status()
+            raw_bytes = bytes(response.content)
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            return (
+                None,
+                None,
+                {},
+                ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    f"{type(exc).__name__}: {exc}",
+                ),
+            )
+        return (
+            payload,
+            raw_bytes,
+            {
+                "endpoint": str(response.url),
+                "content_type": response.headers.get("content-type", ""),
+                "byte_length": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            },
+            None,
+        )
 
     def _get_text(
         self,
@@ -1650,6 +1694,18 @@ class NYFedMarketsProvider(HTTPProvider):
         return result
 
 
+TREASURY_CURVE_CANONICAL_FEED_IDS = {
+    "daily_treasury_yield_curve": (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/pages/xml-item?data=daily_treasury_yield_curve"
+    ),
+    "daily_treasury_real_yield_curve": (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/pages/xml-item?data=daily_treasury_real_yield_curve"
+    ),
+}
+
+
 class TreasuryRatesProvider(HTTPProvider):
     """Direct U.S. Treasury nominal and real par-yield curve adapter."""
 
@@ -1981,7 +2037,7 @@ class TreasuryRatesProvider(HTTPProvider):
         feed_id = (
             root.findtext("atom:id", default="", namespaces=cls.XML_NS) or ""
         ).strip()
-        expected_feed_identity = f"https://home.treasury.gov/xml-item?data={curve}"
+        expected_feed_identity = TREASURY_CURVE_CANONICAL_FEED_IDS[curve]
         if feed_id != expected_feed_identity:
             raise ValueError("Treasury curve feed id does not match the dataset")
         raw_updated = (
@@ -2537,6 +2593,132 @@ class BLSProvider(HTTPProvider):
     key = "bls"
     base_url = "https://api.bls.gov"
 
+    @classmethod
+    def parse_series_json_bytes(
+        cls,
+        raw_bytes: bytes,
+        *,
+        series_ids: list[str] | tuple[str, ...],
+        start_year: int,
+        end_year: int,
+        fetched_at: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Replay one exact BLS Public Data API response into normalized rows."""
+
+        requested_series = tuple(str(item) for item in series_ids)
+        if (
+            not raw_bytes
+            or not requested_series
+            or len(set(requested_series)) != len(requested_series)
+            or any(not item for item in requested_series)
+            or start_year > end_year
+        ):
+            raise ValueError("BLS request identity or raw JSON bytes are invalid")
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=UTC)
+        try:
+            payload = json.loads(raw_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"BLS JSON parse failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("BLS response root is not an object")
+        if payload.get("status") != "REQUEST_SUCCEEDED":
+            messages = payload.get("message")
+            rendered = "; ".join(messages) if isinstance(messages, list) else ""
+            raise ValueError(rendered or "BLS request failed")
+        results = payload.get("Results")
+        response_series = results.get("series") if isinstance(results, dict) else None
+        if not isinstance(response_series, list):
+            raise ValueError("BLS response lacks a series array")
+
+        requested = set(requested_series)
+        returned_series: set[str] = set()
+        seen_rows: set[tuple[str, int, int]] = set()
+        latest_value_dates: dict[str, date] = {}
+        records: list[dict[str, Any]] = []
+        for series in response_series:
+            if not isinstance(series, dict):
+                raise ValueError("BLS response contains a malformed series")
+            series_id = str(series.get("seriesID") or "")
+            if series_id not in requested or series_id in returned_series:
+                raise ValueError("BLS response series identity is unexpected or duplicated")
+            data = series.get("data")
+            if not isinstance(data, list):
+                raise ValueError("BLS response series lacks a data array")
+            returned_series.add(series_id)
+            for item in data:
+                if not isinstance(item, dict):
+                    raise ValueError("BLS response contains a malformed observation")
+                period = str(item.get("period") or "")
+                if period == "M13":
+                    continue
+                if not re.fullmatch(r"M(?:0[1-9]|1[0-2])", period):
+                    raise ValueError("BLS observation period is invalid")
+                try:
+                    year = int(item.get("year"))
+                    month = int(period[1:])
+                    value = Decimal(str(item.get("value")))
+                    value_date = date(year, month, 1)
+                except (ArithmeticError, TypeError, ValueError) as exc:
+                    raise ValueError("BLS observation is malformed") from exc
+                if (
+                    year < start_year
+                    or year > end_year
+                    or value_date > fetched_at.astimezone(UTC).date()
+                    or not value.is_finite()
+                ):
+                    raise ValueError("BLS observation is outside the request contract")
+                identity = (series_id, year, month)
+                if identity in seen_rows:
+                    raise ValueError("BLS response contains a duplicate observation")
+                seen_rows.add(identity)
+                latest_value_dates[series_id] = max(
+                    value_date,
+                    latest_value_dates.get(series_id, value_date),
+                )
+                footnotes = item.get("footnotes") or []
+                if not isinstance(footnotes, list) or any(
+                    not isinstance(footnote, dict) for footnote in footnotes
+                ):
+                    raise ValueError("BLS observation footnotes are malformed")
+                preliminary = any(
+                    str(footnote.get("code") or "").upper() == "P"
+                    or "preliminary" in str(footnote.get("text") or "").lower()
+                    for footnote in footnotes
+                )
+                records.append(
+                    {
+                        "series_id": series_id,
+                        "date": value_date.isoformat(),
+                        "value": value,
+                        "quality_status": "estimated" if preliminary else "fresh",
+                        "metadata": {
+                            "period_name": item.get("periodName"),
+                            "latest": item.get("latest") == "true",
+                            "footnotes": footnotes,
+                            "preliminary": preliminary,
+                        },
+                    }
+                )
+        records.sort(key=lambda item: (str(item["series_id"]), str(item["date"])))
+        messages = payload.get("message") or []
+        if not isinstance(messages, list):
+            raise ValueError("BLS response messages are malformed")
+        missing_series = sorted(requested - returned_series)
+        return records, {
+            "requested_series": list(requested_series),
+            "returned_series": sorted(returned_series),
+            "missing_series": missing_series,
+            "messages": list(messages),
+            "quality_status": "partial" if missing_series else "complete",
+            "start_year": start_year,
+            "end_year": end_year,
+            "latest_value_dates": {
+                key: value.isoformat()
+                for key, value in sorted(latest_value_dates.items())
+            },
+        }
+
     def series(
         self,
         series_ids: list[str] | tuple[str, ...],
@@ -2553,65 +2735,43 @@ class BLSProvider(HTTPProvider):
         registration_key = os.getenv("BLS_REGISTRATION_KEY", "")
         if registration_key:
             body["registrationkey"] = registration_key
-        payload, failure = self._post_json(
+        _payload, raw_bytes, transport_metadata, failure = self._post_json_with_raw(
             dataset,
             "/publicAPI/v2/timeseries/data/",
             json=body,
         )
         if failure:
             return failure
-        if payload.get("status") != "REQUEST_SUCCEEDED":
+        fetched_at = datetime.now(UTC)
+        try:
+            records, replay_metadata = self.parse_series_json_bytes(
+                raw_bytes or b"",
+                series_ids=series_ids,
+                start_year=start_year,
+                end_year=end_year,
+                fetched_at=fetched_at,
+            )
+        except ValueError as exc:
             return ProviderResult.failure(
                 self.key,
                 dataset,
-                "; ".join(payload.get("message") or ["BLS request failed"]),
+                str(exc),
             )
-        records = []
-        returned_series: set[str] = set()
-        for series in payload.get("Results", {}).get("series", []):
-            series_id = series.get("seriesID")
-            for item in series.get("data", []):
-                period = item.get("period", "")
-                if not series_id or not period.startswith("M") or period == "M13":
-                    continue
-                value = _decimal_or_none(item.get("value"))
-                if value is None:
-                    continue
-                month = int(period[1:])
-                footnotes = item.get("footnotes") or []
-                preliminary = any(
-                    str(footnote.get("code") or "").upper() == "P"
-                    or "preliminary" in str(footnote.get("text") or "").lower()
-                    for footnote in footnotes
-                    if isinstance(footnote, dict)
-                )
-                records.append(
-                    {
-                        "series_id": series_id,
-                        "date": f"{int(item['year']):04d}-{month:02d}-01",
-                        "value": value,
-                        "quality_status": "estimated" if preliminary else "fresh",
-                        "metadata": {
-                            "period_name": item.get("periodName"),
-                            "latest": item.get("latest") == "true",
-                            "footnotes": footnotes,
-                            "preliminary": preliminary,
-                        },
-                    }
-                )
-                returned_series.add(series_id)
-        missing_series = sorted(set(series_ids) - returned_series)
         return ProviderResult(
             provider=self.key,
             dataset=dataset,
             records=records,
+            fetched_at=fetched_at,
             metadata={
-                "requested_series": list(series_ids),
-                "returned_series": sorted(returned_series),
-                "missing_series": missing_series,
-                "messages": list(payload.get("message") or []),
-                "quality_status": "partial" if missing_series else "complete",
+                **transport_metadata,
+                **replay_metadata,
+                "request_witness": {
+                    "series_ids": list(series_ids),
+                    "start_year": start_year,
+                    "end_year": end_year,
+                },
             },
+            raw_bytes=raw_bytes,
         )
 
 

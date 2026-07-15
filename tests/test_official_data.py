@@ -353,7 +353,7 @@ def test_treasury_provider_normalizes_nominal_curve_xml():
       xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
       xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
       <title>DailyTreasuryYieldCurveRateData</title>
-      <id>https://home.treasury.gov/xml-item?data=daily_treasury_yield_curve</id>
+      <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve</id>
       <updated>2026-07-10T19:00:00Z</updated>
       <entry><content type="application/xml"><m:properties>
         <d:NEW_DATE m:type="Edm.DateTime">2026-07-10T00:00:00</d:NEW_DATE>

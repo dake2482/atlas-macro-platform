@@ -54,6 +54,7 @@ H10_DATES = (
     "2026-07-09",
     "2026-07-10",
 )
+SWAP_FIXTURE_FETCHED_AT = datetime(2026, 7, 14, 18, 0, tzinfo=UTC)
 
 
 def _h10_archive(
@@ -264,11 +265,13 @@ def _swap_result(*, operations=None) -> ProviderResult:
         base_url="https://markets.newyorkfed.org",
         transport=httpx.MockTransport(handler),
     )
-    return NYFedMarketsProvider(client=client).usd_fx_swaps(
+    result = NYFedMarketsProvider(client=client).usd_fx_swaps(
         start_date="2007-01-01",
         end_date="2026-07-14",
         date_type="trade",
     )
+    result.fetched_at = SWAP_FIXTURE_FETCHED_AT
+    return result
 
 
 @pytest.fixture
@@ -353,6 +356,7 @@ def test_last_endpoint_cannot_forge_search_coverage(tmp_path, monkeypatch):
             transport=httpx.MockTransport(handler),
         )
     ).usd_fx_swaps(limit=3, as_of="2026-07-14")
+    result.fetched_at = SWAP_FIXTURE_FETCHED_AT
     result.metadata.update(
         {
             "endpoint": (

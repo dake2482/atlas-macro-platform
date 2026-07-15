@@ -133,7 +133,7 @@ class ThesisAdmin(admin.ModelAdmin):
                     self.log_change(
                         request,
                         thesis,
-                        "通过 daily-evidence v1 安全门；相同版本保持原发布时间",
+                        "通过版本化 daily-evidence 安全门；相同版本保持原发布时间",
                     )
         if not outcome.ok:
             details = "; ".join(

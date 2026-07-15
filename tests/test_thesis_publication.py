@@ -33,6 +33,9 @@ from research.models import (
 from research.services import ensure_source
 from research.tasks import generate_daily_research, publish_daily_evidence
 from research.thesis_publication import (
+    DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
+    DAILY_EVIDENCE_CONTRACT_VERSION,
+    DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS,
     component_data_fingerprint,
     component_reference_fingerprint,
     daily_evidence_component_set_fingerprint,
@@ -50,6 +53,69 @@ from tests.thesis_factories import (
     build_daily_components,
     build_daily_evidence,
 )
+
+
+@pytest.fixture(autouse=True)
+def _strict_daily_v2_fixture_selectors(monkeypatch):
+    """Let v2 coordinator tests use explicit synthetic strict children."""
+
+    def synthetic_component(page_key: str, state_attribute: str):
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key=page_key,
+                is_published=True,
+                data__contract_version=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS[
+                    page_key
+                ],
+            )
+            .select_related("source")
+            .order_by("-created_at", "-id")
+        )
+        preferred = {
+            "economy": "bea-a191rl",
+            "rates": "ust-10y",
+        }[page_key]
+        for candidate in candidates:
+            data = candidate.data if isinstance(candidate.data, dict) else {}
+            if not data.get("test_daily_component"):
+                continue
+            metrics = data.get("metrics")
+            if (
+                candidate.quality_status
+                not in {Observation.Quality.FRESH, Observation.Quality.ESTIMATED}
+                or data.get("refresh_failure")
+                or not isinstance(metrics, list)
+                or len(
+                    [
+                        item
+                        for item in metrics
+                        if isinstance(item, dict) and item.get("key") == preferred
+                    ]
+                )
+                != 1
+            ):
+                return None
+            selected = deepcopy(candidate)
+            setattr(
+                selected,
+                state_attribute,
+                data.get("test_publication_state", "current_candidate"),
+            )
+            return selected
+        return None
+
+    monkeypatch.setattr(
+        "research.thesis_publication.select_public_economy_snapshot",
+        lambda: synthetic_component("economy", "economy_publication_state"),
+    )
+    monkeypatch.setattr(
+        "research.thesis_publication.select_public_treasury_curve_snapshot",
+        lambda page_key: (
+            synthetic_component("rates", "treasury_publication_state")
+            if page_key == "rates"
+            else None
+        ),
+    )
 
 
 @pytest.mark.django_db
@@ -92,6 +158,27 @@ def test_complete_public_thesis_is_shared_by_every_public_surface(client):
     assert '<option value="hit"' in listing
     assert '<option value="partial"' in listing
     assert '<option value="missed"' in listing
+
+
+@pytest.mark.django_db
+def test_validated_daily_contract_version_renders_v1_and_v2_without_guessing(client):
+    legacy = build_complete_thesis(
+        "VALID-V1-LABEL",
+        report_date=date(1900, 1, 11),
+    )
+    current = build_complete_thesis(
+        "VALID-V2-LABEL",
+        report_date=date(1900, 1, 12),
+        evidence_contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+
+    legacy_body = client.get(legacy.get_absolute_url()).content.decode()
+    current_body = client.get(current.get_absolute_url()).content.decode()
+
+    assert "daily-evidence v1" in legacy_body
+    assert "daily-evidence v2" not in legacy_body
+    assert "daily-evidence v2" in current_body
+    assert "daily-evidence v1" not in current_body
 
 
 def _invalidate_thesis(thesis: Thesis, case: str) -> None:
@@ -570,15 +657,21 @@ def test_daily_research_ignores_arbitrary_dashboard_and_never_creates_thesis():
     result = generate_daily_research()
 
     assert result["partial"] == 1
+    assert IngestionRun.objects.filter(
+        dataset=f"daily-research-v2:{timezone.localdate()}"
+    ).exists()
     assert not GeneratedAnalysis.objects.filter(slug=slug).exists()
     assert Thesis.objects.count() == thesis_count
 
 
 @pytest.mark.django_db
-def test_daily_research_uses_only_latest_ready_v1_and_is_idempotent():
+def test_daily_research_uses_only_latest_ready_v2_and_is_idempotent():
     thesis_count = Thesis.objects.count()
     slug = f"daily-system-summary-{timezone.localdate().isoformat()}"
-    snapshot, _metrics = build_daily_evidence("daily-task")
+    snapshot, _metrics = build_daily_evidence(
+        "daily-task",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
 
     first = generate_daily_research()
     first_analysis = GeneratedAnalysis.objects.get(slug=slug)
@@ -590,10 +683,13 @@ def test_daily_research_uses_only_latest_ready_v1_and_is_idempotent():
     assert first["failed"] == second["failed"] == 0
     assert first["partial"] == second["partial"] == 0
     assert first["row_count"] == second["row_count"] == 1
+    assert IngestionRun.objects.filter(
+        dataset=f"daily-research-v2:{timezone.localdate()}"
+    ).count() == 2
     assert GeneratedAnalysis.objects.filter(slug=slug).count() == 1
     analysis = GeneratedAnalysis.objects.get(slug=slug)
     assert analysis.review_status == GeneratedAnalysis.ReviewStatus.DRAFT
-    assert analysis.prompt_version == "daily-evidence-v1"
+    assert analysis.prompt_version == "daily-evidence-v2"
     assert analysis.evidence[0]["id"] == snapshot.pk
     assert analysis.evidence[0]["batch_id"] == str(snapshot.batch_id)
     assert analysis.evidence[0]["metric_ids"] == snapshot.data["evidence_metric_ids"]
@@ -606,7 +702,10 @@ def test_daily_research_uses_only_latest_ready_v1_and_is_idempotent():
 @pytest.mark.django_db
 def test_daily_research_does_not_fall_back_around_new_invalid_candidate():
     slug = f"daily-system-summary-{timezone.localdate().isoformat()}"
-    build_daily_evidence("older-valid")
+    build_daily_evidence(
+        "older-valid",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
     source = ensure_source("internal")
     DashboardSnapshot.objects.create(
         key="daily-evidence",
@@ -614,7 +713,10 @@ def test_daily_research_does_not_fall_back_around_new_invalid_candidate():
         as_of=timezone.now(),
         source=source,
         is_published=False,
-        data={"demo": False, "contract_version": 1},
+        data={
+            "demo": False,
+            "contract_version": DAILY_EVIDENCE_CONTRACT_VERSION,
+        },
     )
 
     result = generate_daily_research()
@@ -633,7 +735,10 @@ def test_daily_research_does_not_fall_back_around_new_invalid_candidate():
     ],
 )
 def test_daily_research_never_overwrites_a_non_draft_analysis(review_status):
-    build_daily_evidence("reviewed-analysis")
+    build_daily_evidence(
+        "reviewed-analysis",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
     today = timezone.localdate()
     slug = f"daily-system-summary-{today.isoformat()}"
     existing = GeneratedAnalysis.objects.create(
@@ -657,7 +762,10 @@ def test_daily_research_never_overwrites_a_non_draft_analysis(review_status):
 
 @pytest.mark.django_db
 def test_daily_research_revalidates_inside_persistence_transaction(monkeypatch):
-    build_daily_evidence("race-revalidation")
+    build_daily_evidence(
+        "race-revalidation",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
     slug = f"daily-system-summary-{timezone.localdate().isoformat()}"
     monkeypatch.setattr(
         "research.tasks.validate_daily_evidence_snapshot",
@@ -672,14 +780,17 @@ def test_daily_research_revalidates_inside_persistence_transaction(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_daily_research_parent_lock_targets_only_snapshot(monkeypatch):
-    build_daily_evidence("daily-research-lock-target")
-    dashboard_lock_targets: list[tuple[str, ...]] = []
+def test_daily_research_locks_internal_source_before_parent_and_lineage(monkeypatch):
+    build_daily_evidence(
+        "daily-research-lock-target",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    lock_calls: list[tuple[type, tuple[str, ...]]] = []
     original_select_for_update = QuerySet.select_for_update
 
     def tracked_select_for_update(queryset, *args, **kwargs):
-        if queryset.model is DashboardSnapshot:
-            dashboard_lock_targets.append(kwargs.get("of", ()))
+        if queryset.model in {Source, DashboardSnapshot, MetricSnapshot}:
+            lock_calls.append((queryset.model, kwargs.get("of", ())))
         return original_select_for_update(queryset, *args, **kwargs)
 
     monkeypatch.setattr(QuerySet, "select_for_update", tracked_select_for_update)
@@ -687,8 +798,13 @@ def test_daily_research_parent_lock_targets_only_snapshot(monkeypatch):
     result = generate_daily_research()
 
     assert result["failed"] == 0
-    assert dashboard_lock_targets
-    assert dashboard_lock_targets[0] == ("self",)
+    assert [model for model, _of in lock_calls[:4]] == [
+        Source,
+        DashboardSnapshot,
+        DashboardSnapshot,
+        MetricSnapshot,
+    ]
+    assert all(of == ("self",) for _model, of in lock_calls[:4])
 
 
 @pytest.mark.django_db
@@ -697,6 +813,7 @@ def test_daily_evidence_coordinator_freezes_exact_lineage_and_is_idempotent():
     components, metrics = build_daily_components(
         "coordinator-real-components",
         now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
     )
 
     first = publish_daily_evidence_snapshot(now=current_time)
@@ -737,12 +854,16 @@ def test_daily_evidence_coordinator_freezes_exact_lineage_and_is_idempotent():
 @pytest.mark.django_db
 def test_daily_evidence_coordinator_locks_only_primary_rows(monkeypatch):
     current_time = timezone.now()
-    build_daily_components("coordinator-lock-targets", now=current_time)
+    build_daily_components(
+        "coordinator-lock-targets",
+        now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
+    )
     lock_calls: list[tuple[type, tuple[str, ...]]] = []
     original_select_for_update = QuerySet.select_for_update
 
     def tracked_select_for_update(queryset, *args, **kwargs):
-        if queryset.model in {DashboardSnapshot, MetricSnapshot}:
+        if queryset.model in {Source, DashboardSnapshot, MetricSnapshot}:
             lock_calls.append((queryset.model, kwargs.get("of", ())))
         return original_select_for_update(queryset, *args, **kwargs)
 
@@ -752,10 +873,132 @@ def test_daily_evidence_coordinator_locks_only_primary_rows(monkeypatch):
 
     assert outcome.ok
     assert {model for model, _of in lock_calls} == {
+        Source,
         DashboardSnapshot,
         MetricSnapshot,
     }
     assert all(of == ("self",) for _model, of in lock_calls)
+    assert [model for model, _of in lock_calls[:4]] == [
+        Source,
+        DashboardSnapshot,
+        DashboardSnapshot,
+        MetricSnapshot,
+    ]
+
+
+@pytest.mark.django_db
+def test_daily_evidence_coordinator_fails_closed_on_invalid_newest_v2_parent():
+    current_time = timezone.now()
+    build_daily_components(
+        "invalid-newest-parent",
+        now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
+    )
+    first = publish_daily_evidence_snapshot(now=current_time)
+    assert first.ok
+    data = deepcopy(first.snapshot.data)
+    data["unexplained_policy"] = "tampered after publication"
+    first.snapshot.data = data
+    first.snapshot.save(update_fields=["data", "updated_at"])
+
+    outcome = publish_daily_evidence_snapshot(
+        now=current_time + timedelta(minutes=1)
+    )
+
+    assert not outcome.ok
+    assert any("newest daily-evidence v2 candidate is invalid" in error for error in outcome.errors)
+    assert DashboardSnapshot.objects.filter(key="daily-evidence").count() == 1
+
+
+@pytest.mark.django_db
+def test_daily_evidence_coordinator_rejects_noncurrent_strict_economy():
+    current_time = timezone.now()
+    components, _metrics = build_daily_components(
+        "noncurrent-economy",
+        now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
+    )
+    economy = next(item for item in components if item.key == "economy")
+    data = deepcopy(economy.data)
+    data["test_publication_state"] = "natural_expiry"
+    economy.data = data
+    economy.save(update_fields=["data", "updated_at"])
+
+    outcome = publish_daily_evidence_snapshot(now=current_time)
+
+    assert not outcome.ok
+    assert "economy: strict current component is missing" in outcome.errors
+    assert not DashboardSnapshot.objects.filter(key="daily-evidence").exists()
+
+
+@pytest.mark.django_db
+def test_daily_evidence_coordinator_ignores_newer_static_invalid_economy_rogue():
+    current_time = timezone.now()
+    components, _metrics = build_daily_components(
+        "economy-rogue",
+        now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
+    )
+    valid_economy = next(item for item in components if item.key == "economy")
+    rogue = DashboardSnapshot.objects.create(
+        key="economy",
+        title="newer invalid economy",
+        as_of=current_time,
+        source=ensure_source("internal"),
+        is_published=True,
+        data={
+            "demo": False,
+            "contract_version": DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS[
+                "economy"
+            ],
+        },
+    )
+    assert rogue.created_at > valid_economy.created_at
+
+    outcome = publish_daily_evidence_snapshot(now=current_time)
+
+    assert outcome.ok
+    economy_reference = next(
+        item
+        for item in outcome.snapshot.data["component_snapshots"]
+        if item["page_key"] == "economy"
+    )
+    assert economy_reference["snapshot_id"] == valid_economy.pk
+
+
+@pytest.mark.django_db
+def test_daily_evidence_coordinator_reselects_at_commit_boundary(monkeypatch):
+    current_time = timezone.now()
+    build_daily_components(
+        "commit-boundary-reselection",
+        now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
+    )
+    from research import thesis_publication as publication
+
+    original_selector = publication._select_current_daily_component
+    economy_calls = 0
+
+    def racing_selector(page_key):
+        nonlocal economy_calls
+        if page_key == "economy":
+            economy_calls += 1
+            if economy_calls == 3:
+                return None
+        return original_selector(page_key)
+
+    monkeypatch.setattr(
+        publication,
+        "_select_current_daily_component",
+        racing_selector,
+    )
+
+    outcome = publish_daily_evidence_snapshot(now=current_time)
+
+    assert not outcome.ok
+    assert economy_calls == 3
+    assert "economy: strict component changed at commit boundary" in outcome.errors
+    assert not DashboardSnapshot.objects.filter(key="daily-evidence").exists()
 
 
 @pytest.mark.django_db
@@ -774,6 +1017,7 @@ def test_daily_evidence_coordinator_rejects_incomplete_component_sets(failure):
     components, _metrics = build_daily_components(
         f"coordinator-{failure}",
         now=current_time,
+        component_contract_versions=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
     )
     component = components[0]
     if failure == "stale":
@@ -819,7 +1063,7 @@ def test_daily_evidence_coordinator_rejects_incomplete_component_sets(failure):
 def test_daily_evidence_task_records_missing_components_as_partial():
     result = publish_daily_evidence()
 
-    run = IngestionRun.objects.get(dataset="daily-evidence-v1")
+    run = IngestionRun.objects.get(dataset="daily-evidence-v2")
     assert result["failed"] == 0
     assert result["partial"] == 1
     assert result["row_count"] == 0
@@ -838,6 +1082,260 @@ def _save_rehashed_parent(snapshot: DashboardSnapshot, data: dict) -> None:
     data["fingerprint"] = daily_evidence_payload_fingerprint(data)
     snapshot.data = data
     snapshot.save(update_fields=["data", "updated_at"])
+
+
+@pytest.mark.django_db
+def test_daily_contract_versions_reject_boolean_parent_and_reference_values():
+    legacy, _legacy_metrics = build_daily_evidence("boolean-parent")
+    legacy_data = deepcopy(legacy.data)
+    legacy_data["contract_version"] = True
+    _save_rehashed_parent(legacy, legacy_data)
+
+    legacy_errors = validate_daily_evidence_snapshot(legacy)
+    legacy_metadata = _thesis_snapshot_metadata(
+        Thesis.objects.create(
+            date=timezone.localdate(legacy.created_at),
+            regime="BOOLEAN-PARENT",
+            confidence="低",
+            summary="invalid contract metadata must remain unlabeled",
+            source_snapshot=legacy,
+        )
+    )
+
+    assert "daily-evidence contract version is unsupported" in legacy_errors
+    assert legacy_metadata["contract_version"] is None
+    assert legacy_metadata["contract_label"] == ""
+
+    current, _current_metrics = build_daily_evidence(
+        "boolean-reference",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    current_data = deepcopy(current.data)
+    liquidity_reference = next(
+        item
+        for item in current_data["component_snapshots"]
+        if item["page_key"] == "liquidity"
+    )
+    liquidity_reference["contract_version"] = True
+    _save_rehashed_parent(current, current_data)
+
+    current_errors = validate_daily_evidence_snapshot(current)
+
+    assert "liquidity frozen contract version is not 1" in current_errors
+
+
+@pytest.mark.django_db
+def test_daily_v2_requires_formula_identity_for_strict_children():
+    snapshot, _metrics = build_daily_evidence(
+        "missing-formula-version",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    economy_reference = next(
+        item
+        for item in data["component_snapshots"]
+        if item["page_key"] == "economy"
+    )
+    economy_reference["formula_version"] = None
+    _save_rehashed_parent(snapshot, data)
+
+    errors = validate_daily_evidence_snapshot(snapshot)
+
+    assert (
+        "economy frozen formula version is not "
+        + DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS["economy"]
+    ) in errors
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("page_key", ["economy", "rates"])
+def test_daily_v2_rejects_rehashed_formula_identity_tampering(page_key):
+    snapshot, _metrics = build_daily_evidence(
+        f"tampered-{page_key}-formula",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    reference = next(
+        item
+        for item in data["component_snapshots"]
+        if item["page_key"] == page_key
+    )
+    reference["formula_version"] = "attacker-controlled-formula-v2"
+    _save_rehashed_parent(snapshot, data)
+
+    errors = validate_daily_evidence_snapshot(snapshot)
+
+    assert (
+        f"{page_key} frozen formula version is not "
+        f"{DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS[page_key]}"
+    ) in errors
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("mutation", ["extra-key", "missing-key"])
+def test_daily_v2_reference_schema_rejects_rehashed_shape_changes(mutation):
+    snapshot, _metrics = build_daily_evidence(
+        f"reference-shape-{mutation}",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    economy_reference = next(
+        item
+        for item in data["component_snapshots"]
+        if item["page_key"] == "economy"
+    )
+    if mutation == "extra-key":
+        economy_reference["attacker_note"] = "hashes can be recomputed"
+        expected = "economy frozen v2 reference schema has unexpected fields"
+    else:
+        economy_reference.pop("source_key")
+        expected = "economy frozen v2 reference schema lacks fields"
+    _save_rehashed_parent(snapshot, data)
+
+    errors = validate_daily_evidence_snapshot(snapshot)
+
+    assert any(expected in error for error in errors)
+
+
+@pytest.mark.django_db
+def test_daily_v2_parent_schema_rejects_rehashed_extra_fields():
+    snapshot, _metrics = build_daily_evidence(
+        "parent-extra-key",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    data["unexplained_policy"] = {"allow": True}
+    _save_rehashed_parent(snapshot, data)
+
+    errors = validate_daily_evidence_snapshot(snapshot)
+
+    assert any(
+        "daily-evidence v2 parent schema has unexpected fields" in error
+        for error in errors
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "required-order",
+        "reference-order",
+        "parent-batch-duplicate",
+        "parent-source-duplicate",
+        "reference-batch-order",
+        "reference-source-duplicate",
+        "evidence-id-order",
+        "evidence-item-order",
+        "fourth-evidence",
+    ],
+)
+def test_daily_v2_rejects_noncanonical_ordered_lists(mutation):
+    snapshot, _metrics = build_daily_evidence(
+        f"noncanonical-{mutation}",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    if mutation == "required-order":
+        data["required_components"][0:2] = reversed(
+            data["required_components"][0:2]
+        )
+    elif mutation == "reference-order":
+        data["component_snapshots"][0:2] = reversed(
+            data["component_snapshots"][0:2]
+        )
+    elif mutation == "parent-batch-duplicate":
+        data["component_batches"].append(data["component_batches"][0])
+    elif mutation == "parent-source-duplicate":
+        data["source_keys"].append(data["source_keys"][0])
+    elif mutation == "reference-batch-order":
+        data["component_snapshots"][0]["component_batches"].reverse()
+    elif mutation == "reference-source-duplicate":
+        reference_sources = data["component_snapshots"][0]["source_keys"]
+        reference_sources.append(reference_sources[0])
+    elif mutation == "evidence-id-order":
+        data["evidence_metric_ids"][0:2] = reversed(
+            data["evidence_metric_ids"][0:2]
+        )
+    elif mutation == "evidence-item-order":
+        data["evidence_items"][0:2] = reversed(data["evidence_items"][0:2])
+    else:
+        data["evidence_metric_ids"].append(data["evidence_metric_ids"][0])
+        data["evidence_items"].append(deepcopy(data["evidence_items"][0]))
+    _save_rehashed_parent(snapshot, data)
+
+    assert validate_daily_evidence_snapshot(snapshot)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("mutation", ["extra-key", "missing-key"])
+def test_daily_v2_evidence_item_schema_rejects_rehashed_shape_changes(mutation):
+    snapshot, _metrics = build_daily_evidence(
+        f"evidence-shape-{mutation}",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    evidence = data["evidence_items"][0]
+    if mutation == "extra-key":
+        evidence["attacker_note"] = "rehashed"
+        expected = "evidence-item schema has unexpected fields"
+    else:
+        evidence.pop("source_key")
+        expected = "evidence-item schema lacks fields"
+    _save_rehashed_parent(snapshot, data)
+
+    errors = validate_daily_evidence_snapshot(snapshot)
+
+    assert any(expected in error for error in errors)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("target", "value"),
+    [
+        ("reference", True),
+        ("reference", 1.0),
+        ("reference", "1"),
+        ("reference", 2**63),
+        ("evidence", True),
+        ("evidence", 1.0),
+        ("evidence", "1"),
+        ("evidence", 2**63),
+    ],
+)
+def test_daily_v2_ids_reject_bool_float_numeric_string_and_oversized(
+    target,
+    value,
+):
+    snapshot, _metrics = build_daily_evidence(
+        f"strict-id-{target}-{type(value).__name__}",
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
+    data = deepcopy(snapshot.data)
+    if target == "reference":
+        data["component_snapshots"][0]["snapshot_id"] = value
+    else:
+        data["evidence_metric_ids"][0] = value
+        data["evidence_items"][0]["metric_id"] = value
+    _save_rehashed_parent(snapshot, data)
+
+    assert validate_daily_evidence_snapshot(snapshot)
+
+
+@pytest.mark.django_db
+def test_daily_v1_keeps_numeric_string_id_compatibility():
+    snapshot, _metrics = build_daily_evidence("v1-numeric-string-ids")
+    data = deepcopy(snapshot.data)
+    data["component_snapshots"][0]["snapshot_id"] = str(
+        data["component_snapshots"][0]["snapshot_id"]
+    )
+    data["evidence_metric_ids"][0] = str(data["evidence_metric_ids"][0])
+    data["evidence_items"][0]["metric_id"] = str(
+        data["evidence_items"][0]["metric_id"]
+    )
+    _save_rehashed_parent(snapshot, data)
+
+    assert not validate_daily_evidence_snapshot(snapshot)
 
 
 @pytest.mark.django_db
@@ -956,7 +1454,11 @@ def test_live_gate_rejects_database_child_created_after_parent(late_child):
 def test_old_but_fresh_parent_cannot_generate_a_new_days_draft():
     current_time = timezone.now()
     old_time = current_time - timedelta(days=1)
-    snapshot, _metrics = build_daily_evidence("old-but-fresh", now=old_time)
+    snapshot, _metrics = build_daily_evidence(
+        "old-but-fresh",
+        now=old_time,
+        contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+    )
     data = deepcopy(snapshot.data)
     future_deadline = (current_time + timedelta(days=1)).isoformat()
     for reference in data["component_snapshots"]:

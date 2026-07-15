@@ -16,6 +16,9 @@ from django.db.models.query import QuerySet
 from django.test.utils import CaptureQueriesContext
 
 from research.data_catalog import DATA_REQUIREMENTS
+from research.economy_contract import (
+    _component_payload as _strict_economy_component_payload,
+)
 from research.employment_contract import EMPLOYMENT_BLS_REQUEST_SERIES
 from research.inflation_contract import (
     INFLATION_BLS_DATASET,
@@ -29,6 +32,9 @@ from research.inflation_contract import (
     publish_inflation_revision,
     select_public_inflation_snapshot,
 )
+from research.inflation_contract import (
+    _validate_bls_run as _validate_inflation_bls_run,
+)
 from research.macro_releases import BEAPIOReleaseProvider
 from research.models import (
     DashboardSnapshot,
@@ -41,12 +47,10 @@ from research.models import (
 from research.official_data import (
     APPEND_ONLY_PUBLICATION_KEYS,
     BLS_SERIES,
-    ECONOMY_COMPONENTS,
     INDEPENDENT_PUBLICATION_KEYS,
     INFLATION_PUBLICATION_GROUPS,
     MACRO_REQUIRED_SERIES,
     TREASURY_CURVE_FORMULA_VERSION,
-    _economy_component_payload,
     _inflation_market_expectations_from_real_rates,
     _inflation_page_data,
     _inflation_page_is_buildable,
@@ -234,6 +238,28 @@ def _strict_pio_run(settings, tmp_path, *, cycle: str = "pio-independent"):
 
 def _strict_inflation_runs(settings, tmp_path):
     return _strict_bls_run(settings, tmp_path), _strict_pio_run(settings, tmp_path)
+
+
+@pytest.mark.django_db
+def test_inflation_bls_gate_uses_type_strict_required_metadata(
+    settings,
+    tmp_path,
+):
+    bls_run = _strict_bls_run(settings, tmp_path)
+    baseline = deepcopy(bls_run.metadata)
+    for mutation in ("bool-for-int", "float-for-int", "missing-key"):
+        metadata = deepcopy(baseline)
+        if mutation == "bool-for-int":
+            metadata["official_missing_observation_count"] = False
+        elif mutation == "float-for-int":
+            metadata["start_year"] = 2021.0
+        else:
+            metadata.pop("latest_missing_series")
+        IngestionRun.objects.filter(pk=bls_run.pk).update(metadata=metadata)
+        bls_run.refresh_from_db()
+
+        with pytest.raises(ValueError, match="metadata does not replay"):
+            _validate_inflation_bls_run(bls_run)
 
 
 def _real_rates_snapshot() -> DashboardSnapshot:
@@ -456,18 +482,23 @@ def test_inflation_v2_replays_official_bytes_and_publishes_exact_formula_contrac
     assert selected is not None
     assert selected.pk == snapshot.pk
     assert selected.inflation_publication_state == "current_candidate"
-    component = _economy_component_payload(
+    metric, chart, reference, metric_row = _strict_economy_component_payload(
         "inflation",
-        ECONOMY_COMPONENTS["inflation"],
-        now=FIXED_NOW,
+        snapshot,
     )
-    assert not isinstance(component, dict)
-    reference = component[2]
+    assert metric["key"] == "core-cpi-yoy"
+    assert chart["key"] == "core-cpi-rates"
+    assert reference["selected_metric_snapshot_id"] == metric_row.pk
     assert reference["payload_integrity_hash"] == snapshot.data["payload_integrity_hash"]
     assert reference["contract_version"] == INFLATION_CONTRACT_VERSION
     assert reference["formula_version"] == INFLATION_FORMULA_VERSION
     assert set(reference["component_roles"]) == set(snapshot.data["component_roles"])
     assert reference["source_roles"] == {"bls": "bls", "bea-pio": "bea-pio-release"}
+    assert reference["root_source_keys"] == sorted(snapshot.data["source_keys"])
+    assert reference["root_component_batches"] == sorted(
+        snapshot.data["component_batches"]
+    )
+    assert reference["root_fresh_until"] == snapshot.data["fresh_until"]
 
 
 @pytest.mark.django_db

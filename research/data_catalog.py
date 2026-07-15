@@ -636,9 +636,9 @@ DATA_REQUIREMENTS = [
         "source_name": "U.S. Census Bureau MARTS release workbook",
         "source_url": "https://www.census.gov/retail/sales.html",
         "reason": (
-            "当前可发布零售页使用 Census 官方 Advance Monthly Retail Sales "
-            "发布工作簿，保留原文件哈希、发布状态和环比/同比来源字段。完整 "
-            "1992 起 API 历史仍单列为待 CENSUS_API_KEY 的数据缺口。"
+            "Census 发布工作簿以 append-only 精确批次保留原文件"
+            "哈希、发布状态、当前三项指标和尾部；Census API 只在"
+            "1992-01 起连续且三序列重叠逐项一致时扩展更早历史。"
         ),
         "priority": 1,
     },
@@ -664,9 +664,9 @@ DATA_REQUIREMENTS = [
         "source_name": "U.S. Bureau of Economic Analysis archived PIO releases",
         "source_url": "https://www.bea.gov/news/current-releases",
         "reason": (
-            "当前 Observation 契约会以同一来源和月份覆盖旧值；RawArtifact 哈希能证明"
-            "每次抓取文件，但不等于可查询的 vintage 历史。需增加独立 vintage 维度后"
-            "才能发布修订轨迹。"
+            "当前已按采集批次 append-only 保留 Observation 与精确"
+            "RawArtifact，但尚无将不同批次规范化为可查询修订轨迹的"
+            "跨批次 vintage 产品；因此不对外声明完整修订路径。"
         ),
         "priority": 2,
     },
@@ -706,8 +706,9 @@ DATA_REQUIREMENTS = [
         "source_name": "Federal Reserve and New York Fed archived releases",
         "source_url": "https://www.federalreserve.gov/releases/g19/revisions.htm",
         "reason": (
-            "当前库保留每次下载文件哈希，但同一来源与观测期的数值会更新为"
-            "最新官方历史。需增加独立 vintage 维度后才能发布批次间修订。"
+            "G.19 与 HHDC 已按批次 append-only 保留完整 Observation "
+            "和原文件哈希，但尚无规范化的跨批次 vintage 产品；"
+            "批次重放能证明当时数值，不等于已发布官方修订轨迹。"
         ),
         "priority": 2,
     },

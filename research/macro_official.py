@@ -54,6 +54,17 @@ CENSUS_MARTS_FIELDS = (
 CENSUS_MARTS_RESPONSE_HEADERS = (*CENSUS_MARTS_FIELDS, "time")
 
 
+def _census_api_series_id(
+    category_code: str,
+    adjustment_code: str,
+    suffix: str | None = None,
+) -> str:
+    """Return the source-qualified acquisition identity for Census API rows."""
+
+    base = f"CENSUS-API-MRTS-{category_code}-SM-{adjustment_code}"
+    return f"{base}-{suffix}" if suffix else base
+
+
 def _decimal_or_none(value: Any) -> Decimal | None:
     if value in (None, "", ".", "--", "---", "NA", "N/A", "(NA)"):
         return None
@@ -361,7 +372,6 @@ class CensusMARTSProvider(HTTPProvider):
             return ProviderResult.failure(self.key, dataset, "invalid MARTS category_code")
 
         requested_time = str(time).strip()
-        fetched_at = datetime.now(UTC)
         fields = ",".join(CENSUS_MARTS_FIELDS)
         params = {
             "get": fields,
@@ -375,6 +385,7 @@ class CensusMARTSProvider(HTTPProvider):
             response = self.client.get(CENSUS_MARTS_ENDPOINT, params=params)
             response.raise_for_status()
             raw_content = response.content
+            fetched_at = datetime.now(UTC)
             parsed_url = urlparse(str(response.url))
             returned_query = parse_qs(parsed_url.query, keep_blank_values=True)
             if (
@@ -524,6 +535,7 @@ class CensusMARTSProvider(HTTPProvider):
             "require_complete_history": request_witness[
                 "require_complete_history"
             ],
+            "retrieved_at": retrieved_at.isoformat(),
         }
 
     @classmethod
@@ -614,7 +626,10 @@ class CensusMARTSProvider(HTTPProvider):
             source_fields = level["source_fields"]
             records.append(
                 {
-                    "series_id": f"CENSUS-MRTS-{category_code}-SM-{adjustment_code}",
+                    "series_id": _census_api_series_id(
+                        category_code,
+                        adjustment_code,
+                    ),
                     "date": period.isoformat(),
                     "value": level["value"],
                     "metadata": {
@@ -648,8 +663,10 @@ class CensusMARTSProvider(HTTPProvider):
                 ).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
                 records.append(
                     {
-                        "series_id": (
-                            f"CENSUS-MRTS-{category_code}-SM-{adjustment_code}-{suffix}"
+                        "series_id": _census_api_series_id(
+                            category_code,
+                            adjustment_code,
+                            suffix,
                         ),
                         "date": period.isoformat(),
                         "value": derived,
@@ -661,7 +678,10 @@ class CensusMARTSProvider(HTTPProvider):
                             "calculation_owner": "Atlas Macro",
                             "formula": f"(level_t / level_t-{months} - 1) * 100",
                             "input_series": [
-                                f"CENSUS-MRTS-{category_code}-SM-{adjustment_code}"
+                                _census_api_series_id(
+                                    category_code,
+                                    adjustment_code,
+                                )
                             ],
                             "input_value_dates": [
                                 prior_period.isoformat(),

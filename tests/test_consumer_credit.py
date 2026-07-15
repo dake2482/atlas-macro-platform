@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
 import httpx
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
+import research.official_data as official_data
+from research.consumer_contract import _validate_run
 from research.consumer_credit import (
     G19_SERIES,
     FederalReserveG19Provider,
@@ -16,7 +20,7 @@ from research.consumer_credit import (
 )
 from research.models import IngestionRun, Observation, RawArtifact
 from research.official_data import _store_consumer_credit_observations_v2
-from research.raw_evidence import parse_evidence_bundle
+from research.raw_evidence import EvidenceResponse, build_evidence_bundle, parse_evidence_bundle
 from research.services import record_provider_result
 
 
@@ -34,8 +38,6 @@ def _g19_csv() -> bytes:
         ["2026-05", "-0.04", "-4.71", "1.61", "5154538.86", "1344207.79", "3810331.07", "-182.45", "-5297.84", "5115.39"],
     ]
     output = io.StringIO()
-    import csv
-
     csv.writer(output, lineterminator="\n").writerows(rows)
     return output.getvalue().encode()
 
@@ -52,13 +54,18 @@ def _g19_page() -> bytes:
     ).encode()
 
 
-def _g19_client(csv_payload: bytes | None = None) -> httpx.Client:
+def _g19_client(
+    csv_payload: bytes | None = None,
+    *,
+    page_payload: bytes | None = None,
+) -> httpx.Client:
     payload = csv_payload or _g19_csv()
+    page = page_payload or _g19_page()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("Choose.aspx"):
             assert request.url.params["rel"] == "G19"
-            return httpx.Response(200, content=_g19_page(), headers={"content-type": "text/html"})
+            return httpx.Response(200, content=page, headers={"content-type": "text/html"})
         assert request.url.path.endswith("Output.aspx")
         assert request.url.params["series"] == "test-package"
         return httpx.Response(200, content=payload, headers={"content-type": "text/csv"})
@@ -103,6 +110,72 @@ def _hhdc_workbook(
     output = io.BytesIO()
     workbook.save(output)
     return output.getvalue()
+
+
+def _mutate_hhdc_workbook(payload: bytes, mutation: str) -> bytes:
+    workbook = load_workbook(io.BytesIO(payload))
+    if mutation == "duplicate-header":
+        workbook["Page 3 Data"].cell(4, 9, "Mortgage")
+    elif mutation == "invalid-value":
+        workbook["Page 3 Data"].cell(5, 2, "not-a-number")
+    elif mutation == "later-start":
+        workbook["Page 3 Data"].cell(5, 2).value = None
+    elif mutation == "started-gap":
+        sheet = workbook["Page 3 Data"]
+        sheet.insert_rows(5)
+        for column, value in enumerate(
+            ["25:Q3", 13.0, 0.42, 1.65, 1.25, 1.64, 0.55, 18.56],
+            start=1,
+        ):
+            sheet.cell(5, column, value)
+        sheet.cell(6, 2).value = None
+    elif mutation == "entirely-missing":
+        workbook["Page 3 Data"].cell(6, 2).value = None
+        workbook["Page 3 Data"].cell(5, 2).value = None
+    elif mutation == "duplicate-quarter":
+        workbook["Page 12 Data"].cell(6, 1, "25:Q4")
+    elif mutation == "quarter-gap":
+        workbook["Page 12 Data"].cell(5, 1, "25:Q3")
+    else:
+        raise AssertionError(f"unknown HHDC mutation: {mutation}")
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+def _retime_evidence_bundle(
+    raw_bytes: bytes,
+    *,
+    provider: str,
+    dataset: str,
+    retrieved_at: str,
+    payload_overrides: dict[str, bytes] | None = None,
+) -> bytes:
+    evidence = parse_evidence_bundle(
+        raw_bytes,
+        expected_provider=provider,
+        expected_dataset=dataset,
+    )
+    overrides = payload_overrides or {}
+    responses = []
+    for entry in evidence.manifest["responses"]:
+        role = entry["role"]
+        responses.append(
+            EvidenceResponse(
+                role=role,
+                url=entry["url"],
+                content_type=entry["content_type"],
+                raw_bytes=overrides.get(role, evidence.responses[role]),
+                request_witness=entry["request_witness"],
+                response_witness={"retrieved_at": retrieved_at},
+            )
+        )
+    return build_evidence_bundle(
+        provider=provider,
+        dataset=dataset,
+        responses=tuple(responses),
+    )[0]
 
 
 def _hhdc_client(workbook: bytes, *, filename_quarter: str = "2026q1") -> httpx.Client:
@@ -192,6 +265,109 @@ def test_g19_provider_rejects_wrong_declared_unit_or_multiplier(
     assert "source unit or multiplier is invalid" in result.error
 
 
+def test_g19_provider_rejects_noncanonical_package_parameters():
+    page = _g19_page().replace(b"lastObs=", b"lastObs=1", 1)
+
+    result = FederalReserveG19Provider(
+        client=_g19_client(page_payload=page)
+    ).consumer_credit()
+
+    assert not result.ok
+    assert "package parameters are incomplete" in result.error
+
+
+@pytest.mark.parametrize(
+    ("violation", "message"),
+    [
+        ("header", "metadata headers are invalid"),
+        ("row-width", "row width"),
+        ("currency", "source currency is invalid"),
+        ("started-tail-gap", "missing month after starting"),
+        ("started-gap", "missing month after starting"),
+        ("entirely-missing", "entirely missing required series"),
+        ("non-month-data", "non-month row contains required values"),
+        ("duplicate-month", "duplicated a monthly period"),
+        ("month-gap", "missing month"),
+    ],
+)
+def test_g19_provider_rejects_structural_and_history_fallbacks(violation, message):
+    rows = list(csv.reader(io.StringIO(_g19_csv().decode())))
+    if violation == "header":
+        rows[3][0] = "Currency"
+    elif violation == "row-width":
+        rows[-1].pop()
+    elif violation == "currency":
+        rows[3][1] = "EUR"
+    elif violation == "started-tail-gap":
+        rows[-1][1] = ""
+    elif violation == "started-gap":
+        earlier = ["2026-03", *rows[6][1:]]
+        rows.insert(6, earlier)
+        rows[7][1] = ""
+    elif violation == "entirely-missing":
+        for row in rows[6:]:
+            row[1] = ""
+    elif violation == "non-month-data":
+        rows[-1][0] = "source note"
+    elif violation == "duplicate-month":
+        rows[-1][0] = rows[-2][0]
+    else:
+        rows[6][0] = "2026-03"
+    output = io.StringIO()
+    csv.writer(output, lineterminator="\n").writerows(rows)
+
+    result = FederalReserveG19Provider(
+        client=_g19_client(output.getvalue().encode())
+    ).consumer_credit()
+
+    assert not result.ok
+    assert message in result.error
+
+
+def test_g19_provider_allows_required_series_to_start_later():
+    rows = list(csv.reader(io.StringIO(_g19_csv().decode())))
+    rows[6][1] = ""
+    output = io.StringIO()
+    csv.writer(output, lineterminator="\n").writerows(rows)
+
+    result = FederalReserveG19Provider(
+        client=_g19_client(output.getvalue().encode())
+    ).consumer_credit()
+
+    assert result.ok
+    assert result.row_count == 17
+    total_growth = [
+        record
+        for record in result.records
+        if record["series_id"] == "G19-CONSUMER-CREDIT-GROWTH-SAAR"
+    ]
+    assert [record["date"] for record in total_growth] == ["2026-05-01"]
+
+
+def test_g19_replay_rejects_observation_month_after_retrieval_date():
+    result = FederalReserveG19Provider(client=_g19_client()).consumer_credit()
+    assert result.ok
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="federal-reserve-g19",
+        expected_dataset="consumer-credit",
+    )
+    earlier_release_page = evidence.responses["choose-page"].replace(
+        b"July 8, 2026",
+        b"April 8, 2026",
+    )
+    replay_bundle = _retime_evidence_bundle(
+        result.raw_bytes,
+        provider="federal-reserve-g19",
+        dataset="consumer-credit",
+        retrieved_at="2026-04-30T12:00:00+00:00",
+        payload_overrides={"choose-page": earlier_release_page},
+    )
+
+    with pytest.raises(ValueError, match="observation period is in the future"):
+        FederalReserveG19Provider.replay_evidence_bundle(replay_bundle)
+
+
 def test_nyfed_provider_discovers_latest_workbook_and_preserves_attribution():
     payload = _hhdc_workbook()
     result = NYFedHouseholdDebtProvider(
@@ -229,7 +405,7 @@ def test_nyfed_provider_discovers_latest_workbook_and_preserves_attribution():
 
 def test_nyfed_provider_rejects_filename_and_workbook_period_mismatch():
     result = NYFedHouseholdDebtProvider(
-        client=_hhdc_client(_hhdc_workbook(latest_quarter="25:Q4"))
+        client=_hhdc_client(_hhdc_workbook(), filename_quarter="2025q4")
     ).household_debt()
 
     assert not result.ok
@@ -250,6 +426,64 @@ def test_nyfed_provider_rejects_wrong_declared_workbook_units(workbook):
 
     assert not result.ok
     assert "declared unit is invalid" in result.error
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("duplicate-header", "duplicated a column header"),
+        ("invalid-value", "required value is invalid"),
+        ("started-gap", "missing quarter after starting"),
+        ("entirely-missing", "entirely missing required series"),
+        ("duplicate-quarter", "duplicated a quarterly period"),
+        ("quarter-gap", "missing quarter"),
+    ],
+)
+def test_nyfed_provider_rejects_structural_and_quarter_history_fallbacks(
+    mutation,
+    message,
+):
+    payload = _mutate_hhdc_workbook(_hhdc_workbook(), mutation)
+
+    result = NYFedHouseholdDebtProvider(
+        client=_hhdc_client(payload)
+    ).household_debt()
+
+    assert not result.ok
+    assert message in result.error
+
+
+def test_nyfed_provider_allows_required_series_to_start_later():
+    payload = _mutate_hhdc_workbook(_hhdc_workbook(), "later-start")
+
+    result = NYFedHouseholdDebtProvider(
+        client=_hhdc_client(payload)
+    ).household_debt()
+
+    assert result.ok
+    assert result.row_count == 27
+    mortgage = [
+        record
+        for record in result.records
+        if record["series_id"] == "HHDC-MORTGAGE-BALANCE"
+    ]
+    assert [record["date"] for record in mortgage] == ["2026-03-31"]
+
+
+def test_nyfed_replay_rejects_quarter_end_after_retrieval_date():
+    result = NYFedHouseholdDebtProvider(
+        client=_hhdc_client(_hhdc_workbook())
+    ).household_debt()
+    assert result.ok
+    replay_bundle = _retime_evidence_bundle(
+        result.raw_bytes,
+        provider="ny-fed-household-credit",
+        dataset="household-debt-credit",
+        retrieved_at="2026-03-01T12:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="observation period is in the future"):
+        NYFedHouseholdDebtProvider.replay_evidence_bundle(replay_bundle)
 
 
 @pytest.mark.django_db
@@ -311,6 +545,85 @@ def test_consumer_credit_v2_persists_private_append_only_evidence(
         .order_by("pk")
         .values_list("pk", "value", "updated_at")
     ) == first_g19_rows
+
+
+@pytest.mark.django_db
+def test_g19_signed_zero_persists_and_replays_without_masking_nonzero_tamper(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    signed_zero_csv = _g19_csv().replace(
+        b"2026-04,4.87,",
+        b"2026-04,-0.00000000,",
+        1,
+    )
+    result = FederalReserveG19Provider(
+        client=_g19_client(signed_zero_csv)
+    ).consumer_credit()
+    expected = next(
+        record
+        for record in result.records
+        if record["series_id"] == "G19-CONSUMER-CREDIT-GROWTH-SAAR"
+        and record["date"] == "2026-04-01"
+    )
+    assert expected["value"].is_zero() and expected["value"].is_signed()
+
+    run = record_provider_result(
+        result,
+        persist=_store_consumer_credit_observations_v2,
+    )
+    assert run.status == IngestionRun.Status.SUCCESS, run.error
+    stored = Observation.objects.get(
+        batch_id=run.batch_id,
+        series__key="g19-consumer-credit-growth-saar",
+        value_date__date=date(2026, 4, 1),
+    )
+    assert stored.value == Decimal("0")
+    assert _validate_run("g19", run).run.pk == run.pk
+
+    stored.value = Decimal("0.00000001")
+    stored.save(update_fields=["value", "updated_at"])
+    with pytest.raises(ValueError, match="normalized rows do not match exact evidence"):
+        _validate_run("g19", run)
+
+
+@pytest.mark.django_db
+def test_g19_signed_zero_persistence_rejects_one_database_quantum_tamper(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    signed_zero_csv = _g19_csv().replace(
+        b"2026-04,4.87,",
+        b"2026-04,-0.00000000,",
+        1,
+    )
+    original_store = official_data.store_series_observations
+
+    def tampering_store(result, source, run, **kwargs):
+        row_count = original_store(result, source, run, **kwargs)
+        Observation.objects.filter(
+            batch_id=run.batch_id,
+            series__key="g19-consumer-credit-growth-saar",
+            value_date__date=date(2026, 4, 1),
+        ).update(value=Decimal("0.00000001"))
+        return row_count
+
+    monkeypatch.setattr(official_data, "store_series_observations", tampering_store)
+    result = FederalReserveG19Provider(
+        client=_g19_client(signed_zero_csv)
+    ).consumer_credit()
+    run = record_provider_result(
+        result,
+        persist=_store_consumer_credit_observations_v2,
+    )
+
+    assert run.status == IngestionRun.Status.FAILED
+    assert "persistence postcondition failed" in run.error
+    assert not Observation.objects.filter(batch_id=run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=run).exists()
 
 
 @pytest.mark.django_db

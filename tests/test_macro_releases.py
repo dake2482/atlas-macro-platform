@@ -16,12 +16,10 @@ from django.db.models.query import QuerySet
 from django.test.utils import CaptureQueriesContext
 from openpyxl import Workbook
 
-from research.consumer_credit import (
-    G19_SERIES,
-    HHDC_BALANCE_SERIES,
-    HHDC_DELINQUENCY_SERIES,
-)
 from research.data_catalog import DATA_REQUIREMENTS
+from research.economy_contract import (
+    _component_payload as _strict_economy_component_payload,
+)
 from research.macro_contract import (
     GDP_CONTRACT_VERSION,
     GDP_REQUIRED_CHART_KEYS,
@@ -55,22 +53,22 @@ from research.models import (
     SeriesDefinition,
 )
 from research.official_data import (
-    ECONOMY_COMPONENTS,
     MACRO_PUBLICATION_GROUPS,
-    _economy_component_payload,
     _keys_with_current_required_batches,
-    _mark_latest_dashboards_stale,
     _publish_dashboard,
     _publishable_keys_for_source_groups,
     _record_and_coordinate_gdp_result,
-    _record_census_revision_witness,
     _store_bea_release_observations_v2,
     _store_census_marts_observations_v2,
     _store_release_workbook_observations,
     publish_official_dashboards,
 )
 from research.providers import ProviderResult
-from research.raw_evidence import parse_evidence_bundle
+from research.raw_evidence import (
+    EvidenceResponse,
+    build_evidence_bundle,
+    parse_evidence_bundle,
+)
 from research.services import (
     begin_ingestion,
     ensure_source,
@@ -84,79 +82,6 @@ def _workbook_bytes(workbook: Workbook) -> bytes:
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
-
-
-def _consumer_credit_results() -> tuple[ProviderResult, ProviderResult]:
-    g19_records = []
-    for period, offset in (("2026-04-01", Decimal("0")), ("2026-05-01", Decimal("1"))):
-        for index, (_, (series_id, _)) in enumerate(G19_SERIES.items(), start=1):
-            g19_records.append(
-                {
-                    "series_id": series_id,
-                    "date": period,
-                    "value": Decimal(index) + offset,
-                }
-            )
-    household_records = []
-    household_series = [
-        *HHDC_BALANCE_SERIES.values(),
-        *HHDC_DELINQUENCY_SERIES.values(),
-    ]
-    for period, offset in (("2025-12-31", Decimal("0")), ("2026-03-31", Decimal("1"))):
-        for index, series_id in enumerate(household_series, start=1):
-            household_records.append(
-                {
-                    "series_id": series_id,
-                    "date": period,
-                    "value": Decimal(index) + offset,
-                }
-            )
-    return (
-        ProviderResult(
-            provider="federal-reserve-g19",
-            dataset="g19-fixture",
-            records=g19_records,
-        ),
-        ProviderResult(
-            provider="ny-fed-household-credit",
-            dataset="hhdc-fixture",
-            records=household_records,
-        ),
-    )
-
-
-def _census_api_result() -> ProviderResult:
-    records = []
-    values = {
-        "2026-03-01": ("754013", "1.7", "4.2"),
-        "2026-04-01": ("757036", "0.4", "4.8"),
-        "2026-05-01": ("763705", "0.9", "6.9"),
-    }
-    for period, (level, mom, yoy) in values.items():
-        records.extend(
-            [
-                {
-                    "series_id": "CENSUS-MRTS-44X72-SM-SA",
-                    "date": period,
-                    "value": level,
-                },
-                {
-                    "series_id": "CENSUS-MRTS-44X72-SM-SA-MOM",
-                    "date": period,
-                    "value": mom,
-                },
-                {
-                    "series_id": "CENSUS-MRTS-44X72-SM-SA-YOY",
-                    "date": period,
-                    "value": yoy,
-                },
-            ]
-        )
-    return ProviderResult(
-        provider="census",
-        dataset="marts:44X72:SM:yes",
-        records=records,
-    )
 
 
 def _bea_vintage_workbook() -> bytes:
@@ -524,8 +449,10 @@ def _bea_client(vintage: bytes, comparisons: bytes) -> httpx.Client:
 
 def _census_client(workbook: bytes, *, current_status: int = 403) -> httpx.Client:
     latest = f"{CENSUS_MARTS_INDEX}rs2604.xlsx"
+    index_seen = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal index_seen
         url = str(request.url)
         if url == CENSUS_MARTS_CURRENT_WORKBOOK:
             if current_status == 200:
@@ -539,6 +466,7 @@ def _census_client(workbook: bytes, *, current_status: int = 403) -> httpx.Clien
                 )
             return httpx.Response(current_status, text="current workbook unavailable")
         if url == CENSUS_MARTS_INDEX:
+            index_seen = True
             return httpx.Response(
                 200,
                 text=(
@@ -549,14 +477,49 @@ def _census_client(workbook: bytes, *, current_status: int = 403) -> httpx.Clien
                 headers={"content-type": "text/html"},
             )
         if url == latest:
+            if not index_seen:
+                return httpx.Response(404, text="probe candidate unavailable")
             return httpx.Response(
                 200,
                 content=workbook,
                 headers={"content-type": XLSX_CONTENT_TYPE, "last-modified": "May 15, 2026"},
             )
+        if url.startswith(CENSUS_MARTS_INDEX) and url.endswith(".xlsx"):
+            return httpx.Response(404, text="probe candidate unavailable")
         raise AssertionError(f"unexpected URL: {url}")
 
     return httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+
+def _rebuild_census_evidence(
+    raw_bytes: bytes,
+    mutate,
+) -> bytes:
+    evidence = parse_evidence_bundle(
+        raw_bytes,
+        expected_provider="census-release",
+        expected_dataset="marts:retail-food-services",
+    )
+    responses = []
+    for original in evidence.manifest["responses"]:
+        entry = deepcopy(original)
+        if mutate(entry) is False:
+            continue
+        responses.append(
+            EvidenceResponse(
+                role=entry["role"],
+                url=entry["url"],
+                content_type=entry["content_type"],
+                raw_bytes=evidence.responses[original["role"]],
+                request_witness=entry["request_witness"],
+                response_witness=entry["response_witness"],
+            )
+        )
+    return build_evidence_bundle(
+        provider="census-release",
+        dataset="marts:retail-food-services",
+        responses=responses,
+    )[0]
 
 
 def _bea_pio_client(summary: bytes, section2: bytes) -> httpx.Client:
@@ -846,7 +809,13 @@ def test_bea_gdp_v2_keeps_private_bundle_and_append_only_release_vintages(
     assert second.status == IngestionRun.Status.SUCCESS
     assert second.batch_id != first.batch_id
     assert RawArtifact.objects.filter(run__in=(first, second)).count() == 2
-    assert RawArtifact.objects.get(run=second).sha256 == first_artifact.sha256
+    second_artifact = RawArtifact.objects.get(run=second)
+    second_path = (
+        Path(settings.RAW_ARTIFACT_ROOT)
+        / second_artifact.sha256[:2]
+        / f"{second_artifact.sha256}.bin"
+    )
+    assert second_path.read_bytes() == second_result.raw_bytes
     assert Observation.objects.filter(batch_id=second.batch_id).count() == len(
         second_result.records
     )
@@ -914,13 +883,19 @@ def test_gdp_v2_dedicated_publisher_selector_and_route(
     assert selected.pk == snapshot.pk
     assert selected.gdp_publication_state == "current_candidate"
     assert gdp_snapshot_is_publicly_displayable(snapshot)
-    economy_component = _economy_component_payload(
+    metric, chart, reference, metric_row = _strict_economy_component_payload(
         "gdp",
-        ECONOMY_COMPONENTS["gdp"],
-        now=datetime.fromisoformat(snapshot.data["fresh_until"])
-        - timedelta(seconds=1),
+        snapshot,
     )
-    assert isinstance(economy_component, tuple)
+    assert metric["key"] == "bea-a191rl"
+    assert chart["key"] == "gdp-growth-history"
+    assert reference["snapshot_id"] == snapshot.pk
+    assert reference["selected_metric_snapshot_id"] == metric_row.pk
+    assert reference["root_source_keys"] == sorted(snapshot.data["source_keys"])
+    assert reference["root_component_batches"] == sorted(
+        snapshot.data["component_batches"]
+    )
+    assert reference["root_fresh_until"] == snapshot.data["fresh_until"]
 
     response = client.get("/economy/gdp/")
     body = response.content.decode()
@@ -1619,6 +1594,17 @@ def test_census_release_replay_rechecks_xlsx_expanded_size(monkeypatch):
         CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
 
 
+def test_census_release_replay_rechecks_compressed_workbook_size(monkeypatch):
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    assert result.ok
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_workbook_bytes", 1)
+
+    with pytest.raises(ValueError, match="evidence contract"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
 @pytest.mark.parametrize(
     "workbook",
     [
@@ -1639,7 +1625,7 @@ def test_census_release_provider_rejects_wrong_declared_units(workbook):
     assert "declared unit is invalid" in result.error
 
 
-def test_census_release_provider_falls_back_to_latest_archive_file():
+def test_census_release_provider_falls_back_to_latest_archive_file(monkeypatch):
     workbook = _census_workbook()
     result = CensusMARTSReleaseProvider(client=_census_client(workbook)).monthly_retail_sales()
 
@@ -1647,13 +1633,21 @@ def test_census_release_provider_falls_back_to_latest_archive_file():
     assert result.metadata["workbook_url"].endswith("rs2604.xlsx")
     assert result.metadata["workbook_scope"] == "historical_archive"
     assert result.metadata["latest_value_date"] == "2026-04-01"
-    assert result.metadata["artifacts"][1]["sha256"] == hashlib.sha256(workbook).hexdigest()
+    assert result.metadata["artifacts"][-1]["sha256"] == hashlib.sha256(workbook).hexdigest()
     evidence = parse_evidence_bundle(
         result.raw_bytes,
         expected_provider="census-release",
         expected_dataset="marts:retail-food-services",
     )
-    assert set(evidence.responses) == {"archive-index", "archive-workbook"}
+    assert set(evidence.responses) == {
+        "current-workbook-failure",
+        "recent-probe-01",
+        "recent-probe-02",
+        "recent-probe-03",
+        "recent-probe-04",
+        "archive-index",
+        "archive-workbook",
+    }
     assert evidence.responses["archive-workbook"] == workbook
     assert b"rs2604.xlsx" in evidence.responses["archive-index"]
     replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
@@ -1661,6 +1655,14 @@ def test_census_release_provider_falls_back_to_latest_archive_file():
     )
     assert replay_records == result.records
     assert replay_metadata["workbook_scope"] == "historical_archive"
+
+    def regress_archive_time(entry):
+        if entry["role"] == "archive-workbook":
+            entry["response_witness"]["retrieved_at"] = "2000-01-01T00:00:00+00:00"
+
+    regressed = _rebuild_census_evidence(result.raw_bytes, regress_archive_time)
+    with pytest.raises(ValueError, match="chronology regressed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(regressed)
     by_series_and_date = {
         (item["series_id"], item["date"]): item for item in result.records
     }
@@ -1676,6 +1678,312 @@ def test_census_release_provider_falls_back_to_latest_archive_file():
     assert by_series_and_date[("CENSUS-MRTS-44X72-SM-SA-MOM", "2026-04-01")][
         "metadata"
     ]["estimate_status"] == "(a)"
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_workbook_bytes", 1)
+    with pytest.raises(ValueError, match="archive evidence contract"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
+def test_census_release_recent_probe_beats_stale_archive_index(monkeypatch):
+    workbook = _census_current_workbook()
+    anchor = datetime(2026, 7, 16, tzinfo=UTC)
+    monkeypatch.setattr(
+        CensusMARTSReleaseProvider,
+        "_utc_now",
+        staticmethod(lambda: anchor),
+    )
+    candidates = CensusMARTSReleaseProvider._recent_archive_candidates(anchor)
+    may_url = next(url for month, url in candidates if month == "2026-05")
+    attempted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        attempted.append(url)
+        if url == CENSUS_MARTS_CURRENT_WORKBOOK:
+            return httpx.Response(403, text="current workbook unavailable")
+        if url == may_url:
+            return httpx.Response(
+                200,
+                content=workbook,
+                headers={
+                    "content-type": XLSX_CONTENT_TYPE,
+                    "last-modified": "July 15, 2026",
+                },
+            )
+        if url.startswith(CENSUS_MARTS_INDEX) and url.endswith(".xlsx"):
+            return httpx.Response(404, text="not yet published")
+        if url == CENSUS_MARTS_INDEX:
+            return httpx.Response(
+                200,
+                text='<html><a href="rs2604.xlsx">stale latest</a></html>',
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    result = CensusMARTSReleaseProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        )
+    ).monthly_retail_sales()
+
+    assert result.ok
+    assert result.metadata["workbook_url"] == may_url
+    assert result.metadata["workbook_scope"] == "recent_archive_probe"
+    assert result.metadata["latest_value_date"] == "2026-05-01"
+    assert CENSUS_MARTS_INDEX not in attempted
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="census-release",
+        expected_dataset="marts:retail-food-services",
+    )
+    assert set(evidence.responses) == {
+        "current-workbook-failure",
+        "recent-probe-01",
+        "recent-probe-02",
+    }
+    responses = {
+        item["role"]: item for item in evidence.manifest["responses"]
+    }
+    assert responses["current-workbook-failure"]["response_witness"][
+        "status_code"
+    ] == 403
+    assert responses["recent-probe-01"]["response_witness"]["status_code"] == 404
+    response = responses["recent-probe-02"]
+    assert response["request_witness"]["candidate_month"] == "2026-05"
+    assert response["request_witness"]["candidate_rank"] == 2
+    assert response["url"] == may_url
+    replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["workbook_scope"] == "recent_archive_probe"
+
+    missing_failure = _rebuild_census_evidence(
+        result.raw_bytes,
+        lambda entry: entry["role"] != "recent-probe-01",
+    )
+    with pytest.raises(ValueError, match="not consecutive"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(missing_failure)
+
+    def fake_rank(entry):
+        if entry["role"] == "recent-probe-02":
+            entry["request_witness"]["candidate_rank"] = 1
+
+    forged_rank = _rebuild_census_evidence(result.raw_bytes, fake_rank)
+    with pytest.raises(ValueError, match="request chain"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(forged_rank)
+
+    def future_anchor(entry):
+        if entry["role"].startswith("recent-probe-"):
+            rank = entry["request_witness"]["candidate_rank"]
+            future_candidates = CensusMARTSReleaseProvider._recent_archive_candidates(
+                datetime(2079, 1, 1, tzinfo=UTC)
+            )
+            entry["request_witness"]["probe_anchor_month"] = "2079-01"
+            entry["request_witness"]["candidate_month"] = future_candidates[rank - 1][0]
+            entry["url"] = future_candidates[rank - 1][1]
+            entry["response_witness"]["retrieved_at"] = "2079-01-15T12:00:00+00:00"
+
+    forged_future = _rebuild_census_evidence(result.raw_bytes, future_anchor)
+    with pytest.raises(ValueError, match="future"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(forged_future)
+
+    missing_current = _rebuild_census_evidence(
+        result.raw_bytes,
+        lambda entry: entry["role"] != "current-workbook-failure",
+    )
+    with pytest.raises(ValueError, match="roles"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(missing_current)
+
+    def current_after_probe(entry):
+        if entry["role"] == "current-workbook-failure":
+            entry["response_witness"]["retrieved_at"] = (
+                anchor + timedelta(minutes=1)
+            ).isoformat()
+
+    regressed_from_current = _rebuild_census_evidence(
+        result.raw_bytes,
+        current_after_probe,
+    )
+    with pytest.raises(ValueError, match="chronology regressed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(regressed_from_current)
+
+    def first_probe_after_second(entry):
+        if entry["role"] == "recent-probe-01":
+            entry["response_witness"]["retrieved_at"] = (
+                anchor + timedelta(minutes=1)
+            ).isoformat()
+
+    regressed_between_probes = _rebuild_census_evidence(
+        result.raw_bytes,
+        first_probe_after_second,
+    )
+    with pytest.raises(ValueError, match="chronology regressed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(regressed_between_probes)
+
+    def mismatched_anchor(entry):
+        if entry["role"].startswith("recent-probe-"):
+            rank = entry["request_witness"]["candidate_rank"]
+            candidates = CensusMARTSReleaseProvider._recent_archive_candidates(
+                datetime(2026, 6, 1, tzinfo=UTC)
+            )
+            entry["request_witness"]["probe_anchor_month"] = "2026-06"
+            entry["request_witness"]["candidate_month"] = candidates[rank - 1][0]
+            entry["url"] = candidates[rank - 1][1]
+
+    anchor_mismatch = _rebuild_census_evidence(
+        result.raw_bytes,
+        mismatched_anchor,
+    )
+    with pytest.raises(ValueError, match="anchor is not bound"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(anchor_mismatch)
+
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_workbook_bytes", 1)
+    with pytest.raises(ValueError, match="success content type"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("forbidden", "non-terminal HTTP 403"),
+        ("network", "lacks an exact response"),
+        ("redirect", "left its exact official URL"),
+        ("malformed", "failed strict workbook validation"),
+    ],
+)
+def test_census_recent_probe_fails_closed_without_directory_fallback(
+    monkeypatch,
+    mode,
+    message,
+):
+    anchor = datetime(2026, 7, 16, tzinfo=UTC)
+    monkeypatch.setattr(
+        CensusMARTSReleaseProvider,
+        "_utc_now",
+        staticmethod(lambda: anchor),
+    )
+    first_url = CensusMARTSReleaseProvider._recent_archive_candidates(anchor)[0][1]
+    redirected_url = f"{first_url}?redirected=1"
+    attempted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        attempted.append(url)
+        if url == CENSUS_MARTS_CURRENT_WORKBOOK:
+            return httpx.Response(403, text="current workbook unavailable")
+        if url == first_url:
+            if mode == "forbidden":
+                return httpx.Response(403, text="forbidden")
+            if mode == "network":
+                raise httpx.ConnectError("probe transport failed", request=request)
+            if mode == "redirect":
+                return httpx.Response(302, headers={"location": redirected_url})
+            return httpx.Response(
+                200,
+                content=b"<html>not an XLSX workbook</html>",
+                headers={"content-type": XLSX_CONTENT_TYPE},
+            )
+        if url == redirected_url:
+            return httpx.Response(404, text="redirect target")
+        if url == CENSUS_MARTS_INDEX:
+            raise AssertionError("directory fallback must not run")
+        raise AssertionError(f"unexpected URL: {url}")
+
+    result = CensusMARTSReleaseProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        )
+    ).monthly_retail_sales()
+
+    assert not result.ok
+    assert message in result.error
+    assert CENSUS_MARTS_INDEX not in attempted
+
+
+def test_census_release_recent_probe_rejects_filename_content_month_mismatch(monkeypatch):
+    april_workbook = _census_workbook()
+    anchor = datetime(2026, 7, 16, tzinfo=UTC)
+    monkeypatch.setattr(
+        CensusMARTSReleaseProvider,
+        "_utc_now",
+        staticmethod(lambda: anchor),
+    )
+    candidates = CensusMARTSReleaseProvider._recent_archive_candidates(anchor)
+    may_url = next(url for month, url in candidates if month == "2026-05")
+    attempted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        attempted.append(url)
+        if url == CENSUS_MARTS_CURRENT_WORKBOOK:
+            return httpx.Response(403, text="current workbook unavailable")
+        if url == may_url:
+            return httpx.Response(
+                200,
+                content=april_workbook,
+                headers={"content-type": XLSX_CONTENT_TYPE},
+            )
+        if url.startswith(CENSUS_MARTS_INDEX) and url.endswith(".xlsx"):
+            return httpx.Response(404, text="not published")
+        if url == CENSUS_MARTS_INDEX:
+            return httpx.Response(
+                200,
+                text='<html><a href="rs2605.xlsx">mismatched</a></html>',
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    result = CensusMARTSReleaseProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        )
+    ).monthly_retail_sales()
+
+    assert not result.ok
+    assert "filename month does not match workbook latest month" in result.error
+    assert CENSUS_MARTS_INDEX not in attempted
+
+
+def test_census_release_replay_rejects_legacy_workbook_role():
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    assert result.ok
+
+    def legacy_role(entry):
+        if entry["role"] == "current-workbook":
+            entry["role"] = "workbook"
+
+    legacy = _rebuild_census_evidence(result.raw_bytes, legacy_role)
+    with pytest.raises(ValueError, match="roles are incomplete or mixed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(legacy)
+
+
+@pytest.mark.django_db
+def test_census_standalone_archive_diagnostic_is_rejected_by_official_persistence(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_workbook())
+    ).historical_monthly_retail_sales()
+    assert result.ok
+    _, metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+    assert metadata["workbook_scope"] == "historical_archive"
+
+    run = record_provider_result(
+        result,
+        persist=_store_census_marts_observations_v2,
+    )
+
+    assert run.status == IngestionRun.Status.FAILED
+    assert "release evidence roles are invalid" in run.error
+    assert not Observation.objects.filter(batch_id=run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=run).exists()
 
 
 @pytest.mark.django_db
@@ -1739,7 +2047,7 @@ def test_consumer_dashboard_refuses_partial_metric_set():
 
 
 @pytest.mark.django_db
-def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(
+def test_release_workbooks_persist_lineage_and_publish_gdp_page(
     client,
     settings,
     tmp_path,
@@ -1748,55 +2056,16 @@ def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(
     bea = BEAGDPReleaseProvider(
         client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
     ).gdp_pce()
-    census_api = _census_api_result()
-    census = CensusMARTSReleaseProvider(
-        client=_census_client(_census_current_workbook(), current_status=200)
-    ).monthly_retail_sales()
-    pio = BEAPIOReleaseProvider(
-        client=_bea_pio_client(
-            _bea_pio_summary_workbook(),
-            _bea_pio_section2_workbook(),
-        )
-    ).personal_income_outlays()
     bea_run = record_provider_result(
         bea,
         persist=_store_bea_release_observations_v2,
     )
-    census_api_run = record_provider_result(
-        census_api, persist=_store_release_workbook_observations
-    )
-    census_run = record_provider_result(census, persist=_store_release_workbook_observations)
-    pio_run = record_provider_result(pio, persist=_store_release_workbook_observations)
-    g19, household = _consumer_credit_results()
-    g19_run = record_provider_result(g19, persist=_store_release_workbook_observations)
-    household_run = record_provider_result(
-        household, persist=_store_release_workbook_observations
-    )
-    _record_census_revision_witness(
-        [census_api_run, census_run, pio_run, g19_run, household_run]
-    )
-    census_api_run.refresh_from_db()
-
-    dashboards = {
-        item.key: item for item in publish_official_dashboards(keys={"consumer"})
-    }
     gdp_snapshot = publish_gdp_revision(run=bea_run)
     assert gdp_snapshot is not None
-    dashboards["gdp"] = gdp_snapshot
+    dashboards = {"gdp": gdp_snapshot}
 
     assert bea_run.status == "success"
-    assert census_api_run.status == "success"
-    assert census_run.status == "success"
-    assert pio_run.status == "success"
-    assert g19_run.status == "success"
-    assert household_run.status == "success"
-    witness = census_api_run.metadata["legacy_revision_witness"]
-    assert witness["latest_value_date"] == "2026-05-01"
-    assert witness["overlap_count"] == 7
-    assert witness["differences"] == []
     assert RawArtifact.objects.filter(run=bea_run).count() == 1
-    assert RawArtifact.objects.filter(run=census_run).count() == 1
-    assert RawArtifact.objects.filter(run=pio_run).count() == 3
     assert ReleaseVintageObservation.objects.filter(batch_id=bea_run.batch_id).count() == 12
     second_estimate = ReleaseVintageObservation.objects.get(
         batch_id=bea_run.batch_id,
@@ -1812,11 +2081,8 @@ def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(
     assert second_estimate.license_scope == second_estimate.source.license_scope
     assert second_estimate.fallback_source is None
     assert second_estimate.quality_status == Observation.Quality.FRESH
-    assert set(dashboards) == {"gdp", "consumer"}
+    assert set(dashboards) == {"gdp"}
     gdp = {item["key"]: item for item in dashboards["gdp"].data["metrics"]}
-    consumer = {
-        item["key"]: item for item in dashboards["consumer"].data["metrics"]
-    }
     assert gdp["bea-a191rl"]["display_value"] == "2.10%"
     assert gdp["bea-dpcerl"]["display_value"] == "0.50%"
     assert gdp["bea-pce-contribution"]["display_value"] == "0.37pp"
@@ -1838,126 +2104,12 @@ def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(
     assert revision_section["title"] == "GDP 发布轮次与修订路径"
     assert revision_section["rows"][0]["display_value"] == "1.60% → 2.10%"
     assert "累计修订 +0.50pp" in revision_section["rows"][0]["status"]
-    assert consumer["census-mrts-44x72-sm-sa"]["display_value"] == "763,705 USD mn"
-    assert consumer["census-mrts-44x72-sm-sa-mom"]["display_value"] == "0.90%"
-    assert consumer["census-mrts-44x72-sm-sa-mom"]["change_unit"] == "pp"
-    assert consumer["bea-real-pce-mom"]["display_value"] == "0.30%"
-    assert consumer["bea-real-dpi-mom"]["display_value"] == "0.30%"
-    assert consumer["bea-personal-saving-rate"]["display_value"] == "3.00%"
-    assert consumer["census-mrts-44x72-sm-sa"]["source_key"] == "census-release"
-    assert consumer["bea-real-pce-mom"]["source_key"] == "bea-pio-release"
-    assert consumer["g19-consumer-credit-outstanding-sa"]["source_key"] == (
-        "federal-reserve-g19"
-    )
-    assert consumer["hhdc-total-debt-balance"]["source_key"] == (
-        "ny-fed-household-credit"
-    )
-    charts = dashboards["consumer"].data["charts"]
-    assert [chart["key"] for chart in charts] == [
-        "retail-sales",
-        "real-consumption-income-momentum",
-        "personal-saving-rate",
-        "consumer-credit-composition",
-        "household-debt-composition",
-        "household-debt-delinquency",
-    ]
-    assert dashboards["consumer"].data["chart_data"] == charts[0]["data"]
-    assert dashboards["consumer"].data["contract_version"] == 1
-    assert dashboards["consumer"].data["retail_batch_id"] == str(
-        census_run.batch_id
-    )
-    assert charts[0]["source_keys"] == ["census-release"]
-    assert charts[1]["source_keys"] == ["bea-pio-release"]
-    assert charts[0]["data"][0]["_lineage"]["零售与餐饮服务"][
-        "source_key"
-    ] == "census-release"
-    response = client.get("/economy/consumer/")
-    body = response.content.decode()
-    assert response.status_code == 200
-    assert body.count(" data-chart ") == 6
-    assert "dashboard-chart-0" in body
-    assert "dashboard-chart-1" in body
-    assert "dashboard-chart-2" in body
-    assert "dashboard-chart-5" in body
-    assert "实际 PCE 环比" in body
-    assert "3.00%" in body
-    assert "U.S. Bureau of Economic Analysis Personal Income and Outlays Releases" in body
-    assert "New York Fed Household Debt and Credit" in body
-    assert "来源：Atlas Macro Derived Data" not in body
     gdp_response = client.get("/economy/gdp/")
     gdp_body = gdp_response.content.decode()
     assert gdp_response.status_code == 200
     assert gdp_body.count(" data-chart ") == 2
     assert "GDP 发布轮次与修订路径" in gdp_body
     assert "1.60% → 2.10%" in gdp_body
-
-    runs = [
-        bea_run,
-        census_api_run,
-        census_run,
-        pio_run,
-        g19_run,
-        household_run,
-    ]
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp",
-        "consumer",
-    }
-    census_api_run.dataset = "mrts:44X72:SM:yes"
-    census_api_run.save(update_fields=["dataset", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp",
-        "consumer",
-    }
-    census_api_run.dataset = "marts:44X72:SM:yes"
-    census_api_run.save(update_fields=["dataset", "updated_at"])
-    census_run.dataset = "marts:44X72:SM:yes"
-    census_run.save(update_fields=["dataset", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {"gdp"}
-    census_run.dataset = "marts:retail-food-services"
-    census_run.save(update_fields=["dataset", "updated_at"])
-    latest_pio = Observation.objects.filter(
-        series__key="bea-real-pce-mom",
-        source__key="bea-pio-release",
-    ).latest("value_date")
-    latest_pio.batch_id = uuid.uuid4()
-    latest_pio.save(update_fields=["batch_id", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp"
-    }
-    _mark_latest_dashboards_stale({"consumer"}, runs)
-    stale = DashboardSnapshot.objects.filter(key="consumer").latest("created_at")
-    assert stale.quality_status == "stale"
-    assert "上一版完整快照" in stale.data["refresh_failure"]["reason"]
-
-    latest_pio.batch_id = pio_run.batch_id
-    latest_pio.save(update_fields=["batch_id", "updated_at"])
-    latest_g19 = Observation.objects.filter(
-        series__key="g19-consumer-credit-outstanding-sa",
-        source__key="federal-reserve-g19",
-    ).latest("value_date")
-    latest_g19.batch_id = uuid.uuid4()
-    latest_g19.save(update_fields=["batch_id", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp"
-    }
-    latest_g19.batch_id = g19_run.batch_id
-    latest_g19.save(update_fields=["batch_id", "updated_at"])
-    assert publish_official_dashboards(keys={"consumer"}) == []
-    recovered = DashboardSnapshot.objects.get(pk=stale.pk)
-    assert "refresh_failure" not in recovered.data
-
-    census_api_run.status = IngestionRun.Status.PARTIAL
-    census_api_run.row_count = 0
-    census_api_run.metadata = {"reason": "CENSUS_API_KEY is not configured"}
-    census_api_run.save(
-        update_fields=["status", "row_count", "metadata", "updated_at"]
-    )
-    assert _publishable_keys_for_source_groups(runs, MACRO_PUBLICATION_GROUPS) == {
-        "gdp",
-        "consumer",
-    }
-
 
 @pytest.mark.django_db
 def test_gdp_generic_publisher_rejects_legacy_cross_source_rows():
@@ -2091,15 +2243,15 @@ def test_economy_catalog_separates_live_release_data_from_remaining_gaps():
     [
         (
             ("success", "success", "success", "success", "success", "success"),
-            {"gdp", "consumer"},
+            {"gdp"},
         ),
         (
             ("success", "failed", "success", "success", "success", "success"),
-            {"gdp", "consumer"},
+            {"gdp"},
         ),
         (("success", "success", "failed", "success", "success", "success"), {"gdp"}),
         (("success", "success", "success", "failed", "success", "success"), {"gdp"}),
-        (("failed", "success", "success", "success", "success", "success"), {"consumer"}),
+        (("failed", "success", "success", "success", "success", "success"), set()),
         (("success", "success", "success", "success", "partial", "success"), {"gdp"}),
         (("success", "success", "success", "success", "success", "failed"), {"gdp"}),
     ],

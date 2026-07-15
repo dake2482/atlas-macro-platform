@@ -34,6 +34,10 @@ from django.db.models import Q
 from django.utils import timezone
 
 from .calculations import yield_spread
+from .consumer_contract import (
+    CONSUMER_CONTRACT_VERSION,
+    coordinate_consumer_dashboard,
+)
 from .consumer_credit import (
     G19_SERIES,
     HHDC_BALANCE_SERIES,
@@ -59,11 +63,19 @@ from .credit_contract import (
     select_public_credit_stress_snapshot,  # noqa: F401 - view/test re-export
 )
 from .credit_official import FederalReserveSLOOSProvider, TreasuryHQMProvider
+from .economy_contract import (
+    ECONOMY_FORMULA_VERSION,  # noqa: F401 - public strict-contract re-export
+    ECONOMY_REQUIRED_CHART_KEYS,  # noqa: F401 - public strict-contract re-export
+    _economy_snapshot_static_replay,  # noqa: F401 - operations/test re-export
+    coordinate_economy_dashboard,
+    economy_snapshot_is_publicly_displayable,  # noqa: F401 - public re-export
+    publish_economy_revision,  # noqa: F401 - public re-export
+    select_public_economy_snapshot,  # noqa: F401 - view/test re-export
+)
 from .employment_contract import (
     EMPLOYMENT_BLS_REQUEST_SERIES,
     EMPLOYMENT_REQUIRED_METRIC_KEYS,
     coordinate_employment_dashboard,
-    select_public_employment_snapshot,
 )
 from .fed_h8 import (
     H8_RELEASE_FRESHNESS_DAYS,
@@ -86,7 +98,6 @@ from .fed_prates import FederalReservePRATESProvider
 from .inflation_contract import (
     INFLATION_REQUIRED_METRIC_KEYS,
     coordinate_inflation_dashboard,
-    select_public_inflation_snapshot,
 )
 from .labor_official import (
     CONTINUED_4WK,
@@ -99,7 +110,7 @@ from .labor_official import (
 from .labor_official import (
     REQUIRED_SERIES as DOL_REQUIRED_SERIES,
 )
-from .macro_contract import coordinate_gdp_dashboard, select_public_gdp_snapshot
+from .macro_contract import coordinate_gdp_dashboard
 from .macro_official import CensusMARTSProvider
 from .macro_releases import (
     BEAGDPReleaseProvider,
@@ -125,12 +136,14 @@ from .providers import (
     NYFedMarketsProvider,
     ProviderResult,
     TreasuryRatesProvider,
+    strict_json_metadata_matches,
 )
 from .raw_evidence import (
     EVIDENCE_BUNDLE_CONTENT_TYPE,
     parse_evidence_bundle,
 )
 from .services import (
+    SERIES_CATALOG,
     begin_ingestion,
     current_display_source_key_sets,
     ensure_source,
@@ -818,6 +831,8 @@ INDEPENDENT_PUBLICATION_KEYS = frozenset(
         "gdp",
         "employment",
         "inflation",
+        "consumer",
+        "economy",
         *FX_VOL_PUBLICATION_KEYS,
     }
 )
@@ -840,6 +855,8 @@ APPEND_ONLY_PUBLICATION_KEYS = frozenset(
         "gdp",
         "employment",
         "inflation",
+        "consumer",
+        "economy",
         *FX_VOL_PUBLICATION_KEYS,
     }
 )
@@ -927,17 +944,8 @@ REAL_RATES_REQUIRED_SECTION_KEYS = frozenset({"current-real-par-curve"})
 H41_PUBLICATION_KEYS = frozenset()
 PRATES_PUBLICATION_KEYS = frozenset()
 H10_PUBLICATION_KEYS = frozenset()
-CONSUMER_CONTRACT_VERSION = 1
 MACRO_PUBLICATION_GROUPS = {
     "gdp": frozenset({"bea-release"}),
-    "consumer": frozenset(
-        {
-            "census-release",
-            "bea-pio-release",
-            "federal-reserve-g19",
-            "ny-fed-household-credit",
-        }
-    ),
 }
 MACRO_REQUIRED_DATASETS = {
     "consumer": {
@@ -1061,34 +1069,6 @@ RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS = frozenset(
 RESERVES_RATE_SPREADS_HISTORY_DAYS = 60
 RESERVES_RATE_SPREADS_MIN_HISTORY_ROWS = 30
 RESERVES_RATE_SPREADS_QUOTE_CONVENTION = TreasuryRatesProvider.BILL_13W_QUOTE_CONVENTION
-ECONOMY_CONTRACT_VERSION = 1
-ECONOMY_COMPONENTS = {
-    "gdp": {
-        "metric_key": "bea-a191rl",
-        "metric_label": "实际 GDP 季调年化增速",
-        "chart_key": "gdp-growth-history",
-        "tab": "growth",
-    },
-    "employment": {
-        "metric_key": "lns14000000",
-        "metric_label": "失业率",
-        "chart_key": "labor-slack",
-        "tab": "labor",
-    },
-    "inflation": {
-        "metric_key": "core-cpi-yoy",
-        "metric_label": "核心 CPI 同比",
-        "chart_key": "core-cpi-rates",
-        "tab": "inflation",
-    },
-    "consumer": {
-        "metric_key": "bea-real-pce-mom",
-        "metric_label": "实际 PCE 环比",
-        "chart_key": "real-consumption-income-momentum",
-        "tab": "consumer",
-    },
-}
-ECONOMY_REQUIRED_METRIC_KEYS = frozenset(item["metric_key"] for item in ECONOMY_COMPONENTS.values())
 MACRO_REQUIRED_SERIES = {
     "employment": {
         "bls": frozenset(
@@ -1377,7 +1357,11 @@ def _fresh_until(observation: Observation) -> datetime:
         ).astimezone(UTC)
     else:
         period_end = value_date
-    return period_end + timedelta(days=FRESHNESS_DAYS.get(frequency, 4))
+    return (
+        period_end
+        + timedelta(days=FRESHNESS_DAYS.get(frequency, 4) + 1)
+        - timedelta(microseconds=1)
+    )
 
 
 def _effective_source_license(
@@ -5168,590 +5152,9 @@ def _parse_payload_datetime(raw_value: Any) -> datetime | None:
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
 
 
-def _economy_component_state(
-    page_key: str,
-    snapshot: DashboardSnapshot | None,
-    *,
-    reason: str,
-    status: str = "invalid",
-) -> dict[str, Any]:
-    data = dict(snapshot.data or {}) if snapshot is not None else {}
-    return {
-        "page_key": page_key,
-        "status": status,
-        "reason": reason[:320],
-        "snapshot_id": snapshot.pk if snapshot is not None else None,
-        "publication_batch_id": (str(snapshot.batch_id) if snapshot is not None else None),
-        "snapshot_quality_status": (snapshot.quality_status if snapshot is not None else None),
-        "fingerprint": data.get("fingerprint"),
-        "payload_integrity_hash": data.get("payload_integrity_hash"),
-        "contract_version": data.get("contract_version"),
-        "formula_version": data.get("formula_version"),
-        "component_roles": deepcopy(data.get("component_roles")),
-    }
-
-
-def _latest_economy_component_snapshot(
-    page_key: str,
-) -> DashboardSnapshot | None:
-    return (
-        DashboardSnapshot.objects.filter(key=page_key, is_published=True)
-        .order_by("-created_at", "-id")
-        .first()
-    )
-
-
-def _economy_component_payload(
-    page_key: str,
-    component: dict[str, str],
-    *,
-    now: datetime,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | dict[str, Any]:
-    snapshot = (
-        select_public_gdp_snapshot()
-        if page_key == "gdp"
-        else (
-            select_public_employment_snapshot()
-            if page_key == "employment"
-            else (
-                select_public_inflation_snapshot()
-                if page_key == "inflation"
-                else _latest_economy_component_snapshot(page_key)
-            )
-        )
-    )
-    if snapshot is None:
-        latest = _latest_economy_component_snapshot(page_key)
-        return _economy_component_state(
-            page_key,
-            latest,
-            reason=(
-                f"{page_key} strict selector found no replayable current component"
-                if page_key in {"gdp", "employment", "inflation"} and latest is not None
-                else "latest published component snapshot is missing"
-            ),
-            status="invalid" if latest is not None else "missing",
-        )
-    if (
-        page_key == "gdp"
-        and getattr(
-            snapshot,
-            "gdp_publication_state",
-            None,
-        )
-        != "current_candidate"
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="GDP strict child is not in current_candidate state",
-            status=str(getattr(snapshot, "gdp_publication_state", "invalid")),
-        )
-    if (
-        page_key == "employment"
-        and getattr(
-            snapshot,
-            "employment_publication_state",
-            None,
-        )
-        != "current_candidate"
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="Employment strict child is not in current_candidate state",
-            status=str(getattr(snapshot, "employment_publication_state", "invalid")),
-        )
-    if (
-        page_key == "inflation"
-        and getattr(
-            snapshot,
-            "inflation_publication_state",
-            None,
-        )
-        != "current_candidate"
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="Inflation strict child is not in current_candidate state",
-            status=str(getattr(snapshot, "inflation_publication_state", "invalid")),
-        )
-    data = dict(snapshot.data or {})
-    if snapshot.source.key == "demo-market" or data.get("demo") is not False:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="latest component snapshot is demo or lacks an explicit real-data flag",
-            status="demo",
-        )
-    if snapshot.quality_status == Observation.Quality.ERROR:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="latest component snapshot has error quality",
-            status=Observation.Quality.ERROR,
-        )
-    if data.get("publication_batch_id") != str(snapshot.batch_id):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="component publication batch does not match its snapshot batch",
-        )
-    fingerprint = str(data.get("fingerprint") or "")
-    if len(fingerprint) != 64 or any(
-        character not in "0123456789abcdef" for character in fingerprint.lower()
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="component fingerprint is missing or malformed",
-        )
-
-    metric_key = component["metric_key"]
-    metrics = [
-        item
-        for item in data.get("metrics", [])
-        if isinstance(item, dict) and item.get("key") == metric_key
-    ]
-    if len(metrics) != 1:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=f"required metric {metric_key} is missing or duplicated",
-        )
-    chart_key = component["chart_key"]
-    charts = [
-        item
-        for item in data.get("charts", [])
-        if isinstance(item, dict) and item.get("key") == chart_key
-    ]
-    if len(charts) != 1:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=f"required chart {chart_key} is missing or duplicated",
-        )
-    metric = metrics[0]
-    chart = charts[0]
-    if metric.get("value") is None or metric.get("unit") != "%":
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=f"required metric {metric_key} is not a percentage observation",
-        )
-    for payload_name, payload in (("metric", metric), ("chart", chart)):
-        quality = payload.get("quality_status")
-        if quality not in {
-            Observation.Quality.FRESH,
-            Observation.Quality.ESTIMATED,
-            Observation.Quality.FALLBACK,
-        }:
-            return _economy_component_state(
-                page_key,
-                snapshot,
-                reason=f"selected {payload_name} has invalid {quality} quality",
-                status=str(quality or "invalid"),
-            )
-        deadline = _parse_payload_datetime(payload.get("fresh_until"))
-        if deadline is None or deadline < now:
-            return _economy_component_state(
-                page_key,
-                snapshot,
-                reason=f"selected {payload_name} freshness deadline is missing or expired",
-                status=Observation.Quality.STALE,
-            )
-        if _parse_payload_datetime(payload.get("as_of")) is None or (
-            _parse_payload_datetime(payload.get("fetched_at")) is None
-        ):
-            return _economy_component_state(
-                page_key,
-                snapshot,
-                reason=f"selected {payload_name} lacks valid as_of or fetched_at lineage",
-            )
-    if not chart.get("data"):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=f"required chart {chart_key} contains no observations",
-        )
-    chart_rows = chart.get("data")
-    if not isinstance(chart_rows, list) or any(
-        not isinstance(row, dict) or _parse_payload_datetime(row.get("date")) is None
-        for row in chart_rows
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=f"required chart {chart_key} has a non-date observation axis",
-        )
-
-    component_batches = {str(item) for item in data.get("component_batches", []) if item}
-    metric_batches = _payload_batch_ids(metric)
-    chart_batches = _payload_batch_ids(chart)
-    if (
-        not component_batches
-        or not metric_batches
-        or not chart_batches
-        or not metric_batches <= component_batches
-        or not chart_batches <= component_batches
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected metric or chart batch lineage is outside the component snapshot",
-        )
-    source_keys = _payload_source_keys([metric, chart])
-    missing_current_batches = []
-    selected_batches = metric_batches | chart_batches
-    if page_key not in {"employment", "inflation"}:
-        for source_key in sorted(source_keys - {"internal"}):
-            latest_successful_batch = _latest_successful_source_batch(source_key)
-            if (
-                latest_successful_batch is not None
-                and str(latest_successful_batch) not in selected_batches
-            ):
-                missing_current_batches.append(
-                    {
-                        "source": source_key,
-                        "latest_batch_id": str(latest_successful_batch),
-                    }
-                )
-    if missing_current_batches:
-        missing_sources = ", ".join(item["source"] for item in missing_current_batches)
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=(
-                "selected component has not inherited the latest successful "
-                f"source batch: {missing_sources}"
-            ),
-            status=Observation.Quality.STALE,
-        )
-    if not publicly_displayable_source_keys(source_keys):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected metric or chart source licence is not publicly displayable",
-            status="unlicensed",
-        )
-    refresh_failure = data.get("refresh_failure")
-    if isinstance(refresh_failure, dict):
-        source_states = refresh_failure.get("sources")
-        if not isinstance(source_states, list):
-            return _economy_component_state(
-                page_key,
-                snapshot,
-                reason="component refresh failure has no source-level isolation",
-                status=Observation.Quality.STALE,
-            )
-        failed_relevant_sources = [
-            state
-            for state in source_states
-            if isinstance(state, dict)
-            and state.get("source") in source_keys
-            and state.get("status") != IngestionRun.Status.SUCCESS
-        ]
-        if failed_relevant_sources:
-            failed_names = ", ".join(str(item.get("source")) for item in failed_relevant_sources)
-            return _economy_component_state(
-                page_key,
-                snapshot,
-                reason=f"selected source refresh failed: {failed_names}",
-                status=Observation.Quality.STALE,
-            )
-
-    metric_snapshot = (
-        MetricSnapshot.objects.filter(
-            key=f"{page_key}-{metric_key}",
-            batch_id=snapshot.batch_id,
-        )
-        .select_related("source", "fallback_source")
-        .first()
-    )
-    if metric_snapshot is None:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected metric has no normalized MetricSnapshot row",
-        )
-    if metric_snapshot.value is None:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected normalized metric has no numeric value",
-        )
-    try:
-        payload_value = Decimal(str(metric["value"])).quantize(Decimal("0.00000001"))
-    except (ArithmeticError, TypeError, ValueError):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected metric value is not a valid decimal",
-        )
-    metric_value_date = _parse_payload_datetime(metric.get("value_date") or metric.get("as_of"))
-    metric_as_of = _parse_payload_datetime(metric.get("as_of"))
-    metric_fetched_at = _parse_payload_datetime(metric.get("fetched_at"))
-    fallback_key = (
-        metric_snapshot.fallback_source.key if metric_snapshot.fallback_source_id else None
-    )
-    if any(
-        (
-            payload_value != metric_snapshot.value.quantize(Decimal("0.00000001")),
-            metric_value_date != metric_snapshot.value_date,
-            metric_as_of != metric_snapshot.as_of,
-            metric_fetched_at != metric_snapshot.fetched_at,
-            metric.get("source_key") != metric_snapshot.source.key,
-            metric.get("fallback_source") != fallback_key,
-            metric.get("quality_status") != metric_snapshot.quality_status,
-            metric.get("unit", "") != metric_snapshot.unit,
-            not metric_snapshot.license_scope,
-        )
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected metric JSON and MetricSnapshot lineage do not agree",
-        )
-    metric_formula = (metric.get("metadata") or {}).get("formula")
-    if metric_formula and metric_snapshot.metadata.get("formula") != metric_formula:
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason="selected metric formula differs from its normalized row",
-        )
-    normalized_metric_batches = _payload_batch_ids(
-        {
-            "batch_id": metric_snapshot.metadata.get("component_batch_id"),
-            "batch_ids": metric_snapshot.metadata.get("input_batch_ids", []),
-            "input_lineage": metric_snapshot.metadata.get("input_lineage", []),
-        }
-    )
-    normalized_metric_sources = {
-        metric_snapshot.source.key,
-        *([metric_snapshot.fallback_source.key] if metric_snapshot.fallback_source_id else []),
-    }
-    normalized_metric_sources.update(_payload_source_keys(metric_snapshot.metadata))
-    if (
-        metric_batches != normalized_metric_batches
-        or _payload_source_keys(metric) != normalized_metric_sources
-    ):
-        return _economy_component_state(
-            page_key,
-            snapshot,
-            reason=(
-                "selected metric JSON batch or source lineage differs from its "
-                "normalized MetricSnapshot row"
-            ),
-        )
-
-    copied_metric = deepcopy(metric)
-    copied_metric["label"] = component["metric_label"]
-    copied_metric["license_scope"] = metric_snapshot.license_scope
-    copied_metric_metadata = deepcopy(copied_metric.get("metadata") or {})
-    copied_metric_metadata.update(
-        {
-            "component_page_key": page_key,
-            "component_snapshot_id": snapshot.pk,
-            "component_publication_batch_id": str(snapshot.batch_id),
-            "component_fingerprint": fingerprint,
-            "component_payload_integrity_hash": data.get("payload_integrity_hash"),
-            "component_contract_version": data.get("contract_version"),
-            "component_formula_version": data.get("formula_version"),
-            "component_roles": deepcopy(data.get("component_roles")),
-            "component_metric_snapshot_id": metric_snapshot.pk,
-            "component_metric_snapshot_key": metric_snapshot.key,
-            "component_metric_snapshot_batch_id": str(metric_snapshot.batch_id),
-            "inherited_license_scope": metric_snapshot.license_scope,
-        }
-    )
-    copied_metric["metadata"] = copied_metric_metadata
-
-    copied_chart = deepcopy(chart)
-    copied_chart.update(
-        {
-            "tab": component["tab"],
-            "time_axis": "date",
-            "component_page_key": page_key,
-            "component_snapshot_id": snapshot.pk,
-            "component_publication_batch_id": str(snapshot.batch_id),
-            "component_fingerprint": fingerprint,
-            "component_payload_integrity_hash": data.get("payload_integrity_hash"),
-            "component_contract_version": data.get("contract_version"),
-            "component_formula_version": data.get("formula_version"),
-            "component_roles": deepcopy(data.get("component_roles")),
-        }
-    )
-    input_runs = data.get("input_runs")
-    source_roles = {
-        str(item.get("role")): str(item.get("source_key"))
-        for item in input_runs
-        if isinstance(item, dict) and item.get("role") and item.get("source_key")
-    } if isinstance(input_runs, list) else {}
-    component_reference = {
-        "page_key": page_key,
-        "snapshot_id": snapshot.pk,
-        "snapshot_batch_id": str(snapshot.batch_id),
-        "publication_batch_id": str(snapshot.batch_id),
-        "fingerprint": fingerprint,
-        "payload_integrity_hash": data.get("payload_integrity_hash"),
-        "contract_version": data.get("contract_version"),
-        "formula_version": data.get("formula_version"),
-        "component_roles": deepcopy(data.get("component_roles")),
-        "source_roles": source_roles,
-        "snapshot_quality_status": snapshot.quality_status,
-        "selected_metric_key": metric_key,
-        "selected_chart_key": chart_key,
-        "metric_snapshot_id": metric_snapshot.pk,
-        "metric_snapshot_key": metric_snapshot.key,
-        "metric_quality_status": metric.get("quality_status"),
-        "metric_value_date": metric.get("value_date") or metric.get("as_of"),
-        "fresh_until": min(
-            _parse_payload_datetime(metric["fresh_until"]),
-            _parse_payload_datetime(chart["fresh_until"]),
-        ).isoformat(),
-        "source_keys": sorted(source_keys),
-        "component_batches": sorted(component_batches),
-        "selected_batches": sorted(metric_batches | chart_batches),
-    }
-    return copied_metric, copied_chart, component_reference
-
-
-def _economy_page_data() -> tuple[
-    tuple[
-        list[dict[str, Any]],
-        list[dict[str, Any]],
-        list[dict[str, Any]],
-        dict[str, Any],
-    ]
-    | None,
-    list[dict[str, Any]],
-]:
-    metrics: list[dict[str, Any]] = []
-    charts: list[dict[str, Any]] = []
-    component_snapshots: list[dict[str, Any]] = []
-    failures: list[dict[str, Any]] = []
-    now = timezone.now()
-    for page_key, component in ECONOMY_COMPONENTS.items():
-        result = _economy_component_payload(page_key, component, now=now)
-        if isinstance(result, dict):
-            failures.append(result)
-            continue
-        metric, chart, component_reference = result
-        metrics.append(metric)
-        charts.append(chart)
-        component_snapshots.append(component_reference)
-    if failures:
-        return None, failures
-    return (
-        (
-            metrics,
-            charts,
-            [],
-            {
-                "contract_version": ECONOMY_CONTRACT_VERSION,
-                "component_snapshots": component_snapshots,
-            },
-        ),
-        [],
-    )
-
-
-def _latest_economy_snapshot() -> DashboardSnapshot | None:
-    return (
-        DashboardSnapshot.objects.filter(
-            key="economy",
-            is_published=True,
-            data__contract_version=ECONOMY_CONTRACT_VERSION,
-        )
-        .exclude(source__key="demo-market")
-        .order_by("-created_at", "-id")
-        .first()
-    )
-
-
-def _mark_economy_stale(components: list[dict[str, Any]], *, reason: str) -> None:
-    latest = (
-        DashboardSnapshot.objects.select_for_update()
-        .filter(
-            key="economy",
-            is_published=True,
-            data__contract_version=ECONOMY_CONTRACT_VERSION,
-        )
-        .exclude(source__key="demo-market")
-        .order_by("-created_at", "-id")
-        .first()
-    )
-    if latest is None:
-        return
-    component_summary = "；".join(
-        (
-            f"{item.get('page_key') or 'unknown'}"
-            f"[{item.get('status') or 'invalid'}] "
-            f"{item.get('reason') or 'unknown failure'}"
-        )
-        for item in components
-    )
-    public_reason = f"{reason} 失败组件：{component_summary}" if component_summary else reason
-    data = dict(latest.data or {})
-    data["refresh_failure"] = {
-        "checked_at": timezone.now().isoformat(),
-        "reason": public_reason,
-        "components": components,
-    }
-    latest.data = data
-    latest.quality_status = Observation.Quality.STALE
-    latest.save(update_fields=["data", "quality_status", "updated_at"])
-
-
-@transaction.atomic
-def _coordinate_economy_dashboard() -> tuple[list[DashboardSnapshot], set[str]]:
-    internal = ensure_source("internal")
-    Source.objects.select_for_update().get(pk=internal.pk)
-    prepared_data, failures = _economy_page_data()
-    if prepared_data is None:
-        _mark_economy_stale(
-            failures,
-            reason=("四个必需经济组件未形成完整、有效且许可可公开的组合；继续保留上一版完整总览。"),
-        )
-        return [], {"economy"}
-    expected_chart_keys = {component["chart_key"] for component in ECONOMY_COMPONENTS.values()}
-    previous = _latest_economy_snapshot()
-    try:
-        with transaction.atomic():
-            dashboards = publish_official_dashboards(
-                keys={"economy"},
-                prepared_economy_data=prepared_data,
-            )
-            latest = _latest_economy_snapshot()
-            postcondition_failed = (
-                latest is None
-                or {str(item.get("key") or "") for item in (latest.data or {}).get("metrics", [])}
-                != set(ECONOMY_REQUIRED_METRIC_KEYS)
-                or {str(item.get("key") or "") for item in (latest.data or {}).get("charts", [])}
-                != expected_chart_keys
-                or {
-                    str(item.get("page_key") or "")
-                    for item in (latest.data or {}).get("component_snapshots", [])
-                }
-                != set(ECONOMY_COMPONENTS)
-                or (latest.data or {}).get("refresh_failure")
-            )
-            if postcondition_failed:
-                raise ValueError("economy publication postcondition failed")
-    except ValueError:
-        _mark_economy_stale(
-            [
-                _economy_component_state(
-                    "economy",
-                    previous,
-                    reason="publication postcondition failed",
-                )
-            ],
-            reason=("经济总览发布后置条件未满足；继续保留快照并等待下一次完整组件协调。"),
-        )
-        return [], {"economy"}
-    return dashboards, set()
+# Refresh orchestration and legacy operations imports keep this stable name;
+# all writes now go through the strict append-only Economy v2 contract.
+_coordinate_economy_dashboard = coordinate_economy_dashboard
 
 
 def _reserves_run_identity(run: IngestionRun) -> str | None:
@@ -25400,6 +24803,16 @@ def _series_date_coverage(
     }
 
 
+def _series_matches_catalog(series: SeriesDefinition) -> bool:
+    contract = SERIES_CATALOG.get(series.key.upper())
+    return bool(
+        contract
+        and series.name == contract[0]
+        and series.unit == contract[1]
+        and series.frequency == contract[2]
+    )
+
+
 def _guard_series_coverage_not_shrunk(
     *,
     context: str,
@@ -25438,7 +24851,7 @@ def _guard_series_coverage_not_shrunk(
             if (
                 candidate_end < prior_end
                 or candidate_count < prior_count
-                or (candidate_end == prior_end and candidate_start > prior_start)
+                or candidate_start > prior_start
             ):
                 raise ValueError(f"{context} series coverage shrank")
 
@@ -25488,11 +24901,10 @@ def _validated_bls_raw_contract(
     ):
         raise ValueError("BLS endpoint or credential-free request witness is invalid")
     series_ids = request_witness.get("series_ids")
-    try:
-        start_year = int(request_witness.get("start_year"))
-        end_year = int(request_witness.get("end_year"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("BLS request years are invalid") from exc
+    start_year = request_witness.get("start_year")
+    end_year = request_witness.get("end_year")
+    if type(start_year) is not int or type(end_year) is not int:
+        raise ValueError("BLS request years are invalid")
     if not isinstance(series_ids, list) or any(
         not isinstance(series_id, str) or not series_id for series_id in series_ids
     ):
@@ -25544,17 +24956,33 @@ def _validated_bls_raw_contract(
         "missing_series",
         "messages",
         "quality_status",
+        "missing_observations",
+        "official_missing_observation_count",
+        "latest_observation_dates",
+        "latest_missing_series",
         "start_year",
         "end_year",
         "latest_value_dates",
     }
-    if any(metadata.get(key) != replay_metadata.get(key) for key in replay_keys):
+    if not strict_json_metadata_matches(
+        metadata,
+        replay_metadata,
+        fields=replay_keys,
+    ):
         raise ValueError("BLS replay metadata does not match the exact JSON")
     requested = set(replay_metadata["requested_series"])
+    latest_value_dates = replay_metadata["latest_value_dates"]
+    latest_observation_dates = replay_metadata["latest_observation_dates"]
     if (
         replay_metadata["missing_series"]
+        or replay_metadata["latest_missing_series"]
         or set(replay_metadata["returned_series"]) != requested
-        or set(replay_metadata["latest_value_dates"]) != requested
+        or set(latest_value_dates) != requested
+        or set(latest_observation_dates) != requested
+        or any(
+            latest_value_dates[series_id] != latest_observation_dates[series_id]
+            for series_id in requested
+        )
         or not replay_records
     ):
         raise ValueError("BLS exact JSON lacks required requested-series coverage")
@@ -27579,6 +27007,26 @@ def _validated_consumer_credit_release_bundle(
         fetched_at = fetched_at.replace(tzinfo=UTC)
     if fetched_at > timezone.now() + timedelta(minutes=5):
         raise ValueError("consumer-credit fetch time is in the future")
+    try:
+        retrieved_at = datetime.fromisoformat(
+            str(replay_metadata["retrieved_at"]).replace("Z", "+00:00")
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("consumer-credit retrieval time is invalid") from exc
+    if retrieved_at.tzinfo is None:
+        raise ValueError("consumer-credit retrieval time lacks a timezone")
+    retrieved_at = retrieved_at.astimezone(UTC)
+    fetched_at = fetched_at.astimezone(UTC)
+    if retrieved_at != fetched_at:
+        raise ValueError("consumer-credit fetched_at does not match final retrieval")
+    raw_release_date = replay_metadata.get("release_date")
+    if raw_release_date:
+        try:
+            release_date = date.fromisoformat(str(raw_release_date))
+        except ValueError as exc:
+            raise ValueError("consumer-credit official release date is invalid") from exc
+        if release_date > fetched_at.date():
+            raise ValueError("consumer-credit official release date is in the future")
 
     latest_by_series: dict[str, date] = {}
     seen: set[tuple[str, date]] = set()
@@ -27594,6 +27042,7 @@ def _validated_consumer_credit_release_bundle(
         if (
             series_id not in expected_series
             or raw_period != period.isoformat()
+            or period > fetched_at.date()
             or not value.is_finite()
             or row_identity in seen
         ):
@@ -27610,6 +27059,22 @@ def _validated_consumer_credit_release_bundle(
     }:
         raise ValueError("consumer-credit latest-period metadata is inconsistent")
     return replay_records, replay_metadata, latest_by_series
+
+
+_CONSUMER_CREDIT_VALUE_QUANTUM = Decimal("0.00000001")
+
+
+def _consumer_credit_database_value(value: Any) -> Decimal:
+    """Return one finite value exactly representable by Observation.value."""
+
+    try:
+        decimal_value = Decimal(str(value))
+        database_value = decimal_value.quantize(_CONSUMER_CREDIT_VALUE_QUANTUM)
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise ValueError("consumer-credit value exceeds database precision") from exc
+    if not decimal_value.is_finite() or decimal_value != database_value:
+        raise ValueError("consumer-credit value exceeds database precision")
+    return database_value
 
 
 def _store_consumer_credit_observations_v2(result, source, run) -> int:
@@ -27643,6 +27108,15 @@ def _store_consumer_credit_observations_v2(result, source, run) -> int:
         source,
         run.dataset,
         exclude_run_id=run.pk,
+    )
+    series_date_coverage = _series_date_coverage(
+        replay_records,
+        context="consumer-credit",
+    )
+    _guard_series_coverage_not_shrunk(
+        context="consumer-credit",
+        candidate=series_date_coverage,
+        previous_metadata=successful_metadata,
     )
     prior_latest: dict[str, date] = {}
     for series_key in latest_by_series:
@@ -27678,6 +27152,7 @@ def _store_consumer_credit_observations_v2(result, source, run) -> int:
         "latest_value_dates": {
             key: value.isoformat() for key, value in sorted(latest_by_series.items())
         },
+        "series_date_coverage": series_date_coverage,
     }
     artifact, reused = _persist_or_reuse_v2_exact_batch_artifact(
         result=result,
@@ -27701,7 +27176,7 @@ def _store_consumer_credit_observations_v2(result, source, run) -> int:
         (
             str(record["series_id"]).lower(),
             str(record["date"]),
-            f"{Decimal(str(record['value'])):.8f}",
+            _consumer_credit_database_value(record["value"]),
             _canonical_provider_payload(record.get("metadata") or {}),
         )
         for record in replay_records
@@ -27710,7 +27185,7 @@ def _store_consumer_credit_observations_v2(result, source, run) -> int:
         (
             item.series.key,
             item.value_date.date().isoformat(),
-            f"{item.value:.8f}",
+            _consumer_credit_database_value(item.value),
             _canonical_provider_payload(item.metadata or {}),
         )
         for item in Observation.objects.filter(
@@ -27721,6 +27196,7 @@ def _store_consumer_credit_observations_v2(result, source, run) -> int:
         and item.as_of == item.value_date
         and item.source_id == source.pk
         and item.series.source_id == source.pk
+        and _series_matches_catalog(item.series)
         and item.quality_status == Observation.Quality.FRESH
         and item.fallback_source_id is None
     )
@@ -27760,9 +27236,9 @@ def _validated_census_marts_bundle(
         category, seasonal_value = dataset_match.groups()
         adjustment = "SA" if seasonal_value == "yes" else "NSA"
         expected_series = {
-            f"CENSUS-MRTS-{category}-SM-{adjustment}",
-            f"CENSUS-MRTS-{category}-SM-{adjustment}-MOM",
-            f"CENSUS-MRTS-{category}-SM-{adjustment}-YOY",
+            f"CENSUS-API-MRTS-{category}-SM-{adjustment}",
+            f"CENSUS-API-MRTS-{category}-SM-{adjustment}-MOM",
+            f"CENSUS-API-MRTS-{category}-SM-{adjustment}-YOY",
         }
     elif identity == ("census-release", "marts:retail-food-services"):
         evidence = parse_evidence_bundle(
@@ -27770,11 +27246,25 @@ def _validated_census_marts_bundle(
             expected_provider=identity[0],
             expected_dataset=identity[1],
         )
-        expected_roles = (
-            {"current-workbook"}
-            if set(evidence.responses) == {"current-workbook"}
-            else {"archive-index", "archive-workbook"}
-        )
+        actual_release_roles = set(evidence.responses)
+        if actual_release_roles == {"current-workbook"}:
+            expected_roles = actual_release_roles
+        else:
+            probe_roles = {
+                role
+                for role in actual_release_roles
+                if re.fullmatch(r"recent-probe-\d{2}", role)
+            }
+            remaining = actual_release_roles - probe_roles - {
+                "current-workbook-failure"
+            }
+            if (
+                "current-workbook-failure" not in actual_release_roles
+                or not probe_roles
+                or remaining not in (set(), {"archive-index", "archive-workbook"})
+            ):
+                raise ValueError("Census MARTS release evidence roles are invalid")
+            expected_roles = actual_release_roles
         replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
             bytes(result.raw_bytes or b"")
         )
@@ -27812,6 +27302,17 @@ def _validated_census_marts_bundle(
         fetched_at = fetched_at.replace(tzinfo=UTC)
     if fetched_at > timezone.now() + timedelta(minutes=5):
         raise ValueError("Census MARTS fetch time is in the future")
+    if identity[0] in {"census", "census-release"}:
+        try:
+            retrieved_at = datetime.fromisoformat(
+                str(replay_metadata["retrieved_at"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Census MARTS API retrieval time is invalid") from exc
+        if retrieved_at.tzinfo is None:
+            raise ValueError("Census MARTS API retrieval time lacks a timezone")
+        if retrieved_at.astimezone(UTC) != fetched_at.astimezone(UTC):
+            raise ValueError("Census MARTS API fetched_at does not match retrieval")
     fetched_month = fetched_at.astimezone(UTC).date().replace(day=1)
 
     latest_by_series: dict[str, date] = {}
@@ -27978,6 +27479,7 @@ def _store_census_marts_observations_v2(result, source, run) -> int:
         and item.as_of == item.value_date
         and item.source_id == source.pk
         and item.series.source_id == source.pk
+        and _series_matches_catalog(item.series)
         and item.quality_status == Observation.Quality.FRESH
         and item.fallback_source_id is None
     )
@@ -28264,68 +27766,6 @@ def _store_dol_claims_observations_v2(result, source, run) -> int:
         "raw_artifact_uri": artifact.uri,
     }
     return row_count
-
-
-def _record_census_revision_witness(runs: Iterable[IngestionRun]) -> None:
-    """Record, but never promote, differences from the older release workbook."""
-
-    run_by_source = {run.source.key: run for run in runs}
-    current_run = run_by_source.get("census")
-    legacy_run = run_by_source.get("census-release")
-    if (
-        current_run is None
-        or legacy_run is None
-        or current_run.status != IngestionRun.Status.SUCCESS
-        or legacy_run.status != IngestionRun.Status.SUCCESS
-    ):
-        return
-    series_keys = {
-        "census-mrts-44x72-sm-sa",
-        "census-mrts-44x72-sm-sa-mom",
-        "census-mrts-44x72-sm-sa-yoy",
-    }
-    current = {
-        (item.series.key, item.value_date.date().isoformat()): item.value
-        for item in Observation.objects.filter(
-            source__key="census",
-            batch_id=current_run.batch_id,
-            series__key__in=series_keys,
-        ).select_related("series")
-    }
-    legacy = {
-        (item.series.key, item.value_date.date().isoformat()): item.value
-        for item in Observation.objects.filter(
-            source__key="census-release",
-            batch_id=legacy_run.batch_id,
-            series__key__in=series_keys,
-        ).select_related("series")
-    }
-    overlap = sorted(set(current) & set(legacy))
-    differences = [
-        {
-            "series_key": key[0],
-            "value_date": key[1],
-            "legacy_value": str(legacy[key]),
-            "current_value": str(current[key]),
-            "revision_delta": str(current[key] - legacy[key]),
-        }
-        for key in overlap
-        if current[key] != legacy[key]
-    ]
-    metadata = dict(current_run.metadata or {})
-    metadata["legacy_revision_witness"] = {
-        "source": "census-release",
-        "batch_id": str(legacy_run.batch_id),
-        "latest_value_date": max((key[1] for key in legacy), default=None),
-        "overlap_count": len(overlap),
-        "differences": differences,
-        "policy": (
-            "Older MARTS workbooks are immutable revision witnesses; "
-            "the current API batch always controls public observations."
-        ),
-    }
-    current_run.metadata = metadata
-    current_run.save(update_fields=["metadata", "updated_at"])
 
 
 def _payload_source_keys(value: Any) -> set[str]:
@@ -28853,7 +28293,7 @@ def _publish_dashboard_core(
     snapshot_fresh_until: str | None = None,
     _publish_capability: object | None = None,
 ) -> DashboardSnapshot | None:
-    if key in {"gdp", "employment", "inflation"}:
+    if key in {"gdp", "employment", "inflation", "consumer", "economy"}:
         raise ValueError(f"{key} must be published by its dedicated macro v2 publisher")
     if key in CREDIT_PUBLICATION_KEYS:
         raise ValueError(f"{key} must be published by its dedicated Credit Official v1 publisher")
@@ -29213,7 +28653,7 @@ def _publish_dashboard(
 ) -> DashboardSnapshot | None:
     """Publish generic dashboards; independent contracts are never writable here."""
 
-    if key in {"gdp", "employment", "inflation"}:
+    if key in {"gdp", "employment", "inflation", "consumer", "economy"}:
         raise ValueError(f"{key} must be published by its dedicated macro v2 publisher")
     if key in {
         "assets-fx",
@@ -29471,13 +28911,6 @@ def publish_official_dashboards(
         list[dict[str, Any]],
     ]
     | None = None,
-    prepared_economy_data: tuple[
-        list[dict[str, Any]],
-        list[dict[str, Any]],
-        list[dict[str, Any]],
-        dict[str, Any],
-    ]
-    | None = None,
     prepared_liquidity_data: tuple[
         list[dict[str, Any]],
         list[dict[str, Any]],
@@ -29532,10 +28965,6 @@ def publish_official_dashboards(
     fed_funds_metrics: list[dict[str, Any]] = []
     fed_funds_charts: list[dict[str, Any]] = []
     fed_funds_sections: list[dict[str, Any]] = []
-    economy_metrics: list[dict[str, Any]] = []
-    economy_charts: list[dict[str, Any]] = []
-    economy_sections: list[dict[str, Any]] = []
-    economy_extra_data: dict[str, Any] = {}
     liquidity_metrics: list[dict[str, Any]] = []
     liquidity_charts: list[dict[str, Any]] = []
     liquidity_sections: list[dict[str, Any]] = []
@@ -29701,13 +29130,6 @@ def publish_official_dashboards(
                 fed_funds_charts,
                 fed_funds_sections,
             ) = _fed_funds_page_data(dataset_batches=normalized_dataset_batches)
-    if (selected_keys is None or "economy" in selected_keys) and prepared_economy_data is not None:
-        (
-            economy_metrics,
-            economy_charts,
-            economy_sections,
-            economy_extra_data,
-        ) = prepared_economy_data
     if (
         selected_keys is None or "liquidity" in selected_keys
     ) and prepared_liquidity_data is not None:
@@ -29807,21 +29229,6 @@ def publish_official_dashboards(
             "sections": reserves_sections,
             "extra_data": reserves_extra_data,
             "required_metric_keys": RESERVES_REQUIRED_METRIC_KEYS,
-        },
-        {
-            "key": "economy",
-            "title": "经济数据",
-            "summary": (
-                "实际 GDP 季调年化增速、失业率、核心 CPI 同比与实际 PCE "
-                "环比分别继承 GDP、就业、通胀和消费官方子页的有效日、"
-                "抓取时间、公式、许可、质量及输入批次；不同频率不强行"
-                "对齐，任一被选组件失效时保留上一版完整总览。"
-            ),
-            "metrics": economy_metrics,
-            "charts": economy_charts,
-            "sections": economy_sections,
-            "extra_data": economy_extra_data,
-            "required_metric_keys": ECONOMY_REQUIRED_METRIC_KEYS,
         },
         {
             "key": "gdp",
@@ -30073,7 +29480,11 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     dashboards.extend(employment_dashboards)
     inflation_dashboards, stale_inflation_keys = coordinate_inflation_dashboard(runs)
     dashboards.extend(inflation_dashboards)
-    stale_dashboard_keys = stale_employment_keys | stale_inflation_keys
+    consumer_dashboards, stale_consumer_keys = coordinate_consumer_dashboard(runs)
+    dashboards.extend(consumer_dashboards)
+    stale_dashboard_keys = (
+        stale_employment_keys | stale_inflation_keys | stale_consumer_keys
+    )
     fed_funds_dashboards, stale_fed_funds_keys = _coordinate_fed_funds_dashboard(runs)
     dashboards.extend(fed_funds_dashboards)
     stale_dashboard_keys |= stale_fed_funds_keys
@@ -30599,7 +30010,6 @@ def refresh_macro_official_data(*, current_year: int | None = None) -> dict[str,
     finally:
         for provider, _, _, _ in providers:
             provider.close()
-    _record_census_revision_witness(runs)
     completed_keys = _publishable_keys_for_source_groups(runs, MACRO_PUBLICATION_GROUPS)
     publishable_keys = _keys_with_current_required_batches(completed_keys, runs)
     stale_keys = set(MACRO_PUBLICATION_GROUPS) - publishable_keys
@@ -30617,6 +30027,9 @@ def refresh_macro_official_data(*, current_year: int | None = None) -> dict[str,
     inflation_dashboards, stale_inflation_keys = coordinate_inflation_dashboard(runs)
     dashboards.extend(inflation_dashboards)
     stale_keys |= stale_inflation_keys
+    consumer_dashboards, stale_consumer_keys = coordinate_consumer_dashboard(runs)
+    dashboards.extend(consumer_dashboards)
+    stale_keys |= stale_consumer_keys
     economy_dashboards, stale_economy_keys = _coordinate_economy_dashboard()
     dashboards.extend(economy_dashboards)
     stale_keys |= stale_economy_keys

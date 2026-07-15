@@ -37,7 +37,7 @@ from .models import (
     Source,
     SourceLicense,
 )
-from .providers import BLSProvider
+from .providers import BLSProvider, strict_json_metadata_matches
 from .raw_evidence import EVIDENCE_BUNDLE_CONTENT_TYPE
 from .services import SERIES_CATALOG, ensure_source, public_source_notices
 
@@ -408,11 +408,10 @@ def _validate_bls_run(
     ):
         raise ValueError("employment BLS endpoint or request witness is invalid")
     series_ids = witness.get("series_ids")
-    try:
-        start_year = int(witness.get("start_year"))
-        end_year = int(witness.get("end_year"))
-    except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("employment BLS request years are invalid") from exc
+    start_year = witness.get("start_year")
+    end_year = witness.get("end_year")
+    if type(start_year) is not int or type(end_year) is not int:
+        raise ValueError("employment BLS request years are invalid")
     if (
         not isinstance(series_ids, list)
         or any(not isinstance(item, str) or not item for item in series_ids)
@@ -433,14 +432,31 @@ def _validate_bls_run(
         "missing_series",
         "messages",
         "quality_status",
+        "missing_observations",
+        "official_missing_observation_count",
+        "latest_observation_dates",
+        "latest_missing_series",
         "start_year",
         "end_year",
         "latest_value_dates",
     }
+    latest_value_dates = replay_metadata.get("latest_value_dates") or {}
+    latest_observation_dates = replay_metadata.get("latest_observation_dates") or {}
     if (
-        any(metadata.get(key) != replay_metadata.get(key) for key in replay_keys)
+        not strict_json_metadata_matches(
+            metadata,
+            replay_metadata,
+            fields=replay_keys,
+        )
         or replay_metadata.get("missing_series")
+        or replay_metadata.get("latest_missing_series")
         or set(replay_metadata.get("returned_series") or []) != set(series_ids)
+        or set(latest_value_dates) != set(series_ids)
+        or set(latest_observation_dates) != set(series_ids)
+        or any(
+            latest_value_dates[series_id] != latest_observation_dates[series_id]
+            for series_id in series_ids
+        )
         or not records
     ):
         raise ValueError("employment BLS metadata does not replay from exact JSON")
@@ -910,6 +926,14 @@ def _employment_snapshot_static_replay(
         )
     except (ArithmeticError, AttributeError, KeyError, OSError, TypeError, ValueError):
         return None
+
+
+def replay_employment_snapshot(
+    snapshot: DashboardSnapshot,
+) -> SimpleNamespace | None:
+    """Replay one immutable employment revision without live-state selection."""
+
+    return _employment_snapshot_static_replay(snapshot)
 
 
 def _is_employment_bls_dataset(dataset: str) -> bool:

@@ -17,6 +17,11 @@ from django.db import connection, transaction
 from django.db.models import QuerySet
 from django.utils import timezone
 
+from .economy_contract import (
+    ECONOMY_CONTRACT_VERSION,
+    ECONOMY_FORMULA_VERSION,
+    select_public_economy_snapshot,
+)
 from .models import (
     DashboardSnapshot,
     EvidenceItem,
@@ -27,15 +32,86 @@ from .models import (
     Thesis,
     Trigger,
 )
+from .official_data import (
+    TREASURY_CURVE_CONTRACT_VERSION,
+    TREASURY_CURVE_FORMULA_VERSION,
+    select_public_treasury_curve_snapshot,
+)
 from .services import current_display_source_key_sets
 
 DAILY_EVIDENCE_KEY = "daily-evidence"
-DAILY_EVIDENCE_CONTRACT_VERSION = 1
+DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION = 1
+DAILY_EVIDENCE_CONTRACT_VERSION = 2
 DAILY_EVIDENCE_COMPONENT_KEYS = ("economy", "liquidity", "rates")
+DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS = {
+    "economy": ECONOMY_CONTRACT_VERSION,
+    "liquidity": 1,
+    "rates": TREASURY_CURVE_CONTRACT_VERSION,
+}
 DAILY_EVIDENCE_PREFERRED_METRICS = {
     "economy": "bea-a191rl",
     "liquidity": "net-liquidity",
     "rates": "ust-10y",
+}
+DAILY_EVIDENCE_V2_PARENT_KEYS = frozenset(
+    {
+        "demo",
+        "contract_version",
+        "publication_batch_id",
+        "research_date",
+        "required_components",
+        "component_snapshots",
+        "component_batches",
+        "source_keys",
+        "evidence_metric_ids",
+        "evidence_items",
+        "component_set_sha256",
+        "fingerprint",
+    }
+)
+DAILY_EVIDENCE_V2_REFERENCE_KEYS = frozenset(
+    {
+        "page_key",
+        "demo",
+        "contract_version",
+        "formula_version",
+        "payload_integrity_hash",
+        "snapshot_id",
+        "publication_batch_id",
+        "fingerprint",
+        "as_of",
+        "quality_status",
+        "source_key",
+        "component_batches",
+        "source_keys",
+        "fresh_until",
+        "metrics",
+        "component_data_sha256",
+        "component_payload_sha256",
+    }
+)
+DAILY_EVIDENCE_V2_EVIDENCE_ITEM_KEYS = frozenset(
+    {
+        "component",
+        "component_metric_key",
+        "metric_id",
+        "key",
+        "value",
+        "display_value",
+        "unit",
+        "value_date",
+        "as_of",
+        "fetched_at",
+        "batch_id",
+        "quality_status",
+        "source_key",
+        "license_scope",
+        "fresh_until",
+    }
+)
+DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS = {
+    "economy": ECONOMY_FORMULA_VERSION,
+    "rates": TREASURY_CURVE_FORMULA_VERSION,
 }
 MINIMUM_EVIDENCE_ITEMS = 3
 MAX_DATABASE_ID = (2**63) - 1
@@ -396,6 +472,33 @@ def _positive_database_id(value: Any) -> int | None:
     return parsed if 0 < parsed <= MAX_DATABASE_ID else None
 
 
+def _strict_positive_database_id(value: Any) -> int | None:
+    if type(value) is not int or not 0 < value <= MAX_DATABASE_ID:
+        return None
+    return value
+
+
+def _canonical_uuid_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return value if str(parsed) == value else None
+
+
+def _sorted_unique_strings(value: Any, *, uuid_values: bool = False) -> bool:
+    return bool(
+        isinstance(value, list)
+        and value
+        and all(isinstance(item, str) and item for item in value)
+        and (not uuid_values or all(_canonical_uuid_string(item) for item in value))
+        and value == sorted(value)
+        and len(value) == len(set(value))
+    )
+
+
 def _metric_values_match(payload_value: Any, stored_value: Decimal | None) -> bool:
     parsed = _decimal(payload_value)
     if (
@@ -596,6 +699,54 @@ def _snapshot_sources(snapshot: DashboardSnapshot) -> set[str]:
     return {snapshot.source.key, *_payload_source_keys(_mapping(snapshot.data))}
 
 
+def _daily_component_versions(parent_contract_version: Any) -> dict[str, int] | None:
+    if type(parent_contract_version) is not int:
+        return None
+    if parent_contract_version == DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION:
+        return {page_key: 1 for page_key in DAILY_EVIDENCE_COMPONENT_KEYS}
+    if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+        return dict(DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS)
+    return None
+
+
+def _select_current_daily_component(page_key: str) -> DashboardSnapshot | None:
+    """Resolve one v2 producer input through its public current-state contract."""
+
+    if page_key == "economy":
+        selected = select_public_economy_snapshot()
+        return (
+            selected
+            if selected is not None
+            and getattr(selected, "economy_publication_state", None)
+            == "current_candidate"
+            else None
+        )
+    if page_key == "rates":
+        selected = select_public_treasury_curve_snapshot("rates")
+        return (
+            selected
+            if selected is not None
+            and getattr(selected, "treasury_publication_state", None)
+            == "current_candidate"
+            else None
+        )
+    if page_key == "liquidity":
+        return (
+            DashboardSnapshot.objects.filter(
+                key="liquidity",
+                is_published=True,
+                data__contract_version=DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS[
+                    "liquidity"
+                ],
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")
+            .first()
+        )
+    raise ValueError(f"unsupported daily-evidence component: {page_key}")
+
+
 def validate_daily_evidence_snapshot(
     snapshot: DashboardSnapshot | None,
     *,
@@ -617,26 +768,45 @@ def validate_daily_evidence_snapshot(
     if cutoff > current_time:
         errors.append("daily-evidence creation cutoff is in the future")
     data = _mapping(snapshot.data)
+    parent_contract_version = data.get("contract_version")
+    component_contract_versions = _daily_component_versions(
+        parent_contract_version
+    )
     if not isinstance(snapshot.data, dict):
         errors.append("daily-evidence payload is not an object")
     errors.extend(_payload_shape_errors(data, path="daily-evidence"))
     if snapshot.key != DAILY_EVIDENCE_KEY:
         errors.append("snapshot key is not daily-evidence")
     if require_latest_snapshot:
-        latest_id = (
-            DashboardSnapshot.objects.filter(key=DAILY_EVIDENCE_KEY)
-            .order_by("-created_at", "-id")
-            .values_list("pk", flat=True)
-            .first()
-        )
+        latest_query = DashboardSnapshot.objects.filter(key=DAILY_EVIDENCE_KEY)
+        if component_contract_versions is not None:
+            latest_query = latest_query.filter(
+                data__contract_version=parent_contract_version
+            )
+        latest_id = latest_query.order_by("-created_at", "-id").values_list(
+            "pk", flat=True
+        ).first()
         if latest_id != snapshot.pk:
             errors.append("daily-evidence snapshot is not the newest candidate")
     if not snapshot.is_published:
         errors.append("daily-evidence snapshot is not published")
     if snapshot.source.key != "internal":
         errors.append("daily-evidence snapshot source is not internal")
-    if data.get("contract_version") != DAILY_EVIDENCE_CONTRACT_VERSION:
-        errors.append("daily-evidence contract version is not 1")
+    if component_contract_versions is None:
+        errors.append("daily-evidence contract version is unsupported")
+    elif parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+        missing_parent_keys = sorted(DAILY_EVIDENCE_V2_PARENT_KEYS - data.keys())
+        extra_parent_keys = sorted(data.keys() - DAILY_EVIDENCE_V2_PARENT_KEYS)
+        if missing_parent_keys:
+            errors.append(
+                "daily-evidence v2 parent schema lacks fields: "
+                + ", ".join(missing_parent_keys)
+            )
+        if extra_parent_keys:
+            errors.append(
+                "daily-evidence v2 parent schema has unexpected fields: "
+                + ", ".join(extra_parent_keys)
+            )
     if data.get("demo") is not False:
         errors.append("daily-evidence snapshot is demo or lacks demo=false")
     if snapshot.quality_status not in PUBLIC_QUALITY_STATES:
@@ -662,6 +832,11 @@ def validate_daily_evidence_snapshot(
             errors.append("daily-evidence research_date is not the current local date")
     if data.get("publication_batch_id") != str(snapshot.batch_id):
         errors.append("daily-evidence publication batch does not match snapshot batch")
+    if (
+        parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+        and _canonical_uuid_string(data.get("publication_batch_id")) is None
+    ):
+        errors.append("daily-evidence v2 publication batch is not canonical")
     if not _valid_fingerprint(data.get("fingerprint")):
         errors.append("daily-evidence fingerprint is missing or malformed")
     elif data.get("fingerprint") != daily_evidence_payload_fingerprint(data):
@@ -672,10 +847,28 @@ def validate_daily_evidence_snapshot(
         errors.append("daily-evidence component-set fingerprint does not match content")
 
     required = data.get("required_components")
-    if not isinstance(required, list) or set(map(str, required)) != set(
+    if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+        if required != list(DAILY_EVIDENCE_COMPONENT_KEYS):
+            errors.append(
+                "daily-evidence v2 required components are not in canonical order"
+            )
+    elif not isinstance(required, list) or set(map(str, required)) != set(
         DAILY_EVIDENCE_COMPONENT_KEYS
     ):
         errors.append("daily-evidence required component set is incomplete")
+    raw_references = data.get("component_snapshots")
+    if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION and (
+        not isinstance(raw_references, list)
+        or len(raw_references) != len(DAILY_EVIDENCE_COMPONENT_KEYS)
+        or [
+            item.get("page_key") if isinstance(item, dict) else None
+            for item in raw_references
+        ]
+        != list(DAILY_EVIDENCE_COMPONENT_KEYS)
+    ):
+        errors.append(
+            "daily-evidence v2 component references are not in canonical order"
+        )
     references = _component_reference_map(data)
     if set(references) != set(DAILY_EVIDENCE_COMPONENT_KEYS):
         errors.append("daily-evidence component references are incomplete or duplicated")
@@ -690,10 +883,53 @@ def validate_daily_evidence_snapshot(
         if reference is None:
             continue
         errors.extend(_payload_shape_errors(reference, path=f"reference.{page_key}"))
+        if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+            missing_reference_keys = sorted(
+                DAILY_EVIDENCE_V2_REFERENCE_KEYS - reference.keys()
+            )
+            extra_reference_keys = sorted(
+                reference.keys() - DAILY_EVIDENCE_V2_REFERENCE_KEYS
+            )
+            if missing_reference_keys:
+                errors.append(
+                    f"{page_key} frozen v2 reference schema lacks fields: "
+                    + ", ".join(missing_reference_keys)
+                )
+            if extra_reference_keys:
+                errors.append(
+                    f"{page_key} frozen v2 reference schema has unexpected fields: "
+                    + ", ".join(extra_reference_keys)
+                )
         if reference.get("demo") is not False:
             errors.append(f"{page_key} frozen reference is demo or lacks demo=false")
-        if reference.get("contract_version") != 1:
-            errors.append(f"{page_key} frozen contract version is not 1")
+        expected_component_version = (
+            component_contract_versions.get(page_key)
+            if component_contract_versions is not None
+            else None
+        )
+        reference_contract_version = reference.get("contract_version")
+        if (
+            type(reference_contract_version) is not int
+            or reference_contract_version != expected_component_version
+        ):
+            errors.append(
+                f"{page_key} frozen contract version is not "
+                f"{expected_component_version}"
+            )
+        if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+            expected_formula_version = DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS.get(
+                page_key
+            )
+            if (
+                expected_formula_version is not None
+                and reference.get("formula_version") != expected_formula_version
+            ):
+                errors.append(
+                    f"{page_key} frozen formula version is not "
+                    f"{expected_formula_version}"
+                )
+            if not _valid_fingerprint(reference.get("payload_integrity_hash")):
+                errors.append(f"{page_key} frozen payload integrity hash is malformed")
         if not _valid_fingerprint(reference.get("fingerprint")):
             errors.append(f"{page_key} frozen fingerprint is malformed")
         if not _valid_fingerprint(reference.get("component_data_sha256")):
@@ -702,13 +938,22 @@ def validate_daily_evidence_snapshot(
             reference
         ):
             errors.append(f"{page_key} frozen component payload hash is invalid")
-        normalized_snapshot_id = _positive_database_id(reference.get("snapshot_id"))
+        normalized_snapshot_id = (
+            _strict_positive_database_id(reference.get("snapshot_id"))
+            if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+            else _positive_database_id(reference.get("snapshot_id"))
+        )
         if normalized_snapshot_id is None:
             errors.append(f"{page_key} component snapshot id is malformed")
             continue
         publication_batch_id = str(reference.get("publication_batch_id") or "")
         if not publication_batch_id:
             errors.append(f"{page_key} frozen publication batch is missing")
+        if (
+            parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+            and _canonical_uuid_string(reference.get("publication_batch_id")) is None
+        ):
+            errors.append(f"{page_key} frozen publication batch is not canonical")
         frozen_as_of = _parse_datetime(reference.get("as_of"))
         if frozen_as_of is None or frozen_as_of > cutoff:
             errors.append(f"{page_key} frozen as_of is missing or after cutoff")
@@ -723,19 +968,48 @@ def validate_daily_evidence_snapshot(
         )
         if reference.get("quality_status") not in PUBLIC_QUALITY_STATES:
             errors.append(f"{page_key} frozen quality is not publishable")
-        if not isinstance(reference.get("component_batches"), list):
+        raw_batches = reference.get("component_batches")
+        if not isinstance(raw_batches, list):
             errors.append(f"{page_key} frozen component_batches is not a list")
             batches: set[str] = set()
         else:
-            batches = {str(item) for item in reference["component_batches"] if item}
+            if (
+                parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+                and not _sorted_unique_strings(raw_batches, uuid_values=True)
+            ):
+                errors.append(
+                    f"{page_key} frozen component_batches is not canonical"
+                )
+            batches = (
+                set(raw_batches)
+                if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+                and all(isinstance(item, str) for item in raw_batches)
+                else {str(item) for item in raw_batches if item}
+            )
         if not batches or publication_batch_id not in batches:
             errors.append(f"{page_key} frozen component batch set is incomplete")
-        if not isinstance(reference.get("source_keys"), list):
+        raw_sources = reference.get("source_keys")
+        if not isinstance(raw_sources, list):
             errors.append(f"{page_key} frozen source_keys is not a list")
             sources: set[str] = set()
         else:
-            sources = {str(item) for item in reference["source_keys"] if item}
-        frozen_source_key = str(reference.get("source_key") or "")
+            if (
+                parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+                and not _sorted_unique_strings(raw_sources)
+            ):
+                errors.append(f"{page_key} frozen source_keys is not canonical")
+            sources = (
+                set(raw_sources)
+                if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+                and all(isinstance(item, str) for item in raw_sources)
+                else {str(item) for item in raw_sources if item}
+            )
+        frozen_source_key = (
+            reference.get("source_key")
+            if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+            and isinstance(reference.get("source_key"), str)
+            else str(reference.get("source_key") or "")
+        )
         if not sources or not frozen_source_key or frozen_source_key not in sources:
             errors.append(f"{page_key} frozen source set is incomplete")
         quality_states = _payload_quality_states(reference)
@@ -793,7 +1067,8 @@ def validate_daily_evidence_snapshot(
             if (
                 component.key != page_key
                 or not component.is_published
-                or component_data.get("contract_version") != 1
+                or type(component_data.get("contract_version")) is not int
+                or component_data.get("contract_version") != expected_component_version
                 or component_data.get("demo") is not False
                 or component.quality_status not in PUBLIC_QUALITY_STATES
                 or component_data.get("refresh_failure")
@@ -820,6 +1095,16 @@ def validate_daily_evidence_snapshot(
                 != reference.get("component_data_sha256")
                 or component_data.get("publication_batch_id") != publication_batch_id
                 or component_data.get("fresh_until") != reference.get("fresh_until")
+                or (
+                    parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+                    and component_data.get("formula_version")
+                    != reference.get("formula_version")
+                )
+                or (
+                    parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+                    and component_data.get("payload_integrity_hash")
+                    != reference.get("payload_integrity_hash")
+                )
                 or component.source.key != frozen_source_key
                 or component.as_of != frozen_as_of
                 or component.quality_status != reference.get("quality_status")
@@ -840,14 +1125,21 @@ def validate_daily_evidence_snapshot(
             }:
                 errors.append(f"{page_key} live metric payload differs from frozen reference")
             if require_current_components:
-                latest = (
-                    DashboardSnapshot.objects.filter(key=page_key, is_published=True)
-                    .order_by("-created_at", "-id")
-                    .first()
-                )
+                if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+                    latest = _select_current_daily_component(page_key)
+                else:
+                    latest = (
+                        DashboardSnapshot.objects.filter(
+                            key=page_key,
+                            is_published=True,
+                            data__contract_version=expected_component_version,
+                        )
+                        .order_by("-created_at", "-id")
+                        .first()
+                    )
                 if latest is None or latest.pk != component.pk:
                     errors.append(
-                        f"{page_key} reference is not the latest published component"
+                        f"{page_key} reference is not the strict current component"
                     )
             if require_current_components and (
                 not deadlines or min(deadlines) < current_time
@@ -855,10 +1147,26 @@ def validate_daily_evidence_snapshot(
                 errors.append(f"{page_key} component is stale at generation time")
 
     declared_batches = data.get("component_batches")
-    if not isinstance(declared_batches, list) or set(map(str, declared_batches)) != component_batches:
+    if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+        if (
+            not _sorted_unique_strings(declared_batches, uuid_values=True)
+            or declared_batches != sorted(component_batches)
+        ):
+            errors.append("daily-evidence v2 component batch union is not canonical")
+    elif not isinstance(declared_batches, list) or set(
+        map(str, declared_batches)
+    ) != component_batches:
         errors.append("daily-evidence component batch union is not exact")
     declared_sources = data.get("source_keys")
-    if not isinstance(declared_sources, list) or set(map(str, declared_sources)) != component_sources:
+    if parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+        if (
+            not _sorted_unique_strings(declared_sources)
+            or declared_sources != sorted(component_sources)
+        ):
+            errors.append("daily-evidence v2 source-key union is not canonical")
+    elif not isinstance(declared_sources, list) or set(
+        map(str, declared_sources)
+    ) != component_sources:
         errors.append("daily-evidence source-key union is not exact")
     if component_as_of_values and snapshot.as_of != min(component_as_of_values):
         errors.append("daily-evidence as_of is not the minimum component as_of")
@@ -874,10 +1182,12 @@ def validate_daily_evidence_snapshot(
     evidence_metric_ids = data.get("evidence_metric_ids")
     normalized_metric_ids: list[int] = []
     raw_metric_id_count = -1
+    strict_v2 = parent_contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+    id_parser = _strict_positive_database_id if strict_v2 else _positive_database_id
     if isinstance(evidence_metric_ids, list):
         raw_metric_id_count = len(evidence_metric_ids)
         for item in evidence_metric_ids:
-            normalized_id = _positive_database_id(item)
+            normalized_id = id_parser(item)
             if normalized_id is None:
                 normalized_metric_ids = []
                 break
@@ -886,20 +1196,68 @@ def validate_daily_evidence_snapshot(
         not normalized_metric_ids
         or len(normalized_metric_ids) != raw_metric_id_count
         or len(set(normalized_metric_ids)) != len(normalized_metric_ids)
-        or len(set(normalized_metric_ids)) < MINIMUM_EVIDENCE_ITEMS
+        or (
+            len(normalized_metric_ids) != len(DAILY_EVIDENCE_COMPONENT_KEYS)
+            if strict_v2
+            else len(set(normalized_metric_ids)) < MINIMUM_EVIDENCE_ITEMS
+        )
     ):
-        errors.append("daily-evidence has fewer than three evidence metrics")
+        errors.append(
+            "daily-evidence v2 evidence metric ids are not exactly three strict ids"
+            if strict_v2
+            else "daily-evidence has fewer than three evidence metrics"
+        )
     else:
         raw_evidence_items = data.get("evidence_items")
         evidence_references: dict[int, dict[str, Any]] = {}
         if not isinstance(raw_evidence_items, list):
             errors.append("daily-evidence evidence-item contract is missing")
         else:
+            if strict_v2:
+                if (
+                    len(raw_evidence_items) != len(DAILY_EVIDENCE_COMPONENT_KEYS)
+                    or [
+                        item.get("component") if isinstance(item, dict) else None
+                        for item in raw_evidence_items
+                    ]
+                    != list(DAILY_EVIDENCE_COMPONENT_KEYS)
+                ):
+                    errors.append(
+                        "daily-evidence v2 evidence items are not in canonical order"
+                    )
+                if [
+                    item.get("metric_id") if isinstance(item, dict) else None
+                    for item in raw_evidence_items
+                ] != evidence_metric_ids:
+                    errors.append(
+                        "daily-evidence v2 evidence-item ids do not match ordered ids"
+                    )
             for reference in raw_evidence_items:
                 if not isinstance(reference, dict):
                     errors.append("daily-evidence contains a malformed evidence item")
                     continue
-                normalized_id = _positive_database_id(reference.get("metric_id"))
+                if strict_v2:
+                    missing_item_keys = sorted(
+                        DAILY_EVIDENCE_V2_EVIDENCE_ITEM_KEYS - reference.keys()
+                    )
+                    extra_item_keys = sorted(
+                        reference.keys() - DAILY_EVIDENCE_V2_EVIDENCE_ITEM_KEYS
+                    )
+                    if missing_item_keys:
+                        errors.append(
+                            "daily-evidence v2 evidence-item schema lacks fields: "
+                            + ", ".join(missing_item_keys)
+                        )
+                    if extra_item_keys:
+                        errors.append(
+                            "daily-evidence v2 evidence-item schema has unexpected fields: "
+                            + ", ".join(extra_item_keys)
+                        )
+                    if _canonical_uuid_string(reference.get("batch_id")) is None:
+                        errors.append(
+                            "daily-evidence v2 evidence-item batch is not canonical"
+                        )
+                normalized_id = id_parser(reference.get("metric_id"))
                 if normalized_id is None:
                     errors.append("daily-evidence contains a malformed evidence metric id")
                     continue
@@ -1049,7 +1407,9 @@ def _daily_component_reference(
     reference = {
         "page_key": component.key,
         "demo": False,
-        "contract_version": DAILY_EVIDENCE_CONTRACT_VERSION,
+        "contract_version": data.get("contract_version"),
+        "formula_version": data.get("formula_version"),
+        "payload_integrity_hash": data.get("payload_integrity_hash"),
         "snapshot_id": component.pk,
         "publication_batch_id": str(component.batch_id),
         "fingerprint": data.get("fingerprint"),
@@ -1120,31 +1480,46 @@ def publish_daily_evidence_snapshot(
     try:
         with transaction.atomic():
             _lock_daily_evidence_producer()
-            # All daily-evidence consumers use parent -> components -> metrics.
-            # Keep the producer in that same row-lock order to avoid inversion.
+            # The internal Source is the publication mutex shared with the
+            # strict Economy/rates publishers.  It closes the first-insert
+            # race before daily parent -> components -> metrics row locks.
+            Source.objects.select_for_update(of=("self",)).get(pk=internal.pk)
             latest_parent = (
                 DashboardSnapshot.objects.select_for_update(of=("self",))
                 .select_related("source")
-                .filter(key=DAILY_EVIDENCE_KEY)
+                .filter(
+                    key=DAILY_EVIDENCE_KEY,
+                    data__contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+                )
                 .order_by("-created_at", "-id")
                 .first()
             )
+            allowed_public, allowed_derived = current_display_source_key_sets()
+            if latest_parent is not None:
+                latest_parent_errors = validate_daily_evidence_snapshot(
+                    latest_parent,
+                    now=current_time,
+                    require_latest_snapshot=True,
+                    allowed_public_source_keys=allowed_public,
+                    allowed_derived_source_keys=allowed_derived,
+                )
+                if latest_parent_errors:
+                    raise _CandidateRejected(
+                        (
+                            "newest daily-evidence v2 candidate is invalid: "
+                            + "; ".join(latest_parent_errors),
+                        )
+                    )
             selected_ids: dict[str, int] = {}
             missing: list[str] = []
             for page_key in DAILY_EVIDENCE_COMPONENT_KEYS:
-                snapshot_id = (
-                    DashboardSnapshot.objects.filter(
-                        key=page_key,
-                        is_published=True,
+                selected = _select_current_daily_component(page_key)
+                if selected is None:
+                    missing.append(
+                        f"{page_key}: strict current component is missing"
                     )
-                    .order_by("-created_at", "-id")
-                    .values_list("pk", flat=True)
-                    .first()
-                )
-                if snapshot_id is None:
-                    missing.append(f"{page_key}: latest published component is missing")
                 else:
-                    selected_ids[page_key] = snapshot_id
+                    selected_ids[page_key] = selected.pk
             if missing:
                 raise _CandidateRejected(missing)
 
@@ -1160,18 +1535,12 @@ def publish_daily_evidence_snapshot(
                     ("one or more selected component snapshots disappeared",)
                 )
             for page_key, selected_id in selected_ids.items():
-                newest_id = (
-                    DashboardSnapshot.objects.filter(
-                        key=page_key,
-                        is_published=True,
-                    )
-                    .order_by("-created_at", "-id")
-                    .values_list("pk", flat=True)
-                    .first()
-                )
-                if newest_id != selected_id:
+                current = _select_current_daily_component(page_key)
+                if current is None or current.pk != selected_id:
                     raise _CandidateRejected(
-                        (f"{page_key}: a newer component won the publication mutex",)
+                        (
+                            f"{page_key}: strict component changed after row locking",
+                        )
                     )
 
             component_metrics: dict[str, dict[str, Any]] = {}
@@ -1278,7 +1647,6 @@ def publish_daily_evidence_snapshot(
             )
             parent_data["fingerprint"] = daily_evidence_payload_fingerprint(parent_data)
 
-            allowed_public, allowed_derived = current_display_source_key_sets()
             if (
                 latest_parent is not None
                 and isinstance(latest_parent.data, dict)
@@ -1307,6 +1675,14 @@ def publish_daily_evidence_snapshot(
                 if Observation.Quality.ESTIMATED in quality_states
                 else Observation.Quality.FRESH
             )
+            for page_key, selected_id in selected_ids.items():
+                commit_component = _select_current_daily_component(page_key)
+                if commit_component is None or commit_component.pk != selected_id:
+                    raise _CandidateRejected(
+                        (
+                            f"{page_key}: strict component changed at commit boundary",
+                        )
+                    )
             candidate = DashboardSnapshot.objects.create(
                 key=DAILY_EVIDENCE_KEY,
                 title=f"{parent_data['research_date']} daily evidence",
@@ -1346,7 +1722,10 @@ def latest_ready_daily_evidence(
     """Return only the newest candidate; never fall back around a failed attempt."""
 
     snapshot = (
-        DashboardSnapshot.objects.filter(key=DAILY_EVIDENCE_KEY)
+        DashboardSnapshot.objects.filter(
+            key=DAILY_EVIDENCE_KEY,
+            data__contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+        )
         .select_related("source")
         .order_by("-created_at", "-id")
         .first()
@@ -1364,7 +1743,7 @@ def _evidence_lineage(item):
     if item.observation_id and item.snapshot_id:
         return None, "evidence item references both an observation and metric snapshot"
     if item.observation_id:
-        return None, "daily-evidence v1 requires MetricSnapshot lineage, not Observation"
+        return None, "daily-evidence requires MetricSnapshot lineage, not Observation"
     if item.snapshot_id:
         return item.snapshot, ""
     return None, "evidence item has no normalized observation or metric snapshot"

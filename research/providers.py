@@ -12,7 +12,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -53,6 +53,39 @@ class ProviderResult:
     @classmethod
     def failure(cls, provider: str, dataset: str, error: str) -> ProviderResult:
         return cls(provider=provider, dataset=dataset, error=error[:2000])
+
+
+def strict_json_metadata_matches(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+    *,
+    fields: Iterable[str],
+) -> bool:
+    """Compare required metadata fields using canonical JSON values and types."""
+
+    for field_name in fields:
+        if field_name not in actual or field_name not in expected:
+            return False
+        try:
+            actual_value = json.dumps(
+                actual[field_name],
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            expected_value = json.dumps(
+                expected[field_name],
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            return False
+        if actual_value != expected_value:
+            return False
+    return True
 
 
 @runtime_checkable
@@ -2635,6 +2668,8 @@ class BLSProvider(HTTPProvider):
         returned_series: set[str] = set()
         seen_rows: set[tuple[str, int, int]] = set()
         latest_value_dates: dict[str, date] = {}
+        latest_observation_dates: dict[str, date] = {}
+        missing_observations: list[dict[str, str]] = []
         records: list[dict[str, Any]] = []
         for series in response_series:
             if not isinstance(series, dict):
@@ -2649,38 +2684,67 @@ class BLSProvider(HTTPProvider):
             for item in data:
                 if not isinstance(item, dict):
                     raise ValueError("BLS response contains a malformed observation")
-                period = str(item.get("period") or "")
+                period = item.get("period")
+                raw_year = item.get("year")
+                footnotes = item.get("footnotes")
+                latest = item.get("latest")
+                period_name = item.get("periodName")
+                if (
+                    not isinstance(period, str)
+                    or not re.fullmatch(r"M(?:0[1-9]|1[0-3])", period)
+                    or not isinstance(raw_year, str)
+                    or not re.fullmatch(r"\d{4}", raw_year)
+                    or not isinstance(footnotes, list)
+                    or any(not isinstance(footnote, dict) for footnote in footnotes)
+                    or (latest is not None and latest not in {"true", "false"})
+                    or (period_name is not None and not isinstance(period_name, str))
+                ):
+                    raise ValueError("BLS observation structure is invalid")
+                year = int(raw_year)
+                if year < start_year or year > end_year:
+                    raise ValueError("BLS observation is outside the request contract")
                 if period == "M13":
                     continue
                 if not re.fullmatch(r"M(?:0[1-9]|1[0-2])", period):
                     raise ValueError("BLS observation period is invalid")
                 try:
-                    year = int(item.get("year"))
                     month = int(period[1:])
-                    value = Decimal(str(item.get("value")))
                     value_date = date(year, month, 1)
-                except (ArithmeticError, TypeError, ValueError) as exc:
+                except (TypeError, ValueError) as exc:
                     raise ValueError("BLS observation is malformed") from exc
                 if (
-                    year < start_year
-                    or year > end_year
-                    or value_date > fetched_at.astimezone(UTC).date()
-                    or not value.is_finite()
+                    value_date > fetched_at.astimezone(UTC).date()
                 ):
                     raise ValueError("BLS observation is outside the request contract")
                 identity = (series_id, year, month)
                 if identity in seen_rows:
                     raise ValueError("BLS response contains a duplicate observation")
                 seen_rows.add(identity)
+                latest_observation_dates[series_id] = max(
+                    value_date,
+                    latest_observation_dates.get(series_id, value_date),
+                )
+                raw_value = item.get("value")
+                if isinstance(raw_value, str) and raw_value == "-":
+                    missing_observations.append(
+                        {
+                            "series_id": series_id,
+                            "date": value_date.isoformat(),
+                        }
+                    )
+                    continue
+                if not isinstance(raw_value, str) or not raw_value:
+                    raise ValueError("BLS observation value is invalid")
+                try:
+                    value = Decimal(raw_value)
+                except (ArithmeticError, ValueError) as exc:
+                    raise ValueError("BLS observation value is invalid") from exc
+                if not value.is_finite():
+                    raise ValueError("BLS observation value is invalid")
                 latest_value_dates[series_id] = max(
                     value_date,
                     latest_value_dates.get(series_id, value_date),
                 )
-                footnotes = item.get("footnotes") or []
-                if not isinstance(footnotes, list) or any(
-                    not isinstance(footnote, dict) for footnote in footnotes
-                ):
-                    raise ValueError("BLS observation footnotes are malformed")
                 preliminary = any(
                     str(footnote.get("code") or "").upper() == "P"
                     or "preliminary" in str(footnote.get("text") or "").lower()
@@ -2693,24 +2757,40 @@ class BLSProvider(HTTPProvider):
                         "value": value,
                         "quality_status": "estimated" if preliminary else "fresh",
                         "metadata": {
-                            "period_name": item.get("periodName"),
-                            "latest": item.get("latest") == "true",
+                            "period_name": period_name,
+                            "latest": latest == "true",
                             "footnotes": footnotes,
                             "preliminary": preliminary,
                         },
                     }
                 )
         records.sort(key=lambda item: (str(item["series_id"]), str(item["date"])))
+        missing_observations.sort(key=lambda item: (item["series_id"], item["date"]))
         messages = payload.get("message") or []
         if not isinstance(messages, list):
             raise ValueError("BLS response messages are malformed")
         missing_series = sorted(requested - returned_series)
+        latest_missing_series = sorted(
+            series_id
+            for series_id in returned_series
+            if series_id not in latest_value_dates
+            or latest_observation_dates[series_id] > latest_value_dates[series_id]
+        )
         return records, {
             "requested_series": list(requested_series),
             "returned_series": sorted(returned_series),
             "missing_series": missing_series,
             "messages": list(messages),
-            "quality_status": "partial" if missing_series else "complete",
+            "quality_status": (
+                "partial" if missing_series or latest_missing_series else "complete"
+            ),
+            "missing_observations": missing_observations,
+            "official_missing_observation_count": len(missing_observations),
+            "latest_observation_dates": {
+                key: value.isoformat()
+                for key, value in sorted(latest_observation_dates.items())
+            },
+            "latest_missing_series": latest_missing_series,
             "start_year": start_year,
             "end_year": end_year,
             "latest_value_dates": {

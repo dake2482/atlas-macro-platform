@@ -17,6 +17,9 @@ from django.db.models.query import QuerySet
 from django.test.utils import CaptureQueriesContext
 
 from research.data_catalog import DATA_REQUIREMENTS
+from research.economy_contract import (
+    _component_payload as _strict_economy_component_payload,
+)
 from research.employment_contract import (
     EMPLOYMENT_BLS_REQUEST_SERIES,
     EMPLOYMENT_CONTRACT_VERSION,
@@ -27,6 +30,9 @@ from research.employment_contract import (
     coordinate_employment_dashboard,
     publish_employment_revision,
     select_public_employment_snapshot,
+)
+from research.employment_contract import (
+    _validate_bls_run as _validate_employment_bls_run,
 )
 from research.labor_official import (
     CONTINUED_4WK,
@@ -49,8 +55,6 @@ from research.models import (
 )
 from research.official_data import (
     BLS_SERIES,
-    ECONOMY_COMPONENTS,
-    _economy_component_payload,
     _employment_page_is_buildable,
     _publish_dashboard,
     _publish_dashboard_core,
@@ -548,14 +552,19 @@ def test_employment_publication_derives_exact_metrics_and_preserves_lineage(
     assert selected.pk == snapshot.pk
     assert selected.employment_publication_state == "current_candidate"
 
-    component = _economy_component_payload(
+    metric, chart, reference, metric_row = _strict_economy_component_payload(
         "employment",
-        ECONOMY_COMPONENTS["employment"],
-        now=datetime(2026, 7, 15, 12, tzinfo=UTC),
+        snapshot,
     )
-    assert not isinstance(component, dict)
-    assert component[0]["key"] == "lns14000000"
-    assert component[2]["snapshot_id"] == snapshot.pk
+    assert metric["key"] == "lns14000000"
+    assert chart["key"] == "labor-slack"
+    assert reference["snapshot_id"] == snapshot.pk
+    assert reference["selected_metric_snapshot_id"] == metric_row.pk
+    assert reference["root_source_keys"] == sorted(snapshot.data["source_keys"])
+    assert reference["root_component_batches"] == sorted(
+        snapshot.data["component_batches"]
+    )
+    assert reference["root_fresh_until"] == snapshot.data["fresh_until"]
 
     metrics = {item["key"]: item for item in snapshot.data["metrics"]}
     assert metrics["nonfarm-payroll-change"]["value"] == 100.0
@@ -746,6 +755,29 @@ def test_employment_bls_dataset_identity_is_exact_and_ordered():
     )
     assert not _is_employment_bls_dataset("series:" + ",".join(EMPLOYMENT_BLS_REQUEST_SERIES[:-1]))
     assert not _is_employment_bls_dataset(canonical + ",EXTRA")
+
+
+@pytest.mark.django_db
+def test_employment_bls_gate_uses_type_strict_required_metadata(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    bls_run, _dol_run = _strict_employment_runs(monkeypatch, settings, tmp_path)
+    baseline = deepcopy(bls_run.metadata)
+    for mutation in ("bool-for-int", "float-for-int", "missing-key"):
+        metadata = deepcopy(baseline)
+        if mutation == "bool-for-int":
+            metadata["official_missing_observation_count"] = False
+        elif mutation == "float-for-int":
+            metadata["start_year"] = 2025.0
+        else:
+            metadata.pop("latest_missing_series")
+        IngestionRun.objects.filter(pk=bls_run.pk).update(metadata=metadata)
+        bls_run.refresh_from_db()
+
+        with pytest.raises(ValueError, match="metadata does not replay"):
+            _validate_employment_bls_run(bls_run)
 
 
 @pytest.mark.django_db

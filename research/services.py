@@ -1031,6 +1031,21 @@ SERIES_CATALOG = {
         "%",
         "monthly",
     ),
+    "CENSUS-API-MRTS-44X72-SM-SA": (
+        "Retail Trade and Food Services Sales, Seasonally Adjusted",
+        "USD millions",
+        "monthly",
+    ),
+    "CENSUS-API-MRTS-44X72-SM-SA-MOM": (
+        "Retail Trade and Food Services Sales, Month-over-Month",
+        "%",
+        "monthly",
+    ),
+    "CENSUS-API-MRTS-44X72-SM-SA-YOY": (
+        "Retail Trade and Food Services Sales, Year-over-Year",
+        "%",
+        "monthly",
+    ),
     "G19-CONSUMER-CREDIT-GROWTH-SAAR": (
         "Total Consumer Credit Growth, SAAR",
         "% annual rate",

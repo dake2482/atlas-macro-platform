@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from django.db import transaction
 
 from research import official_data
@@ -111,7 +113,6 @@ def test_macro_refresh_uses_every_v2_persistence_callback(monkeypatch, db):
         "_store_consumer_credit_observations_v2",
         _spy(consumer_calls),
     )
-    monkeypatch.setattr(official_data, "_record_census_revision_witness", lambda runs: None)
     monkeypatch.setattr(
         official_data,
         "_publishable_keys_for_source_groups",
@@ -149,10 +150,28 @@ def test_macro_refresh_uses_every_v2_persistence_callback(monkeypatch, db):
         "coordinate_gdp_dashboard",
         coordinate_gdp,
     )
+    coordination_order = []
+
+    def coordinate_consumer(runs):
+        assert transaction.get_connection().in_atomic_block
+        coordination_order.append("consumer")
+        return [], set()
+
+    def coordinate_economy():
+        assert transaction.get_connection().in_atomic_block
+        coordination_order.append("economy")
+        assert coordination_order == ["consumer", "economy"]
+        return [], set()
+
+    monkeypatch.setattr(
+        official_data,
+        "coordinate_consumer_dashboard",
+        coordinate_consumer,
+    )
     monkeypatch.setattr(
         official_data,
         "_coordinate_economy_dashboard",
-        lambda: ([], set()),
+        coordinate_economy,
     )
     inflation_coordinates = []
 
@@ -183,6 +202,7 @@ def test_macro_refresh_uses_every_v2_persistence_callback(monkeypatch, db):
     assert result["dashboard_keys"] == []
     assert len(gdp_coordinates) == 1
     assert len(inflation_coordinates) == 1
+    assert coordination_order == ["consumer", "economy"]
     assert bea_calls == [
         ("bea-release", "gdp-release-workbooks"),
         ("bea-pio-release", "personal-income-outlays-release"),
@@ -195,3 +215,92 @@ def test_macro_refresh_uses_every_v2_persistence_callback(monkeypatch, db):
         ("federal-reserve-g19", "consumer-credit"),
         ("ny-fed-household-credit", "household-debt-credit"),
     ]
+
+
+def test_broad_refresh_coordinates_consumer_before_economy(monkeypatch, db):
+    class BroadProvider:
+        def __getattr__(self, method_name):
+            def fetch(**_kwargs):
+                return ProviderResult(
+                    provider=f"fixture-{method_name.replace('_', '-')}",
+                    dataset=f"fixture:{method_name}",
+                    records=[],
+                )
+
+            return fetch
+
+        def close(self):
+            return None
+
+    for provider_name in (
+        "NYFedMarketsProvider",
+        "TreasuryRatesProvider",
+        "FiscalDataProvider",
+        "BLSProvider",
+        "BEAPIOReleaseProvider",
+        "DOLWeeklyClaimsProvider",
+        "FederalReserveRSSProvider",
+    ):
+        monkeypatch.setattr(official_data, provider_name, BroadProvider)
+
+    def fake_record(result, *, persist):
+        _ = persist
+        return SimpleNamespace(
+            source=SimpleNamespace(key=result.provider),
+            dataset=result.dataset,
+            status="success",
+            row_count=0,
+            error="",
+        )
+
+    monkeypatch.setattr(official_data, "record_provider_result", fake_record)
+    monkeypatch.setattr(official_data, "_has_publishable_run", lambda _runs: False)
+    for coordinator_name in (
+        "coordinate_employment_dashboard",
+        "coordinate_inflation_dashboard",
+        "_coordinate_fed_funds_dashboard",
+        "_coordinate_reserves_rate_spreads_dashboard",
+        "_coordinate_treasury_curve_dashboards",
+        "_coordinate_liquidity_dashboard",
+        "_coordinate_fed_balance_sheet_dashboard",
+        "_coordinate_subsurface_dashboard",
+        "_coordinate_operations_dashboard",
+        "_coordinate_assets_fx_dashboard",
+        "coordinate_fx_vol_dashboard",
+        "_coordinate_global_dollar_dashboard",
+        "_coordinate_transmission_chain_dashboard",
+        "_coordinate_auction_dashboard",
+        "_coordinate_rrp_tga_dashboard",
+    ):
+        monkeypatch.setattr(
+            official_data,
+            coordinator_name,
+            lambda *args, **kwargs: ([], set()),
+        )
+
+    order = []
+
+    def coordinate_consumer(runs):
+        assert runs
+        order.append("consumer")
+        return [], set()
+
+    def coordinate_economy():
+        order.append("economy")
+        return [], set()
+
+    monkeypatch.setattr(
+        official_data,
+        "coordinate_consumer_dashboard",
+        coordinate_consumer,
+    )
+    monkeypatch.setattr(
+        official_data,
+        "_coordinate_economy_dashboard",
+        coordinate_economy,
+    )
+
+    result = official_data.refresh_official_data(current_year=2026)
+
+    assert order == ["consumer", "economy"]
+    assert result["dashboard_keys"] == []

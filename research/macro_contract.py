@@ -964,6 +964,12 @@ def _gdp_snapshot_static_replay(
         return None
 
 
+def replay_gdp_snapshot(snapshot: DashboardSnapshot) -> SimpleNamespace | None:
+    """Replay one immutable GDP revision without consulting live acquisition state."""
+
+    return _gdp_snapshot_static_replay(snapshot)
+
+
 def _attempt_reference(run: IngestionRun) -> dict[str, Any]:
     return {
         "ingestion_run_id": run.pk,

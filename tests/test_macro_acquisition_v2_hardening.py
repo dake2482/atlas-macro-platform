@@ -20,6 +20,7 @@ from research.macro_official import CensusMARTSProvider
 from research.macro_releases import BEAPIOReleaseProvider
 from research.models import IngestionRun, Observation, RawArtifact
 from research.official_data import (
+    _guard_series_coverage_not_shrunk,
     _store_bea_release_observations_v2,
     _store_bls_observations_v2,
     _store_census_marts_observations_v2,
@@ -34,6 +35,44 @@ from research.raw_evidence import EvidenceResponse, build_evidence_bundle
 from research.services import ensure_source, record_provider_result
 
 
+def test_series_coverage_guard_rejects_start_only_shrink_even_if_end_advances():
+    previous = {
+        "series_date_coverage": {
+            "example-series": {
+                "start": "2025-01-01",
+                "end": "2025-06-01",
+                "count": 6,
+            }
+        }
+    }
+    candidate = {
+        "example-series": {
+            "start": "2025-02-01",
+            "end": "2025-07-01",
+            "count": 6,
+        }
+    }
+
+    with pytest.raises(ValueError, match="series coverage shrank"):
+        _guard_series_coverage_not_shrunk(
+            context="start-only fixture",
+            candidate=candidate,
+            previous_metadata=[previous],
+        )
+
+    _guard_series_coverage_not_shrunk(
+        context="expanded fixture",
+        candidate={
+            "example-series": {
+                "start": "2024-12-01",
+                "end": "2025-07-01",
+                "count": 8,
+            }
+        },
+        previous_metadata=[previous],
+    )
+
+
 def _bls_result(
     *,
     start_year: int = 2025,
@@ -43,6 +82,10 @@ def _bls_result(
     message: str | None = None,
     include_series: bool = True,
     preliminary: bool = False,
+    missing_observation_year: int | None = None,
+    missing_observation_month: int = 10,
+    observation_month: int = 6,
+    empty_series_id: str | None = None,
 ) -> ProviderResult:
     series_id = "LNS14000000"
     years = observation_years or (observation_year,)
@@ -55,19 +98,35 @@ def _bls_result(
                     {
                         "seriesID": series_id,
                         "data": [
-                            {
-                                "year": str(year),
-                                "period": "M06",
-                                "periodName": "June",
-                                "value": "4.2",
-                                "latest": "true",
-                                "footnotes": (
-                                    [{"code": "P", "text": "preliminary"}]
-                                    if preliminary
-                                    else []
-                                ),
-                            }
-                            for year in years
+                            *(
+                                [
+                                    {
+                                        "year": str(missing_observation_year),
+                                        "period": f"M{missing_observation_month:02d}",
+                                        "periodName": str(missing_observation_month),
+                                        "value": "-",
+                                        "latest": "false",
+                                        "footnotes": [],
+                                    }
+                                ]
+                                if missing_observation_year is not None
+                                else []
+                            ),
+                            *[
+                                {
+                                    "year": str(year),
+                                    "period": f"M{observation_month:02d}",
+                                    "periodName": str(observation_month),
+                                    "value": "4.2",
+                                    "latest": "true",
+                                    "footnotes": (
+                                        [{"code": "P", "text": "preliminary"}]
+                                        if preliminary
+                                        else []
+                                    ),
+                                }
+                                for year in years
+                            ],
                         ],
                     }
                 ]
@@ -76,18 +135,24 @@ def _bls_result(
             )
         },
     }
+    series_ids = [series_id]
+    if empty_series_id is not None:
+        series_ids.append(empty_series_id)
+        payload["Results"]["series"].append(
+            {"seriesID": empty_series_id, "data": []}
+        )
     raw_bytes = json.dumps(payload, separators=(",", ":")).encode()
     fetched_at = timezone.now()
     records, replay_metadata = BLSProvider.parse_series_json_bytes(
         raw_bytes,
-        series_ids=[series_id],
+        series_ids=series_ids,
         start_year=start_year,
         end_year=end_year,
         fetched_at=fetched_at,
     )
     return ProviderResult(
         provider="bls",
-        dataset=f"series:{series_id}",
+        dataset="series:" + ",".join(series_ids),
         records=records,
         fetched_at=fetched_at,
         raw_bytes=raw_bytes,
@@ -98,7 +163,7 @@ def _bls_result(
             "sha256": hashlib.sha256(raw_bytes).hexdigest(),
             **replay_metadata,
             "request_witness": {
-                "series_ids": [series_id],
+                "series_ids": series_ids,
                 "start_year": start_year,
                 "end_year": end_year,
             },
@@ -236,8 +301,8 @@ def test_bls_rejects_coverage_shrink_and_missing_requested_series(
     first = record_provider_result(
         _bls_result(
             start_year=2024,
-            end_year=2025,
-            observation_year=2025,
+            end_year=2026,
+            observation_years=(2025, 2026),
         ),
         persist=_store_bls_observations_v2,
     )
@@ -246,8 +311,8 @@ def test_bls_rejects_coverage_shrink_and_missing_requested_series(
     narrowed = record_provider_result(
         _bls_result(
             start_year=2025,
-            end_year=2025,
-            observation_year=2025,
+            end_year=2026,
+            observation_years=(2025, 2026),
         ),
         persist=_store_bls_observations_v2,
     )
@@ -255,13 +320,17 @@ def test_bls_rejects_coverage_shrink_and_missing_requested_series(
     assert "coverage window shrank" in narrowed.error
 
     rolled = record_provider_result(
-        _bls_result(start_year=2025, end_year=2026),
+        _bls_result(
+            start_year=2024,
+            end_year=2026,
+            observation_years=(2025, 2026),
+        ),
         persist=_store_bls_observations_v2,
     )
     assert rolled.status == IngestionRun.Status.SUCCESS
 
     missing = record_provider_result(
-        _bls_result(include_series=False),
+        _bls_result(start_year=2024, end_year=2026, include_series=False),
         persist=_store_bls_observations_v2,
     )
     assert missing.status == IngestionRun.Status.FAILED
@@ -284,6 +353,108 @@ def test_bls_preliminary_row_persists_as_exact_estimated_observation(
     assert observation.quality_status == Observation.Quality.ESTIMATED
     assert observation.metadata["preliminary"] is True
     assert RawArtifact.objects.filter(run=run).count() == 1
+
+
+@pytest.mark.django_db
+def test_bls_official_missing_observation_persists_gap_and_rejects_metadata_tamper(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    result = _bls_result(missing_observation_year=2025)
+
+    replay_records, replay_metadata = _validated_bls_raw_contract(result)
+    assert len(replay_records) == 1
+    assert replay_metadata["quality_status"] == "complete"
+    assert replay_metadata["missing_observations"] == [
+        {"series_id": "LNS14000000", "date": "2025-10-01"}
+    ]
+    assert replay_metadata["official_missing_observation_count"] == 1
+    assert replay_metadata["latest_observation_dates"] == {
+        "LNS14000000": "2026-06-01"
+    }
+    assert replay_metadata["latest_missing_series"] == []
+
+    run = record_provider_result(result, persist=_store_bls_observations_v2)
+    assert run.status == IngestionRun.Status.SUCCESS, run.error
+    assert Observation.objects.filter(batch_id=run.batch_id).count() == 1
+    assert RawArtifact.objects.filter(run=run).count() == 1
+
+    for mutation in ("bool-for-int", "float-for-int", "missing-key"):
+        tampered = _bls_result(missing_observation_year=2025)
+        if mutation == "bool-for-int":
+            tampered.metadata["official_missing_observation_count"] = True
+        elif mutation == "float-for-int":
+            tampered.metadata["start_year"] = 2025.0
+        else:
+            tampered.metadata.pop("latest_missing_series")
+        with pytest.raises(ValueError, match="replay metadata"):
+            _validated_bls_raw_contract(tampered)
+
+
+@pytest.mark.django_db
+def test_bls_latest_official_missing_observation_cannot_publish_complete_batch(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    result = _bls_result(
+        start_year=2026,
+        end_year=2026,
+        observation_year=2026,
+        observation_month=5,
+        missing_observation_year=2026,
+        missing_observation_month=6,
+    )
+
+    assert result.metadata["quality_status"] == "partial"
+    assert result.metadata["latest_missing_series"] == ["LNS14000000"]
+    with pytest.raises(ValueError, match="lacks required requested-series coverage"):
+        _validated_bls_raw_contract(result)
+
+    run = record_provider_result(result, persist=_store_bls_observations_v2)
+    assert run.status == IngestionRun.Status.FAILED
+    assert "lacks required requested-series coverage" in run.error
+    assert not Observation.objects.filter(batch_id=run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=run).exists()
+
+
+@pytest.mark.django_db
+def test_bls_mixed_valid_and_empty_returned_series_is_partial_and_rejected(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    empty_series_id = "LNS11300000"
+    result = _bls_result(empty_series_id=empty_series_id)
+
+    assert result.records and {
+        record["series_id"] for record in result.records
+    } == {"LNS14000000"}
+    assert result.metadata["missing_series"] == []
+    assert result.metadata["latest_missing_series"] == [empty_series_id]
+    assert result.metadata["quality_status"] == "partial"
+    assert result.metadata["latest_value_dates"] == {
+        "LNS14000000": "2026-06-01"
+    }
+    assert result.metadata["latest_observation_dates"] == {
+        "LNS14000000": "2026-06-01"
+    }
+
+    generic_run = record_provider_result(result)
+    assert generic_run.status == IngestionRun.Status.PARTIAL
+
+    strict_result = _bls_result(empty_series_id=empty_series_id)
+    with pytest.raises(ValueError, match="lacks required requested-series coverage"):
+        _validated_bls_raw_contract(strict_result)
+    strict_run = record_provider_result(
+        strict_result,
+        persist=_store_bls_observations_v2,
+    )
+    assert strict_run.status == IngestionRun.Status.FAILED
+    assert "lacks required requested-series coverage" in strict_run.error
+    assert not Observation.objects.filter(batch_id=strict_run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=strict_run).exists()
 
 
 @pytest.mark.django_db
@@ -608,12 +779,12 @@ def _census_result(
             "metadata": {},
         }
         for series_id in (
-            "CENSUS-MRTS-44X72-SM-SA",
-            "CENSUS-MRTS-44X72-SM-SA-MOM",
-            "CENSUS-MRTS-44X72-SM-SA-YOY",
+            "CENSUS-API-MRTS-44X72-SM-SA",
+            "CENSUS-API-MRTS-44X72-SM-SA-MOM",
+            "CENSUS-API-MRTS-44X72-SM-SA-YOY",
         )
     ]
-    return _evidence_result(
+    result = _evidence_result(
         provider="census",
         dataset="marts:44X72:SM:yes",
         roles=("marts-api-response",),
@@ -626,6 +797,8 @@ def _census_result(
         },
         nonce=nonce,
     )
+    result.metadata["retrieved_at"] = result.fetched_at.isoformat()
+    return result
 
 
 def _install_census_replay(monkeypatch, results: list[ProviderResult]) -> None:

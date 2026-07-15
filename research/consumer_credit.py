@@ -16,7 +16,7 @@ import html
 import io
 import re
 import zipfile
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import PurePosixPath
 from typing import Any
@@ -116,6 +116,24 @@ def _artifact(url: str, content: bytes, content_type: str) -> dict[str, Any]:
     }
 
 
+def _retrieved_at(entry: dict[str, Any], *, context: str) -> datetime:
+    witness = entry.get("response_witness")
+    if not isinstance(witness, dict) or set(witness) != {"retrieved_at"}:
+        raise ValueError(f"{context} retrieval witness is invalid")
+    try:
+        retrieved_at = datetime.fromisoformat(
+            str(witness["retrieved_at"]).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{context} retrieval time is invalid") from exc
+    if retrieved_at.tzinfo is None:
+        raise ValueError(f"{context} retrieval time lacks a timezone")
+    retrieved_at = retrieved_at.astimezone(UTC)
+    if retrieved_at > datetime.now(UTC) + timedelta(minutes=5):
+        raise ValueError(f"{context} retrieval time is in the future")
+    return retrieved_at
+
+
 class FederalReserveG19Provider(HTTPProvider):
     """Monthly seasonally adjusted G.19 history from the Board DDP CSV."""
 
@@ -146,6 +164,7 @@ class FederalReserveG19Provider(HTTPProvider):
         try:
             choose = self.client.get(G19_CHOOSE_PATH, params={"rel": "G19"})
             choose.raise_for_status()
+            choose_retrieved_at = datetime.now(UTC)
             choose_bytes = choose.content
             if not choose_bytes or len(choose_bytes) > self.max_html_bytes:
                 raise ValueError("G.19 package page exceeded configured size or was empty")
@@ -159,6 +178,7 @@ class FederalReserveG19Provider(HTTPProvider):
             output_url = self._canonical_output_url(package_params)
             response = self.client.get(output_url)
             response.raise_for_status()
+            output_retrieved_at = datetime.now(UTC)
             csv_bytes = response.content
             if not csv_bytes or len(csv_bytes) > self.max_csv_bytes:
                 raise ValueError("G.19 CSV exceeded configured size or was empty")
@@ -179,6 +199,9 @@ class FederalReserveG19Provider(HTTPProvider):
                         content_type=choose_type,
                         raw_bytes=choose_bytes,
                         request_witness={"rel": "G19"},
+                        response_witness={
+                            "retrieved_at": choose_retrieved_at.isoformat(),
+                        },
                     ),
                     EvidenceResponse(
                         role="output-csv",
@@ -188,6 +211,9 @@ class FederalReserveG19Provider(HTTPProvider):
                         request_witness={
                             "discovered_from": "choose-page",
                             "params": package_params,
+                        },
+                        response_witness={
+                            "retrieved_at": output_retrieved_at.isoformat(),
                         },
                     ),
                 ),
@@ -200,6 +226,7 @@ class FederalReserveG19Provider(HTTPProvider):
             provider=self.key,
             dataset=dataset,
             records=records,
+            fetched_at=output_retrieved_at,
             raw_bytes=raw_bundle,
             metadata={
                 **bundle_metadata,
@@ -238,7 +265,10 @@ class FederalReserveG19Provider(HTTPProvider):
         params = dict(pairs)
         if (
             params.get("rel") != "G19"
-            or not params.get("series")
+            or not str(params.get("series") or "").strip()
+            or params.get("lastObs") != ""
+            or params.get("from") != ""
+            or params.get("to") != ""
             or params.get("filetype") != "csv"
             or params.get("label") != "include"
             or params.get("layout") != "seriescolumn"
@@ -275,12 +305,20 @@ class FederalReserveG19Provider(HTTPProvider):
             choose_entry["url"] != G19_CHOOSE_URL
             or choose_entry["content_type"] != "text/html"
             or choose_entry["request_witness"] != {"rel": "G19"}
-            or choose_entry["response_witness"] != {}
             or output_entry["content_type"]
             not in {"text/csv", "application/csv", "application/octet-stream"}
-            or output_entry["response_witness"] != {}
         ):
             raise ValueError("G.19 evidence response contract is invalid")
+        choose_retrieved_at = _retrieved_at(
+            choose_entry,
+            context="G.19 choose page",
+        )
+        output_retrieved_at = _retrieved_at(
+            output_entry,
+            context="G.19 output CSV",
+        )
+        if output_retrieved_at < choose_retrieved_at:
+            raise ValueError("G.19 response retrieval chronology is invalid")
         choose_text = evidence.responses["choose-page"].decode("utf-8")
         package_params = cls._package_params(choose_text)
         release_date = cls._release_date(choose_text)
@@ -295,6 +333,10 @@ class FederalReserveG19Provider(HTTPProvider):
         ):
             raise ValueError("G.19 output request does not replay from package page")
         records, latest_period = cls._parse_csv(evidence.responses["output-csv"])
+        if release_date > output_retrieved_at.date():
+            raise ValueError("G.19 official release date is in the future")
+        if date.fromisoformat(latest_period) > output_retrieved_at.date():
+            raise ValueError("G.19 observation period is in the future")
         for record in records:
             record["metadata"]["source_revision_date"] = release_date.isoformat()
             record["metadata"]["release_freshness_days"] = 45
@@ -305,6 +347,11 @@ class FederalReserveG19Provider(HTTPProvider):
             "frequency": "monthly",
             "seasonal_adjustment": "seasonally adjusted",
             "quality_status": "complete",
+            "retrieved_at": output_retrieved_at.isoformat(),
+            "response_retrieved_at": {
+                "choose-page": choose_retrieved_at.isoformat(),
+                "output-csv": output_retrieved_at.isoformat(),
+            },
         }
 
     @staticmethod
@@ -322,18 +369,46 @@ class FederalReserveG19Provider(HTTPProvider):
     def _parse_csv(payload: bytes) -> tuple[list[dict[str, Any]], str]:
         text = payload.decode("utf-8-sig")
         rows = list(csv.reader(io.StringIO(text)))
-        if len(rows) < 7 or not rows[0] or rows[0][0] != "Series Description":
+        expected_headers = (
+            "Series Description",
+            "Unit:",
+            "Multiplier:",
+            "Currency:",
+            "Unique Identifier:",
+            "Time Period",
+        )
+        if len(rows) < 7 or any(not row for row in rows[:6]):
             raise ValueError("G.19 CSV header is missing")
+        if tuple(row[0] for row in rows[:6]) != expected_headers:
+            raise ValueError("G.19 CSV metadata headers are invalid")
+        column_count = len(rows[0])
+        if column_count < 2 or any(len(row) != column_count for row in rows[:6]):
+            raise ValueError("G.19 CSV metadata row width is inconsistent")
         descriptions = rows[0][1:]
-        units = rows[1][1:] if rows[1] and rows[1][0] == "Unit:" else []
-        multipliers = rows[2][1:] if rows[2] and rows[2][0] == "Multiplier:" else []
-        identifiers = rows[4][1:] if rows[4] and rows[4][0] == "Unique Identifier:" else []
-        if not (len(descriptions) == len(units) == len(multipliers) == len(identifiers)):
-            raise ValueError("G.19 CSV metadata columns are inconsistent")
-        if len(descriptions) != len(set(descriptions)) or len(identifiers) != len(
-            set(identifiers)
+        units = rows[1][1:]
+        multipliers = rows[2][1:]
+        currencies = rows[3][1:]
+        identifiers = rows[4][1:]
+        series_headers = rows[5][1:]
+        metadata_columns = (
+            descriptions,
+            units,
+            multipliers,
+            currencies,
+            identifiers,
+            series_headers,
+        )
+        if any(
+            len(values) != len(descriptions)
+            or any(not str(value).strip() for value in values)
+            for values in metadata_columns
         ):
-            raise ValueError("G.19 CSV duplicated a description or identifier")
+            raise ValueError("G.19 CSV metadata columns must be complete and non-empty")
+        if any(
+            len(values) != len(set(values))
+            for values in (descriptions, identifiers, series_headers)
+        ):
+            raise ValueError("G.19 CSV duplicated a description, identifier, or series header")
         missing_descriptions = sorted(set(G19_SERIES) - set(descriptions))
         if missing_descriptions:
             raise ValueError(f"G.19 required columns missing: {', '.join(missing_descriptions)}")
@@ -354,30 +429,66 @@ class FederalReserveG19Provider(HTTPProvider):
                 raise ValueError(
                     f"G.19 source unit or multiplier is invalid for {description}"
                 )
+            if str(currencies[index]).strip().upper() != "USD":
+                raise ValueError(f"G.19 source currency is invalid for {description}")
 
-        records: list[dict[str, Any]] = []
-        latest_by_series: dict[str, str] = {}
-        seen_periods: set[str] = set()
-        seen_records: set[tuple[str, str]] = set()
+        required_columns = {
+            description: (descriptions.index(description) + 1, target)
+            for description, target in G19_SERIES.items()
+        }
+        period_rows: dict[date, list[str]] = {}
         for row in rows[6:]:
             if not row or not re.fullmatch(r"\d{4}-\d{2}", row[0].strip()):
+                if any(
+                    index < len(row) and str(row[index]).strip()
+                    for index, _target in required_columns.values()
+                ):
+                    raise ValueError("G.19 CSV non-month row contains required values")
                 continue
-            value_date = f"{row[0].strip()}-01"
-            if value_date in seen_periods:
+            if len(row) != column_count:
+                raise ValueError("G.19 CSV data row width does not match its headers")
+            year, month = (int(part) for part in row[0].strip().split("-", 1))
+            try:
+                period = date(year, month, 1)
+            except ValueError as exc:
+                raise ValueError("G.19 CSV monthly period is invalid") from exc
+            if period in period_rows:
                 raise ValueError("G.19 CSV duplicated a monthly period")
-            seen_periods.add(value_date)
-            for index, description in enumerate(descriptions, start=1):
-                target = G19_SERIES.get(description)
-                if target is None:
-                    continue
-                value = _decimal(row[index] if index < len(row) else None)
-                if value is None:
-                    continue
+            period_rows[period] = row
+        ordered_periods = sorted(period_rows)
+        for previous, current in zip(ordered_periods, ordered_periods[1:], strict=False):
+            expected = (
+                date(previous.year + 1, 1, 1)
+                if previous.month == 12
+                else date(previous.year, previous.month + 1, 1)
+            )
+            if current != expected:
+                raise ValueError("G.19 CSV history contains a missing month")
+        records: list[dict[str, Any]] = []
+        latest_by_series: dict[str, str] = {}
+        started_series: set[str] = set()
+        missing_markers = {"", ".", "n.a."}
+        for period in ordered_periods:
+            value_date = period.isoformat()
+            row = period_rows[period]
+            for description, (index, target) in required_columns.items():
+                raw_value = row[index]
+                value = _decimal(raw_value)
                 series_id, normalized_unit = target
-                identity = (series_id, value_date)
-                if identity in seen_records:
-                    raise ValueError("G.19 CSV duplicated a series-period observation")
-                seen_records.add(identity)
+                if value is None:
+                    normalized_missing = str(raw_value).strip().casefold()
+                    if normalized_missing not in missing_markers:
+                        raise ValueError(
+                            f"G.19 required value is invalid for {description} "
+                            f"at {value_date}"
+                        )
+                    if series_id in started_series:
+                        raise ValueError(
+                            f"G.19 series has a missing month after starting: "
+                            f"{description} at {value_date}"
+                        )
+                    continue
+                started_series.add(series_id)
                 latest_by_series[series_id] = value_date
                 records.append(
                     {
@@ -389,6 +500,7 @@ class FederalReserveG19Provider(HTTPProvider):
                             "description": description,
                             "source_unit": units[index - 1],
                             "source_multiplier": multipliers[index - 1],
+                            "source_currency": currencies[index - 1],
                             "unit": normalized_unit,
                             "frequency": "monthly",
                             "seasonal_adjustment": "seasonally adjusted",
@@ -396,6 +508,14 @@ class FederalReserveG19Provider(HTTPProvider):
                         },
                     }
                 )
+        entirely_missing = sorted(
+            {item[0] for item in G19_SERIES.values()} - started_series
+        )
+        if entirely_missing:
+            raise ValueError(
+                "G.19 CSV has entirely missing required series: "
+                f"{', '.join(entirely_missing)}"
+            )
         if not records or set(latest_by_series) != {item[0] for item in G19_SERIES.values()}:
             raise ValueError("G.19 CSV did not provide complete required history")
         latest_periods = set(latest_by_series.values())
@@ -436,6 +556,7 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
         try:
             bank = self.client.get(NYFED_DATABANK_PATH)
             bank.raise_for_status()
+            bank_retrieved_at = datetime.now(UTC)
             bank_bytes = bank.content
             if not bank_bytes or len(bank_bytes) > self.max_html_bytes:
                 raise ValueError("NY Fed data bank page exceeded configured size or was empty")
@@ -448,6 +569,7 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
 
             response = self.client.get(workbook_url)
             response.raise_for_status()
+            workbook_retrieved_at = datetime.now(UTC)
             workbook_bytes = response.content
             if not workbook_bytes or len(workbook_bytes) > self.max_workbook_bytes:
                 raise ValueError("NY Fed household debt workbook exceeded configured size or was empty")
@@ -473,6 +595,9 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
                         url=NYFED_DATABANK_URL,
                         content_type=bank_type,
                         raw_bytes=bank_bytes,
+                        response_witness={
+                            "retrieved_at": bank_retrieved_at.isoformat(),
+                        },
                     ),
                     EvidenceResponse(
                         role="household-debt-workbook",
@@ -482,6 +607,9 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
                         request_witness={
                             "discovered_from": "databank-page",
                             "expected_period": expected_period,
+                        },
+                        response_witness={
+                            "retrieved_at": workbook_retrieved_at.isoformat(),
                         },
                     ),
                 ),
@@ -494,6 +622,7 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
             provider=self.key,
             dataset=dataset,
             records=records,
+            fetched_at=workbook_retrieved_at,
             raw_bytes=raw_bundle,
             metadata={
                 **bundle_metadata,
@@ -538,11 +667,19 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
             bank_entry["url"] != NYFED_DATABANK_URL
             or bank_entry["content_type"] != "text/html"
             or bank_entry["request_witness"] != {}
-            or bank_entry["response_witness"] != {}
             or workbook_entry["content_type"] not in allowed_workbook_types
-            or workbook_entry["response_witness"] != {}
         ):
             raise ValueError("NY Fed household debt evidence response contract is invalid")
+        bank_retrieved_at = _retrieved_at(
+            bank_entry,
+            context="NY Fed data bank page",
+        )
+        workbook_retrieved_at = _retrieved_at(
+            workbook_entry,
+            context="NY Fed household debt workbook",
+        )
+        if workbook_retrieved_at < bank_retrieved_at:
+            raise ValueError("NY Fed household debt retrieval chronology is invalid")
         bank_text = evidence.responses["databank-page"].decode("utf-8")
         workbook_url, expected_period = cls._latest_workbook(bank_text)
         if (
@@ -565,6 +702,8 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
             raise ValueError(
                 f"NY Fed workbook latest period {latest_period} does not match filename {expected_period}"
             )
+        if date.fromisoformat(latest_period) > workbook_retrieved_at.date():
+            raise ValueError("NY Fed household debt observation period is in the future")
         return records, {
             "source_page": NYFED_HHDC_PAGE,
             "data_bank_url": NYFED_DATABANK_URL,
@@ -574,6 +713,11 @@ class NYFedHouseholdDebtProvider(HTTPProvider):
             "frequency": "quarterly",
             "quality_status": "complete",
             "attribution": "New York Fed Consumer Credit Panel / Equifax",
+            "retrieved_at": workbook_retrieved_at.isoformat(),
+            "response_retrieved_at": {
+                "databank-page": bank_retrieved_at.isoformat(),
+                "household-debt-workbook": workbook_retrieved_at.isoformat(),
+            },
         }
 
     @staticmethod
@@ -708,23 +852,64 @@ def _parse_hhdc_sheet(
     chart_name: str,
 ) -> tuple[list[dict[str, Any]], str]:
     headers = [str(cell.value or "").strip() for cell in sheet[4]]
+    named_headers = [header for header in headers[1:] if header]
+    duplicate_headers = sorted(
+        header for header in set(named_headers) if named_headers.count(header) > 1
+    )
+    if duplicate_headers:
+        raise ValueError(
+            f"NY Fed {chart_name} duplicated a column header: {', '.join(duplicate_headers)}"
+        )
     found_headers = set(headers)
     missing_headers = sorted(set(series_map) - found_headers)
     if missing_headers:
         raise ValueError(f"NY Fed {chart_name} columns missing: {', '.join(missing_headers)}")
     positions = {name: headers.index(name) for name in series_map}
-    records: list[dict[str, Any]] = []
-    latest_by_series: dict[str, str] = {}
+    period_rows: dict[str, tuple[str, tuple[Any, ...]]] = {}
     for row in sheet.iter_rows(min_row=5, values_only=True):
         period = _quarter_label(row[0] if row else None)
         if period is None:
             continue
         value_date, period_label = period
+        if value_date in period_rows:
+            raise ValueError(f"NY Fed {chart_name} duplicated a quarterly period")
+        period_rows[value_date] = (period_label, row)
+    ordered_periods = sorted(date.fromisoformat(value) for value in period_rows)
+    for previous, current in zip(ordered_periods, ordered_periods[1:], strict=False):
+        previous_quarter = (previous.month - 1) // 3 + 1
+        next_year = previous.year + 1 if previous_quarter == 4 else previous.year
+        next_quarter = 1 if previous_quarter == 4 else previous_quarter + 1
+        if current != _quarter_end(next_year, next_quarter):
+            raise ValueError(f"NY Fed {chart_name} history contains a missing quarter")
+    records: list[dict[str, Any]] = []
+    latest_by_series: dict[str, str] = {}
+    started_series: set[str] = set()
+    missing_markers = {None, "", ".", "n.a."}
+    for period in ordered_periods:
+        value_date = period.isoformat()
+        period_label, row = period_rows[value_date]
         for name, series_id in series_map.items():
             index = positions[name]
-            value = _decimal(row[index] if index < len(row) else None)
+            raw_value = row[index] if index < len(row) else None
+            value = _decimal(raw_value)
             if value is None:
+                normalized_missing = (
+                    raw_value
+                    if raw_value is None
+                    else str(raw_value).strip().casefold()
+                )
+                if normalized_missing not in missing_markers:
+                    raise ValueError(
+                        f"NY Fed {chart_name} required value is invalid for "
+                        f"{name} at {period_label}"
+                    )
+                if series_id in started_series:
+                    raise ValueError(
+                        f"NY Fed {chart_name} series has a missing quarter after "
+                        f"starting: {name} at {period_label}"
+                    )
                 continue
+            started_series.add(series_id)
             latest_by_series[series_id] = value_date
             records.append(
                 {
@@ -742,6 +927,12 @@ def _parse_hhdc_sheet(
                     },
                 }
             )
+    entirely_missing = sorted(set(series_map.values()) - started_series)
+    if entirely_missing:
+        raise ValueError(
+            f"NY Fed {chart_name} has entirely missing required series: "
+            f"{', '.join(entirely_missing)}"
+        )
     if not records or set(latest_by_series) != set(series_map.values()):
         raise ValueError(f"NY Fed {chart_name} did not provide complete required history")
     latest_periods = set(latest_by_series.values())

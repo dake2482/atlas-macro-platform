@@ -16,6 +16,7 @@ from .models import (
     GeneratedAnalysis,
     IngestionRun,
     MetricSnapshot,
+    Source,
 )
 from .official_data import (
     refresh_credit_official_data,
@@ -361,7 +362,7 @@ def publish_daily_evidence() -> dict[str, Any]:
     current_time = timezone.now()
     result = ProviderResult(
         provider="internal",
-        dataset="daily-evidence-v1",
+        dataset="daily-evidence-v2",
         records=[{"attempted_at": current_time.isoformat()}],
         fetched_at=current_time,
         metadata={"contract_version": DAILY_EVIDENCE_CONTRACT_VERSION},
@@ -411,8 +412,8 @@ def generate_daily_research() -> dict[str, Any]:
             [
                 _skip(
                     "internal",
-                    f"daily-research:{today}",
-                    "; ".join(readiness_errors) or "No complete daily-evidence v1 batch",
+                    f"daily-research-v2:{today}",
+                    "; ".join(readiness_errors) or "No complete daily-evidence v2 batch",
                 )
             ]
         )
@@ -421,7 +422,7 @@ def generate_daily_research() -> dict[str, Any]:
     research_date = date.fromisoformat(latest_data["research_date"])
     result = ProviderResult(
         provider="internal",
-        dataset=f"daily-research:{research_date}",
+        dataset=f"daily-research-v2:{research_date}",
         records=[{"dashboard_id": latest.pk, "batch_id": str(latest.batch_id)}],
         metadata={
             "dashboard_id": latest.pk,
@@ -450,10 +451,14 @@ def generate_daily_research() -> dict[str, Any]:
                     return parsed if 0 < parsed <= (2**63) - 1 else None
             return None
 
+        Source.objects.select_for_update(of=("self",)).get(key="internal")
         locked = (
             DashboardSnapshot.objects.select_for_update(of=("self",))
             .select_related("source")
-            .filter(key="daily-evidence")
+            .filter(
+                key="daily-evidence",
+                data__contract_version=DAILY_EVIDENCE_CONTRACT_VERSION,
+            )
             .order_by("-created_at", "-id")
             .first()
         )
@@ -479,12 +484,12 @@ def generate_daily_research() -> dict[str, Any]:
             if (normalized_id := contract_id(raw_id)) is not None
         ] if isinstance(locked.data.get("evidence_metric_ids"), list) else []
         list(
-            DashboardSnapshot.objects.select_for_update()
+            DashboardSnapshot.objects.select_for_update(of=("self",))
             .filter(pk__in=component_ids)
             .order_by("pk")
         )
         list(
-            MetricSnapshot.objects.select_for_update()
+            MetricSnapshot.objects.select_for_update(of=("self",))
             .filter(pk__in=metric_ids)
             .order_by("pk")
         )
@@ -517,7 +522,7 @@ def generate_daily_research() -> dict[str, Any]:
             "title": f"{research_date.isoformat()} 数据批次摘要",
             "body": locked.summary or "当日数据批次已完成，等待人工研判。",
             "model_name": "deterministic-system-summary",
-            "prompt_version": "daily-evidence-v1",
+            "prompt_version": "daily-evidence-v2",
             "review_status": GeneratedAnalysis.ReviewStatus.DRAFT,
             "evidence": [
                 {

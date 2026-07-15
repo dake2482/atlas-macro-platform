@@ -865,6 +865,7 @@ def test_registry_and_glossary_remove_legacy_scoring_language():
                 "_coordinate_reserves_rate_spreads_dashboard",
                 "_coordinate_subsurface_dashboard",
                 "_coordinate_assets_fx_dashboard",
+                "coordinate_fx_vol_dashboard",
                 "_coordinate_global_dollar_dashboard",
             ),
         ),
@@ -887,6 +888,7 @@ def test_registry_and_glossary_remove_legacy_scoring_language():
             refresh_h10_data,
             (
                 "_coordinate_assets_fx_dashboard",
+                "coordinate_fx_vol_dashboard",
                 "_coordinate_global_dollar_dashboard",
             ),
         ),
@@ -906,8 +908,20 @@ def test_h10_refresh_orders_assets_fx_before_global_dollar_and_parent():
     source = inspect.getsource(refresh_h10_data)
 
     assert source.index("_coordinate_assets_fx_dashboard") < source.index(
-        "_coordinate_global_dollar_dashboard"
-    ) < source.index("_coordinate_transmission_chain_dashboard")
+        "coordinate_fx_vol_dashboard"
+    ) < source.index("_coordinate_global_dollar_dashboard") < source.index(
+        "_coordinate_transmission_chain_dashboard"
+    )
+
+
+def test_main_refresh_orders_assets_fx_before_fx_vol_and_parent():
+    source = inspect.getsource(refresh_official_data)
+
+    assert source.index("_coordinate_assets_fx_dashboard") < source.index(
+        "coordinate_fx_vol_dashboard"
+    ) < source.index("_coordinate_global_dollar_dashboard") < source.index(
+        "_coordinate_transmission_chain_dashboard"
+    )
 
 
 def test_main_official_refresh_reuses_latest_h10_without_fetching_it():

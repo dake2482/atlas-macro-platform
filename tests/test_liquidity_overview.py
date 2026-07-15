@@ -769,6 +769,7 @@ def test_all_three_refresh_entrypoints_invoke_liquidity_coordinator(monkeypatch)
     refresh_prates_data()
 
     assert len(calls) == 3
-    assert len(calls[0]) == 16
+    assert len(calls[0]) == 14
+    assert not any("yield_curve" in dataset for dataset in calls[0])
     assert calls[1] == ["h41:fixture"]
     assert calls[2] == ["iorb:fixture"]

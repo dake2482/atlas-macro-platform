@@ -334,24 +334,52 @@ def test_wrong_dataset_same_named_swap_series_cannot_publish_global_dollar_v1():
 
 
 def test_treasury_provider_normalizes_nominal_curve_xml():
-    payload = """<?xml version="1.0"?>
+    values = {
+        field: (
+            "4.21"
+            if series_id == "UST-2Y"
+            else "4.56"
+            if series_id == "UST-10Y"
+            else "4.00"
+        )
+        for field, series_id in TreasuryRatesProvider.NOMINAL_FIELDS.items()
+    }
+    fields = "".join(
+        f'<d:{field} m:type="Edm.Double">{value}</d:{field}>'
+        for field, value in values.items()
+    )
+    payload = f"""<?xml version="1.0"?>
     <feed xmlns="http://www.w3.org/2005/Atom"
       xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
       xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
-      <entry><content><m:properties>
-        <d:NEW_DATE>2026-07-10T00:00:00</d:NEW_DATE>
-        <d:BC_2YEAR>4.21</d:BC_2YEAR><d:BC_10YEAR>4.56</d:BC_10YEAR>
+      <title>DailyTreasuryYieldCurveRateData</title>
+      <id>https://home.treasury.gov/xml-item?data=daily_treasury_yield_curve</id>
+      <updated>2026-07-10T19:00:00Z</updated>
+      <entry><content type="application/xml"><m:properties>
+        <d:NEW_DATE m:type="Edm.DateTime">2026-07-10T00:00:00</d:NEW_DATE>
+        {fields}
       </m:properties></content></entry>
     </feed>"""
 
-    provider = TreasuryRatesProvider(client=_client(lambda _: httpx.Response(200, text=payload)))
+    provider = TreasuryRatesProvider(
+        client=_client(
+            lambda _: httpx.Response(
+                200,
+                text=payload,
+                headers={"content-type": "text/xml; charset=UTF-8"},
+            )
+        )
+    )
     result = provider.yield_curve(year=2026)
 
     assert result.ok
-    assert {(item["series_id"], item["value"]) for item in result.records} == {
-        ("UST-2Y", Decimal("4.21")),
-        ("UST-10Y", Decimal("4.56")),
+    normalized = {
+        item["series_id"]: item["value"] for item in result.records
     }
+    assert len(normalized) == len(TreasuryRatesProvider.NOMINAL_FIELDS)
+    assert normalized["UST-2Y"] == Decimal("4.21")
+    assert normalized["UST-10Y"] == Decimal("4.56")
+    assert result.raw_bytes == payload.encode()
 
 
 def test_bls_provider_normalizes_monthly_series():
@@ -1103,7 +1131,7 @@ def test_legacy_chart_data_footer_uses_chart_lineage_not_all_page_sources(client
     chart_source = _licensed_source("legacy-chart-only")
     metric_source = _licensed_source("legacy-metric-only")
     DashboardSnapshot.objects.create(
-        key="rates",
+        key="consumer",
         title="Legacy chart snapshot",
         as_of=timezone.now(),
         source=shell,
@@ -1129,7 +1157,7 @@ def test_legacy_chart_data_footer_uses_chart_lineage_not_all_page_sources(client
         },
     )
 
-    body = client.get("/rates/").content.decode()
+    body = client.get("/economy/consumer/").content.decode()
     chart_footer = body.split('<footer class="source-line', 1)[1].split(
         "</footer>", 1
     )[0]

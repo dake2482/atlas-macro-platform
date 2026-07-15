@@ -25,6 +25,7 @@ from .official_data import (
     refresh_macro_official_data,
     refresh_official_data,
     refresh_prates_data,
+    refresh_treasury_curve_data,
 )
 from .official_news import (
     BLSReleaseProvider,
@@ -93,6 +94,11 @@ def refresh_official_sources() -> dict[str, Any]:
     if "assets-fx" in summary.get("stale_dashboard_keys", []):
         raise RuntimeError(
             "Official ingestion completed but the required assets-fx v1 "
+            "snapshot is stale or unavailable"
+        )
+    if "fx-vol" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but the required fx-vol v1 "
             "snapshot is stale or unavailable"
         )
     if "global-dollar" in summary.get("stale_dashboard_keys", []):
@@ -174,6 +180,11 @@ def refresh_h10_sources() -> dict[str, Any]:
             "H.10 ingestion completed but the required assets-fx v1 "
             "snapshot is stale or unavailable"
         )
+    if "fx-vol" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.10 ingestion completed but the required fx-vol v1 "
+            "snapshot is stale or unavailable"
+        )
     if "global-dollar" in summary.get("stale_dashboard_keys", []):
         raise RuntimeError(
             "H.10 ingestion completed but the required global-dollar v1 "
@@ -182,6 +193,28 @@ def refresh_h10_sources() -> dict[str, Any]:
     if "transmission-chain" in summary.get("stale_dashboard_keys", []):
         raise RuntimeError(
             "H.10 ingestion completed but transmission-chain v1 remained stale"
+        )
+    return summary
+
+
+@shared_task(name="research.tasks.refresh_treasury_curve_sources")
+def refresh_treasury_curve_sources() -> dict[str, Any]:
+    """Refresh only the current-year nominal and real Treasury XML shards."""
+
+    current_year = timezone.now().year
+    summary = refresh_treasury_curve_data(
+        start_year=current_year,
+        end_year=current_year,
+    )
+    stale = {
+        "yield-curve",
+        "real-rates",
+        "rates",
+    } & set(summary.get("stale_dashboard_keys", []))
+    if stale:
+        raise RuntimeError(
+            "Treasury curve v2 has no new or independently revalidatable retained "
+            "publication for: " + ", ".join(sorted(stale))
         )
     return summary
 

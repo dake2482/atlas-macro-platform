@@ -269,6 +269,8 @@ html[data-theme="dark"] {
   .panel-header, .panel-body { padding: .9rem; }
   .page-title { font-size: 2rem; }
   .chart { min-height: 16rem; }
+  .panel > .source-line { grid-template-columns: minmax(0, 1fr); align-items: start; }
+  .panel > .source-line > span { min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 }
 
 @media (prefers-reduced-motion: reduce) {

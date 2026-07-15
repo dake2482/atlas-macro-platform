@@ -79,6 +79,8 @@ NAV_GROUPS = [
             ("通胀", "/economy/inflation/"),
             ("消费", "/economy/consumer/"),
             ("波动率", "/volatility/"),
+            ("波动率全景", "/volatility/dashboard/"),
+            ("VIX", "/volatility/vix/"),
             ("MOVE", "/volatility/move/"),
             ("FX 波动率", "/volatility/fx-vol/"),
             ("IV vs RV", "/volatility/implied-vs-realized/"),

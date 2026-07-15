@@ -10,6 +10,7 @@ from research.context_processors import NAV_GROUPS
 from research.models import (
     CodingAgentProfile,
     Company,
+    DashboardSnapshot,
     DataRequirement,
     FedDocument,
     FundLetter,
@@ -100,6 +101,29 @@ STATIC_PUBLIC_PATHS = [
 def test_route_contract_covers_every_navigation_item():
     nav_paths = {path for group in NAV_GROUPS for _label, path in group["items"]}
     assert nav_paths <= set(STATIC_PUBLIC_PATHS)
+
+
+def test_every_top_level_volatility_route_is_navigable():
+    nav_paths = {path for group in NAV_GROUPS for _label, path in group["items"]}
+    assert {
+        "/volatility/",
+        "/volatility/dashboard/",
+        "/volatility/vix/",
+        "/volatility/move/",
+        "/volatility/fx-vol/",
+        "/volatility/implied-vs-realized/",
+    } <= nav_paths
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "path",
+    ("/volatility/dashboard/", "/volatility/vix/"),
+)
+def test_volatility_navigation_marks_each_route_current(client, path):
+    body = client.get(path).content.decode()
+
+    assert f'href="{path}" aria-current="page"' in body
 
 
 @pytest.mark.django_db
@@ -241,6 +265,39 @@ def test_retired_credit_routes_return_gone(client, path):
 def test_credit_cds_is_a_page_specific_no_number_purchase_boundary(
     client, seeded_platform
 ):
+    rogue_source = Source.objects.create(
+        key=f"rogue-cds-{uuid.uuid4()}",
+        name="Rogue CDS fixture",
+        license_status=Source.LicenseStatus.OPEN,
+        redistribution_allowed=True,
+    )
+    DashboardSnapshot.objects.create(
+        key="credit-cds",
+        title="Rogue CDS snapshot",
+        as_of=timezone.now(),
+        source=rogue_source,
+        is_published=True,
+        summary="38 / 100",
+        data={
+            "demo": False,
+            "metrics": [
+                {
+                    "label": "银行代理",
+                    "display_value": "322bp",
+                    "value": 322,
+                }
+            ],
+            "charts": [
+                {
+                    "key": "rogue-cds-chart",
+                    "title": "KBWB 14D",
+                    "kind": "line",
+                    "data": [{"date": "2026-07-15", "Yahoo 代理": 38}],
+                }
+            ],
+            "sections": [{"title": "主权代理", "body": "HY 保护代理"}],
+        },
+    )
     DataRequirement.objects.create(
         key="credit-cds-route-fixture",
         page_key="credit-cds",
@@ -257,6 +314,36 @@ def test_credit_cds_is_a_page_specific_no_number_purchase_boundary(
     assert "采购后最低字段合同" in body
     assert "数据覆盖与采购状态" in body
     assert "CDX IG/HY 与单名 CDS" in body
+    assert 'aria-label="数据视图筛选"' not in body
+    assert 'id="dashboard-primary-chart"' not in body
+    assert "暂无可视化数据" not in body
+    assert response.context["metrics"] == []
+    assert response.context["charts"] == []
+    assert response.context.get("snapshot") is None
+    sections = response.context["sections"]
+    assert [column["key"] for column in sections[0]["columns"]] == [
+        "quote-type",
+        "what-it-is",
+        "why-not-substitute",
+        "required-licence",
+    ]
+    assert [column["key"] for column in sections[2]["columns"]] == [
+        "field",
+        "requirement",
+        "reason",
+    ]
+    for section in (sections[0], sections[2]):
+        expected_keys = [column["key"] for column in section["columns"]]
+        for row in section["rows"]:
+            assert [item["key"] for item in row["cells_list"]] == expected_keys
+            assert all(
+                set(item["cell"]) == {"kind", "value"}
+                and item["cell"]["kind"] == "text"
+                for item in row["cells_list"]
+            )
+    assert body.count("<table") == 3
+    assert 'class="metric-card' not in body
+    assert "data-chart-source=" not in body
     for forbidden in (
         "322bp",
         "KBWB 14D",

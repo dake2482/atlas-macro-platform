@@ -10,7 +10,7 @@ from research.official_data import refresh_treasury_curve_data
 class Command(BaseCommand):
     help = (
         "Backfill explicit annual U.S. Treasury nominal and real curves and publish "
-        "the contract-v1 rate dashboards."
+        "the replayable contract-v2 rate dashboards."
     )
 
     def add_arguments(self, parser):
@@ -41,6 +41,7 @@ class Command(BaseCommand):
         if result.get("publish_requested", True) and {
             "yield-curve",
             "real-rates",
+            "rates",
         } & set(result["stale_dashboard_keys"]):
-            raise CommandError("Treasury curve contract did not publish a complete v1 snapshot")
+            raise CommandError("Treasury curve contract did not publish a complete v2 snapshot")
         self.stdout.write(self.style.SUCCESS("Treasury curve backfill completed"))

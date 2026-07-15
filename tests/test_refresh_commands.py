@@ -14,6 +14,7 @@ from research.tasks import (
     refresh_h41_sources,
     refresh_official_sources,
     refresh_prates_sources,
+    refresh_treasury_curve_sources,
 )
 
 
@@ -55,6 +56,38 @@ def test_credit_command_and_task_fail_only_when_no_strict_publication_is_availab
         return_value=legally_retained,
     ):
         call_command("refresh_credit_data", stdout=StringIO(), stderr=StringIO())
+
+
+def test_treasury_daily_task_refreshes_only_current_year_and_fails_loudly(
+    monkeypatch,
+):
+    calls = []
+
+    def refresh(**kwargs):
+        calls.append(kwargs)
+        return {
+            "runs": [],
+            "dashboard_keys": [],
+            "stale_dashboard_keys": ["yield-curve"],
+        }
+
+    monkeypatch.setattr("research.tasks.refresh_treasury_curve_data", refresh)
+    with pytest.raises(RuntimeError, match="Treasury curve v2"):
+        refresh_treasury_curve_sources.run()
+    assert len(calls) == 1
+    assert calls[0]["start_year"] == calls[0]["end_year"]
+
+    monkeypatch.setattr(
+        "research.tasks.refresh_treasury_curve_data",
+        lambda **kwargs: {
+            "runs": [],
+            "dashboard_keys": ["yield-curve", "real-rates"],
+            "stale_dashboard_keys": [],
+            "requested": kwargs,
+        },
+    )
+    result = refresh_treasury_curve_sources.run()
+    assert result["stale_dashboard_keys"] == []
 
 
 @pytest.mark.parametrize(
@@ -168,6 +201,52 @@ def test_official_and_h10_commands_and_tasks_fail_loudly_for_assets_fx(
 
     monkeypatch.setattr(task_target, lambda: summary)
     with pytest.raises(RuntimeError, match="assets-fx v1"):
+        task.run()
+
+
+@pytest.mark.parametrize(
+    ("command_name", "command_target", "task", "task_target"),
+    [
+        (
+            "refresh_official_data",
+            "research.management.commands.refresh_official_data.refresh_official_data",
+            refresh_official_sources,
+            "research.tasks.refresh_official_data",
+        ),
+        (
+            "refresh_h10_data",
+            "research.management.commands.refresh_h10_data.refresh_h10_data",
+            refresh_h10_sources,
+            "research.tasks.refresh_h10_data",
+        ),
+    ],
+)
+def test_official_and_h10_commands_and_tasks_fail_loudly_for_fx_vol(
+    monkeypatch,
+    command_name,
+    command_target,
+    task,
+    task_target,
+):
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "h10",
+                "status": "success",
+                "row_count": 1200,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["fx-vol"],
+    }
+    with patch(command_target, return_value=summary):
+        with pytest.raises(CommandError, match="fx-vol v1"):
+            call_command(command_name, stdout=StringIO(), stderr=StringIO())
+
+    monkeypatch.setattr(task_target, lambda: summary)
+    with pytest.raises(RuntimeError, match="fx-vol v1"):
         task.run()
 
 

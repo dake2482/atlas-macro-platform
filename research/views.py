@@ -51,6 +51,7 @@ from .models import (
     Thesis,
 )
 from .official_data import (
+    _inflation_market_expectations_from_real_rates,
     select_public_assets_fx_snapshot,
     select_public_credit_snapshot,
     select_public_credit_spreads_snapshot,
@@ -62,6 +63,7 @@ from .official_data import (
     select_public_reserves_snapshot,
     select_public_subsurface_snapshot,
     select_public_transmission_chain_snapshot,
+    select_public_treasury_curve_snapshot,
 )
 from .page_registry import get_page_config
 from .public_ai_contract import is_pending_ai_company_contract_slug
@@ -79,6 +81,7 @@ from .services import (
     publicly_displayable_source_keys,
 )
 from .thesis_publication import public_theses
+from .volatility_contract import select_public_fx_vol_snapshot
 
 
 def _breadcrumbs(*items):
@@ -246,6 +249,44 @@ def _assets_fx_charts_for_presentation(charts: list[dict]) -> list[dict]:
         if not isinstance(raw_chart, dict):
             continue
         fields = _ASSETS_FX_CHART_DISPLAY_FIELDS.get(str(raw_chart.get("key") or ""))
+        if fields is None:
+            continue
+        chart = deepcopy(raw_chart)
+        chart["data"] = [
+            {field: row[field] for field in fields}
+            for row in raw_chart.get("data", [])
+            if isinstance(row, dict) and all(field in row for field in fields)
+        ]
+        presented.append(chart)
+    return presented
+
+
+_FX_VOL_CHART_DISPLAY_FIELDS = {
+    "h10-fx-realized-volatility-20d": (
+        "date",
+        "H.10 Broad Dollar",
+        "H.10 EUR/USD",
+        "H.10 USD/CNY",
+        "H.10 USD/JPY",
+    ),
+    "h10-fx-realized-volatility-60d": (
+        "date",
+        "H.10 Broad Dollar",
+        "H.10 EUR/USD",
+        "H.10 USD/CNY",
+        "H.10 USD/JPY",
+    ),
+}
+
+
+def _fx_vol_charts_for_presentation(charts: list[dict]) -> list[dict]:
+    """Render values only while retaining exact rolling lineage in storage."""
+
+    presented = []
+    for raw_chart in charts:
+        if not isinstance(raw_chart, dict):
+            continue
+        fields = _FX_VOL_CHART_DISPLAY_FIELDS.get(str(raw_chart.get("key") or ""))
         if fields is None:
             continue
         chart = deepcopy(raw_chart)
@@ -765,7 +806,7 @@ def assets_overview(request):
     for asset_class, label in labels.items():
         instruments = (
             []
-            if asset_class == "fx"
+            if asset_class in {"bond", "fx"}
             else list(
                 Instrument.objects.filter(asset_class=asset_class)
                 .filter(public_display_license_q("observations__source__licenses"))
@@ -816,49 +857,14 @@ def assets_overview(request):
             }
         )
 
-    curve_snapshot = None
-    curve_candidates = (
-        DashboardSnapshot.objects.filter(
-            key="yield-curve",
-            is_published=True,
-            data__contract_version=1,
-            data__demo=False,
-        )
-        .exclude(source__key="demo-market")
-        .select_related("source")
-        .order_by("-created_at", "-id")
-    )
-    now = timezone.now()
-    for candidate in curve_candidates[:20]:
-        data = dict(candidate.data or {})
-        source_keys = _snapshot_source_keys(data)
-        if candidate.source_id:
-            source_keys.add(candidate.source.key)
-        metrics = [item for item in data.get("metrics", []) if isinstance(item, dict)]
-        deadlines = []
-        for item in metrics:
-            try:
-                deadline = datetime.fromisoformat(str(item.get("fresh_until") or ""))
-            except ValueError:
-                deadline = None
-            if deadline is not None:
-                if deadline.tzinfo is None:
-                    deadline = deadline.replace(
-                        tzinfo=timezone.get_current_timezone()
-                    )
-                deadlines.append(deadline)
-        if (
-            candidate.quality_status
-            in {Observation.Quality.FRESH, Observation.Quality.ESTIMATED}
-            and not data.get("refresh_failure")
-            and metrics
-            and deadlines
-            and min(deadlines) >= now
-            and publicly_displayable_source_keys(source_keys)
-        ):
-            curve_snapshot = candidate
-            break
+    bond_group = next(group for group in groups if group["key"] == "bond")
+    curve_snapshot = select_public_treasury_curve_snapshot("yield-curve")
     if curve_snapshot is not None:
+        curve_state = getattr(
+            curve_snapshot,
+            "treasury_publication_state",
+            None,
+        )
         curve_metrics = {
             item.get("key"): item
             for item in (curve_snapshot.data or {}).get("metrics", [])
@@ -895,14 +901,33 @@ def assets_overview(request):
                         else "—"
                     ),
                     "as_of": as_of,
-                    "status": metric.get("quality_status") or "stale",
+                    "status": (
+                        metric.get("quality_status") or "stale"
+                        if curve_state == "current_candidate"
+                        else Observation.Quality.STALE
+                    ),
                 }
             )
-        bond_group = next(group for group in groups if group["key"] == "bond")
         bond_group.update(
             {
                 "rows": bond_rows,
-                "deck": "官方 Treasury 收益率与 Atlas 曲线利差；不是 ETF 行情",
+                "deck": (
+                    "官方 Treasury 收益率与 Atlas 曲线利差；不是 ETF 行情"
+                    if curve_state == "current_candidate"
+                    else "保留上一版可重验 Treasury 曲线，当前状态已标记 stale"
+                ),
+                "value_label": "收益率 / 利差",
+                "change_label": "较前值",
+            }
+        )
+    else:
+        bond_group.update(
+            {
+                "rows": [],
+                "deck": (
+                    "严格 Treasury 曲线暂不可用；债券区保持空缺，绝不回退为"
+                    "债券或 ETF 价格"
+                ),
                 "value_label": "收益率 / 利差",
                 "change_label": "较前值",
             }
@@ -1279,7 +1304,14 @@ def dashboard_page(request, page_key: str):
     snapshot = None
     snapshot_source_keys: set[str] = set()
     blocked_refresh_failure = None
-    if snapshot_key == "credit-cds":
+    stale_notice = None
+    treasury_state = None
+    if config.get("prose_only_contract"):
+        # A prose-only licence or coverage contract never trusts database
+        # snapshots.  This makes a deliberately inserted legacy/rogue number
+        # ineligible on every such route, not only the original CDS page.
+        snapshot = None
+    elif snapshot_key == "credit-cds":
         # This route is intentionally prose-only until a licensed CDS/CDX
         # composite product is purchased.  Even a legacy/rogue snapshot is
         # never eligible for presentation.
@@ -1375,6 +1407,67 @@ def dashboard_page(request, page_key: str):
             snapshot_source_keys = _snapshot_source_keys(snapshot.data)
             if snapshot.source_id:
                 snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "fx-vol":
+        snapshot = select_public_fx_vol_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            fx_vol_state = getattr(snapshot, "fx_vol_state", None)
+            if fx_vol_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif fx_vol_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "H.10 输入已自然超过声明的新鲜度窗口；页面保留最后一版"
+                        "可重验快照，且没有把自然过期伪装成采集失败。"
+                    ),
+                }
+            elif fx_vol_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "最新 H.10 刷新批次仍在运行；页面暂时保留上一版可重验"
+                        "快照，这不表示采集或完整性校验已经失败。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key in {"yield-curve", "real-rates", "rates"}:
+        snapshot = select_public_treasury_curve_snapshot(
+            snapshot_key,
+            snapshot_candidates[:50],
+        )
+        if snapshot is not None:
+            treasury_state = getattr(
+                snapshot,
+                "treasury_publication_state",
+                None,
+            )
+            if treasury_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif treasury_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "Treasury 最新完整曲线已自然超过声明的新鲜度窗口；页面"
+                        "保留最后一版可重验快照，且不把自然过期伪装成采集失败。"
+                    ),
+                }
+            elif treasury_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "最新 Treasury 年度分片仍在刷新；页面暂时保留上一版"
+                        "可重验快照，这不表示采集或完整性校验失败。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
     elif snapshot_key == "global-dollar":
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")
@@ -1437,13 +1530,68 @@ def dashboard_page(request, page_key: str):
                 break
     if snapshot:
         snapshot_data = dict(snapshot.data or {})
+        if snapshot_key == "inflation":
+            snapshot_data["metrics"] = [
+                item
+                for item in snapshot_data.get("metrics", [])
+                if not str(item.get("key") or "").startswith("market-")
+            ]
+            snapshot_data["charts"] = [
+                item
+                for item in snapshot_data.get("charts", [])
+                if item.get("key") != "market-breakeven-inflation"
+            ]
+            snapshot_data["sections"] = [
+                item
+                for item in snapshot_data.get("sections", [])
+                if item.get("key") != "market-breakeven-methodology"
+                and item.get("title") != "市场通胀预期代理口径"
+            ]
+            expectation_metrics, expectation_charts, expectation_sections = (
+                _inflation_market_expectations_from_real_rates()
+            )
+            snapshot_data["metrics"] = [
+                *snapshot_data["metrics"],
+                *expectation_metrics,
+            ]
+            snapshot_data["charts"] = [
+                *snapshot_data["charts"],
+                *expectation_charts,
+            ]
+            snapshot_data["sections"] = [
+                *snapshot_data["sections"],
+                *expectation_sections,
+            ]
+            snapshot_source_keys.update(
+                _snapshot_source_keys(
+                    [
+                        expectation_metrics,
+                        expectation_charts,
+                        expectation_sections,
+                    ]
+                )
+            )
         metrics = [dict(item) for item in snapshot_data.get("metrics", [])]
+        if (
+            snapshot_key in {"yield-curve", "real-rates", "rates"}
+            and treasury_state != "current_candidate"
+        ):
+            for item in metrics:
+                item["quality_status"] = Observation.Quality.STALE
         if snapshot_key == "assets-fx":
             for item in metrics:
                 change = item.get("change")
                 if isinstance(change, (int, float, Decimal)) and not isinstance(
                     change, bool
                 ):
+                    item["change_display"] = f"{Decimal(str(change)):+.2f}"
+        elif snapshot_key == "fx-vol":
+            for item in metrics:
+                change = item.get("change")
+                if isinstance(change, (int, float, Decimal)) and not isinstance(
+                    change, bool
+                ):
+                    item["change_unit"] = "pp"
                     item["change_display"] = f"{Decimal(str(change)):+.2f}"
         elif snapshot_key in {"credit", "credit-spreads", "credit-stress"}:
             for item in metrics:
@@ -1516,6 +1664,8 @@ def dashboard_page(request, page_key: str):
             ]
         if snapshot_key == "assets-fx":
             raw_charts = _assets_fx_charts_for_presentation(raw_charts)
+        elif snapshot_key == "fx-vol":
+            raw_charts = _fx_vol_charts_for_presentation(raw_charts)
         elif snapshot_key in {"credit", "credit-spreads", "credit-stress"}:
             raw_charts = _credit_charts_for_presentation(raw_charts)
         charts = []
@@ -1591,9 +1741,10 @@ def dashboard_page(request, page_key: str):
         config["snapshot"] = snapshot
         config["refresh_failure"] = (
             blocked_refresh_failure
-            if snapshot_key == "assets-fx"
+            if snapshot_key in {"assets-fx", "fx-vol"}
             else snapshot_data.get("refresh_failure")
         )
+        config["stale_notice"] = stale_notice
         config["required_notices"] = public_source_notices(snapshot_source_keys)
         config["analysis"] = snapshot.summary or (
             "本批次只发布了通过许可和质量校验的数值，尚未生成经审核的信号解读。"
@@ -1602,7 +1753,7 @@ def dashboard_page(request, page_key: str):
         config["charts"] = charts
         config["chart_data"] = charts[0].get("data", [])
         config["sections"] = sections
-    elif page_key == "credit-cds":
+    elif config.get("prose_only_contract") or page_key == "credit-cds":
         config["metrics"] = []
         config["chart_data"] = []
         config["charts"] = []
@@ -1614,6 +1765,7 @@ def dashboard_page(request, page_key: str):
         config["source_notes"] = list(config.get("source_notes", []))
         config["required_notices"] = []
         config["refresh_failure"] = None
+        config["stale_notice"] = None
     else:
         static_metrics = config.get("metrics", [])
         requirements = list(DataRequirement.objects.filter(page_key=page_key))
@@ -1644,7 +1796,8 @@ def dashboard_page(request, page_key: str):
         ]
         config["sections"] = []
         config["analysis"] = (
-            "本页尚无通过来源许可与质量检查的可发布快照。缺失项目和采购建议见页面下方数据覆盖台账。"
+            "本页尚无通过来源许可与质量检查的可发布快照，也尚未生成"
+            "经审核的信号解读。缺失项目和采购建议见页面下方数据覆盖台账。"
         )
         config["source_notes"] = ["没有真实数据时显示空缺，不回退到演示或合成数值。"]
         config["required_notices"] = []

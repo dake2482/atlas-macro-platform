@@ -14,7 +14,7 @@ import json
 import uuid
 import zipfile
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -102,9 +102,11 @@ from .providers import (
     FederalReserveRSSProvider,
     FiscalDataProvider,
     NYFedMarketsProvider,
+    ProviderResult,
     TreasuryRatesProvider,
 )
 from .services import (
+    begin_ingestion,
     current_display_source_key_sets,
     ensure_source,
     persist_private_raw_artifact,
@@ -116,6 +118,10 @@ from .services import (
     store_release_vintage_observations,
     store_series_observations,
     store_treasury_auctions,
+)
+from .volatility_contract import (
+    FX_VOL_PUBLICATION_KEYS,
+    coordinate_fx_vol_dashboard,
 )
 
 BLS_SERIES = (
@@ -823,6 +829,10 @@ INDEPENDENT_PUBLICATION_KEYS = frozenset(
         "credit",
         "credit-spreads",
         "credit-stress",
+        "yield-curve",
+        "real-rates",
+        "rates",
+        *FX_VOL_PUBLICATION_KEYS,
     }
 )
 APPEND_ONLY_PUBLICATION_KEYS = frozenset(
@@ -838,6 +848,10 @@ APPEND_ONLY_PUBLICATION_KEYS = frozenset(
         "credit",
         "credit-spreads",
         "credit-stress",
+        "yield-curve",
+        "real-rates",
+        "rates",
+        *FX_VOL_PUBLICATION_KEYS,
     }
 )
 AUCTION_REQUIRED_METRIC_KEYS = frozenset(
@@ -859,12 +873,32 @@ RRP_TGA_REQUIRED_METRIC_KEYS = frozenset(
         "issue-gross-14d",
     }
 )
-TREASURY_CURVE_CONTRACT_VERSION = 1
+TREASURY_CURVE_CONTRACT_VERSION = 2
+TREASURY_CURVE_FORMULA_VERSION = "us-treasury-par-yield-curve-v2"
 TREASURY_CURVE_HISTORY_YEARS = 5
+TREASURY_CURVE_RUNNING_TIMEOUT = timedelta(hours=1)
 TREASURY_CURVE_MIN_HISTORY_POINTS = 1000
 TREASURY_CURVE_MAX_GAP_DAYS = 10
 TREASURY_CURVE_START_TOLERANCE_DAYS = 14
 TREASURY_CURVE_PAGE_KEYS = frozenset({"yield-curve", "real-rates"})
+TREASURY_RATE_PUBLICATION_KEYS = frozenset(
+    {"yield-curve", "real-rates", "rates"}
+)
+TREASURY_YIELD_TITLE = "收益率曲线"
+TREASURY_YIELD_SUMMARY = (
+    "财政部名义 Par Yield 曲线按不可变年度 XML 批次组合；当前、1 周、"
+    "1 月与 3 月比较和关键利差均可从私有原始响应独立重放。"
+)
+TREASURY_REAL_TITLE = "实际利率"
+TREASURY_REAL_SUMMARY = (
+    "TIPS 实际 Par Yield 直接来自财政部；BEI 为 Atlas Macro 用同日同期限"
+    "名义减实际的透明近似，不冒充官方 5Y5Y。"
+)
+TREASURY_RATES_TITLE = "利率"
+TREASURY_RATES_SUMMARY = (
+    "政策利率继承严格 Fed Funds 子合同；名义曲线、实际利率与盈亏平衡"
+    "通胀继承同一组可重放 Treasury v2 年度批次。"
+)
 TREASURY_NOMINAL_TENORS = (
     "1m",
     "2m",
@@ -901,6 +935,14 @@ YIELD_CURVE_REQUIRED_METRIC_KEYS = frozenset(
 REAL_RATES_REQUIRED_METRIC_KEYS = frozenset(
     {"tips-5y", "tips-10y", "5y-bei", "10y-bei"}
 )
+YIELD_CURVE_REQUIRED_CHART_KEYS = frozenset(
+    {"nominal-curve-comparison", "curve-spreads-history"}
+)
+REAL_RATES_REQUIRED_CHART_KEYS = frozenset(
+    {"nominal-real-breakeven-history"}
+)
+YIELD_CURVE_REQUIRED_SECTION_KEYS = frozenset({"current-nominal-par-curve"})
+REAL_RATES_REQUIRED_SECTION_KEYS = frozenset({"current-real-par-curve"})
 H41_PUBLICATION_KEYS = frozenset()
 PRATES_PUBLICATION_KEYS = frozenset()
 H10_PUBLICATION_KEYS = frozenset()
@@ -2647,7 +2689,7 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
 ]:
     """Reuse the audited real-rates Treasury/TIPS snapshot for inflation BEI."""
 
-    snapshot = _latest_treasury_contract_snapshot("real-rates")
+    snapshot = select_public_treasury_curve_snapshot("real-rates")
     if snapshot is None:
         return [], [], []
     data = dict(snapshot.data or {})
@@ -2740,6 +2782,7 @@ def _inflation_market_expectations_from_real_rates() -> tuple[
     }
     sections = [
         {
+            "key": "market-breakeven-methodology",
             "title": "市场通胀预期代理口径",
             "body": (
                 "5Y/10Y BEI 复用实际利率页同一 Treasury 官方曲线快照，"
@@ -2901,11 +2944,204 @@ def _treasury_dataset(component: str, year: int) -> str:
     return f"{TREASURY_CURVE_DATASET_PREFIXES[component]}:{year}"
 
 
+def _treasury_artifact_path(digest: str) -> Path:
+    root = Path(
+        getattr(
+            settings,
+            "RAW_ARTIFACT_ROOT",
+            settings.BASE_DIR / "data" / "artifacts",
+        )
+    )
+    return root / digest[:2] / f"{digest}.bin"
+
+
+def _validate_treasury_curve_run(run: IngestionRun) -> SimpleNamespace:
+    """Replay one immutable annual run from disk through normalized rows."""
+
+    identity = _treasury_curve_identity(run.dataset)
+    if (
+        identity is None
+        or run.source.key != "us-treasury-rates"
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        or run.started_at is None
+        or run.completed_at is None
+        or run.completed_at < run.started_at
+    ):
+        raise ValueError("Treasury curve run identity or completion state is invalid")
+    component, fields, requested_year = identity
+    curve = TREASURY_CURVE_DATASET_PREFIXES[component]
+    metadata = dict(run.metadata or {})
+    fetched_at = _parse_payload_datetime(metadata.get("fetched_at"))
+    if (
+        fetched_at is None
+        or fetched_at > run.started_at + timedelta(minutes=5)
+        or fetched_at > timezone.now() + timedelta(minutes=5)
+        or metadata.get("provider") != "us-treasury-rates"
+        or metadata.get("curve") != curve
+        or metadata.get("requested_year") != requested_year
+    ):
+        raise ValueError("Treasury curve run timeline or metadata identity is invalid")
+    source = run.source
+    licence = _effective_source_license(
+        source,
+        require_public=True,
+        require_derived=True,
+        require_storage=True,
+    )
+    if licence is None:
+        raise ValueError("Treasury curve source licence is not currently effective")
+    artifacts = list(RawArtifact.objects.filter(run=run).order_by("pk"))
+    if len(artifacts) != 1:
+        raise ValueError("Treasury curve run requires exactly one raw artifact")
+    artifact = artifacts[0]
+    digest = str(metadata.get("sha256") or "").lower()
+    try:
+        declared_size = int(metadata.get("byte_length"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Treasury curve raw byte length metadata is invalid") from exc
+    expected_uri = f"private://{source.key}/{digest[:2]}/{digest}.bin"
+    content_type = str(metadata.get("content_type") or "")
+    if (
+        len(digest) != 64
+        or artifact.sha256 != digest
+        or artifact.size_bytes != declared_size
+        or artifact.uri != expected_uri
+        or artifact.content_type != content_type
+        or not content_type.lower().startswith(
+            ("application/xml", "application/atom+xml", "text/xml")
+        )
+    ):
+        raise ValueError("Treasury curve raw artifact database evidence is invalid")
+    endpoint = urlparse(str(metadata.get("endpoint") or ""))
+    if (
+        endpoint.scheme != "https"
+        or endpoint.netloc.lower() != "home.treasury.gov"
+        or endpoint.path
+        != "/resource-center/data-chart-center/interest-rates/pages/xml"
+        or parse_qs(endpoint.query) != {
+            "data": [curve],
+            "field_tdr_date_value": [str(requested_year)],
+        }
+    ):
+        raise ValueError("Treasury curve endpoint witness is invalid")
+    try:
+        payload = _treasury_artifact_path(digest).read_bytes()
+    except OSError as exc:
+        raise ValueError("Treasury curve raw artifact bytes are unavailable") from exc
+    if len(payload) != declared_size or hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError("Treasury curve raw artifact bytes are missing or tampered")
+    replayed, evidence = TreasuryRatesProvider.parse_curve_xml_bytes(
+        payload,
+        curve=curve,
+        fields=fields,
+        year=requested_year,
+        fetched_at=fetched_at,
+    )
+    for key in (
+        "curve",
+        "requested_year",
+        "feed_title",
+        "feed_id",
+        "feed_updated_time",
+        "entry_count",
+        "record_count",
+        "series_coverage",
+        "latest_value_date",
+        "missing_latest_series",
+    ):
+        if metadata.get(key) != evidence.get(key):
+            raise ValueError(f"Treasury curve run {key} no longer replays")
+    rows = list(
+        Observation.objects.filter(batch_id=run.batch_id)
+        .select_related("series", "source", "fallback_source")
+        .order_by("series__key", "value_date", "pk")
+    )
+    stored_contract = [
+        (
+            row.series.key.upper(),
+            row.value_date.date().isoformat(),
+            f"{row.value:.8f}",
+            json.dumps(
+                row.metadata or {},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
+        for row in rows
+        if row.series_id
+        and row.series.source_id == source.pk
+        and row.source_id == source.pk
+        and row.instrument_id is None
+        and row.as_of == row.value_date
+        and row.fetched_at == fetched_at
+        and row.quality_status == Observation.Quality.FRESH
+        and row.fallback_source_id is None
+    ]
+    replay_contract = [
+        _treasury_curve_record_contract(record) for record in replayed
+    ]
+    if (
+        len(rows) != run.row_count
+        or len(stored_contract) != len(rows)
+        or sorted(stored_contract) != sorted(replay_contract)
+    ):
+        raise ValueError("Treasury curve exact-batch observations were tampered")
+    return SimpleNamespace(
+        run=run,
+        component=component,
+        curve=curve,
+        year=requested_year,
+        fetched_at=fetched_at,
+        feed_updated=_parse_payload_datetime(evidence["feed_updated_time"]),
+        latest_date=date.fromisoformat(str(evidence["latest_value_date"])),
+        artifact=artifact,
+        payload=payload,
+        records=replayed,
+        rows=rows,
+        licence_scope=licence.scope,
+    )
+
+
+def _treasury_run_witness(run: IngestionRun) -> dict[str, Any]:
+    evidence = _validate_treasury_curve_run(run)
+    return {
+        "component": evidence.component,
+        "year": evidence.year,
+        "dataset": run.dataset,
+        "status": run.status,
+        "row_count": run.row_count,
+        "ingestion_run_id": run.pk,
+        "batch_id": str(run.batch_id),
+        "refresh_cycle_id": str((run.metadata or {}).get("refresh_cycle_id") or ""),
+        "fetched_at": evidence.fetched_at.isoformat(),
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "feed_updated_time": (
+            evidence.feed_updated.isoformat() if evidence.feed_updated else None
+        ),
+        "latest_value_date": evidence.latest_date.isoformat(),
+        "artifact": {
+            "artifact_id": evidence.artifact.pk,
+            "uri": evidence.artifact.uri,
+            "sha256": evidence.artifact.sha256,
+            "size_bytes": evidence.artifact.size_bytes,
+            "content_type": evidence.artifact.content_type,
+        },
+        "license_scope": evidence.licence_scope,
+        "fallback_source": None,
+    }
+
+
 def _latest_treasury_attempt(component: str, year: int) -> IngestionRun | None:
     return (
         IngestionRun.objects.filter(
             source__key="us-treasury-rates",
             dataset=_treasury_dataset(component, year),
+        )
+        .filter(
+            Q(metadata__publication_intent=True)
+            | ~Q(metadata__has_key="publication_intent")
         )
         .order_by("-started_at", "-id")
         .first()
@@ -2917,14 +3153,16 @@ def _treasury_run_state(
     year: int,
     run: IngestionRun | None,
     *,
+    status: str | None = None,
     reason: str = "",
 ) -> dict[str, Any]:
     return {
         "component": component,
         "year": year,
         "dataset": _treasury_dataset(component, year),
-        "status": run.status if run is not None else "missing",
+        "status": status or (run.status if run is not None else "missing"),
         "row_count": run.row_count if run is not None else 0,
+        "ingestion_run_id": run.pk if run is not None else None,
         "batch_id": str(run.batch_id) if run is not None else None,
         "refresh_cycle_id": (
             str((run.metadata or {}).get("refresh_cycle_id") or "")
@@ -2936,6 +3174,12 @@ def _treasury_run_state(
             or (run.error if run is not None else "required annual dataset attempt is missing")
             or str((run.metadata or {}).get("quality_reason") or "")
         )[:240],
+        "started_at": run.started_at.isoformat() if run is not None else None,
+        "completed_at": (
+            run.completed_at.isoformat()
+            if run is not None and run.completed_at is not None
+            else None
+        ),
     }
 
 
@@ -2976,6 +3220,19 @@ def _select_treasury_curve_runs(
                         year,
                         run,
                         reason="latest annual dataset attempt is not complete and successful",
+                    )
+                )
+                continue
+            try:
+                _validate_treasury_curve_run(run)
+            except (ArithmeticError, OSError, TypeError, ValueError) as exc:
+                states.append(
+                    _treasury_run_state(
+                        component,
+                        year,
+                        run,
+                        status="invalid",
+                        reason=f"strict annual run validation failed: {exc}",
                     )
                 )
                 continue
@@ -3354,6 +3611,8 @@ def _treasury_chart(
 
 def _treasury_curve_page_data(
     selected_runs: dict[tuple[str, int], IngestionRun],
+    *,
+    allow_expired: bool = False,
 ) -> tuple[
     dict[
         str,
@@ -3457,7 +3716,7 @@ def _treasury_curve_page_data(
 
     current_inputs = [maps[key][current_date] for key in (*TREASURY_NOMINAL_SERIES, *TREASURY_REAL_SERIES)]
     fresh_until = min(_fresh_until(item) for item in current_inputs)
-    if timezone.now() > fresh_until:
+    if not allow_expired and timezone.now() > fresh_until:
         return None, [
             {
                 "component": "freshness",
@@ -3663,8 +3922,14 @@ def _treasury_curve_page_data(
             "quality_status": Observation.Quality.FRESH,
             "source": nominal_current[f"ust-{tenor}"].source.name,
             "source_key": "us-treasury-rates",
+            "source_keys": ["us-treasury-rates"],
+            "value_date": nominal_current[f"ust-{tenor}"].value_date.isoformat(),
             "as_of": nominal_current[f"ust-{tenor}"].as_of.isoformat(),
+            "fetched_at": nominal_current[f"ust-{tenor}"].fetched_at.isoformat(),
+            "fresh_until": fresh_until.isoformat(),
             "batch_id": str(nominal_current[f"ust-{tenor}"].batch_id),
+            "license_scope": nominal_current[f"ust-{tenor}"].source.license_scope,
+            "fallback_source": None,
         }
         for tenor in TREASURY_NOMINAL_TENORS
     ]
@@ -3675,23 +3940,36 @@ def _treasury_curve_page_data(
             "quality_status": Observation.Quality.FRESH,
             "source": real_current[f"tips-{tenor}"].source.name,
             "source_key": "us-treasury-rates",
+            "source_keys": ["us-treasury-rates"],
+            "value_date": real_current[f"tips-{tenor}"].value_date.isoformat(),
             "as_of": real_current[f"tips-{tenor}"].as_of.isoformat(),
+            "fetched_at": real_current[f"tips-{tenor}"].fetched_at.isoformat(),
+            "fresh_until": fresh_until.isoformat(),
             "batch_id": str(real_current[f"tips-{tenor}"].batch_id),
+            "license_scope": real_current[f"tips-{tenor}"].source.license_scope,
+            "fallback_source": None,
         }
         for tenor in TREASURY_REAL_TENORS
     ]
+    annual_run_witnesses = [
+        _treasury_run_witness(run)
+        for (_component, _year), run in sorted(selected_runs.items())
+    ]
     common_extra = {
         "contract_version": TREASURY_CURVE_CONTRACT_VERSION,
+        "formula_version": TREASURY_CURVE_FORMULA_VERSION,
         "common_effective_date": current_date.isoformat(),
         "history_start": window_dates[0].isoformat(),
         "history_end": window_dates[-1].isoformat(),
         "comparison_dates": {
             label: period.isoformat() for label, period in comparison_dates.items()
         },
-        "annual_runs": [
-            _treasury_run_state(component, year, run)
-            for (component, year), run in sorted(selected_runs.items())
-        ],
+        "fallback_state": "none",
+        "fallback_source": None,
+        "semantic_boundary": (
+            "Treasury par yields and Atlas nominal-minus-real/spread calculations; "
+            "not bond prices, total returns, MOVE, option implied volatility or 5Y5Y."
+        ),
     }
     prepared = {
         "yield-curve": (
@@ -3699,6 +3977,7 @@ def _treasury_curve_page_data(
             yield_charts,
             [
                 {
+                    "key": "current-nominal-par-curve",
                     "title": "财政部名义 Par Yield 曲线",
                     "description": "官方收益率横截面；不是债券或 ETF 价格、久期或总回报。",
                     "rows": nominal_section_rows,
@@ -3707,13 +3986,26 @@ def _treasury_curve_page_data(
                     "full_width": True,
                 }
             ],
-            {**common_extra, "curve_scope": "nominal"},
+            {
+                **common_extra,
+                "curve_scope": "nominal",
+                "annual_runs": [
+                    item
+                    for item in annual_run_witnesses
+                    if item["component"] == "nominal"
+                ],
+                "all_annual_runs": annual_run_witnesses,
+                "required_metric_keys": sorted(YIELD_CURVE_REQUIRED_METRIC_KEYS),
+                "required_chart_keys": sorted(YIELD_CURVE_REQUIRED_CHART_KEYS),
+                "required_section_keys": sorted(YIELD_CURVE_REQUIRED_SECTION_KEYS),
+            },
         ),
         "real-rates": (
             real_metrics,
             real_charts,
             [
                 {
+                    "key": "current-real-par-curve",
                     "title": "财政部实际 Par Yield 曲线",
                     "description": "BEI 为 Atlas 近似通胀补偿，不是财政部发布的官方 BEI 或 5Y5Y。",
                     "rows": real_section_rows,
@@ -3725,6 +4017,11 @@ def _treasury_curve_page_data(
             {
                 **common_extra,
                 "curve_scope": "nominal-real-breakeven",
+                "annual_runs": annual_run_witnesses,
+                "all_annual_runs": annual_run_witnesses,
+                "required_metric_keys": sorted(REAL_RATES_REQUIRED_METRIC_KEYS),
+                "required_chart_keys": sorted(REAL_RATES_REQUIRED_CHART_KEYS),
+                "required_section_keys": sorted(REAL_RATES_REQUIRED_SECTION_KEYS),
                 "model_disclaimer": "Atlas breakeven approximation from Treasury par curves; no 5Y5Y is published",
             },
         ),
@@ -4783,7 +5080,7 @@ def _select_fed_funds_runs(
 def _mark_fed_funds_stale(
     states: list[dict[str, Any]], *, reason: str
 ) -> None:
-    checked_at = timezone.now().isoformat()
+    checked_at = datetime.now(UTC).isoformat()
     with transaction.atomic():
         latest = (
             DashboardSnapshot.objects.select_for_update()
@@ -4803,6 +5100,11 @@ def _mark_fed_funds_stale(
         latest.data = data
         latest.quality_status = Observation.Quality.STALE
         latest.save(update_fields=["data", "quality_status", "updated_at"])
+        _mark_treasury_rates_for_fed_failure(
+            latest,
+            states=states,
+            reason=reason,
+        )
 
 
 def _latest_fed_funds_snapshot() -> DashboardSnapshot | None:
@@ -4830,14 +5132,38 @@ def _fed_funds_snapshot_effective_date(
     return snapshot.as_of.date()
 
 
+def _fed_funds_stale_dashboard_keys() -> set[str]:
+    keys = {"fed-funds"}
+    if DashboardSnapshot.objects.filter(
+        key="rates",
+        is_published=True,
+        data__contract_version=TREASURY_CURVE_CONTRACT_VERSION,
+    ).exists():
+        keys.add("rates")
+    return keys
+
+
 @transaction.atomic
 def _coordinate_fed_funds_dashboard(
     trigger_runs: Iterable[IngestionRun],
 ) -> tuple[list[DashboardSnapshot], set[str]]:
+    for source_key in (
+        "federal-reserve",
+        "internal",
+        "ny-fed-markets",
+        "us-treasury-rates",
+    ):
+        if not Source.objects.filter(key=source_key).exists():
+            ensure_source(source_key)
     list(
         Source.objects.select_for_update()
         .filter(
-            key__in={source_key for source_key, _ in FED_FUNDS_DATASETS.values()}
+            key__in={
+                "federal-reserve",
+                "internal",
+                "ny-fed-markets",
+                "us-treasury-rates",
+            }
         )
         .order_by("key")
         .values_list("pk", flat=True)
@@ -4853,7 +5179,7 @@ def _coordinate_fed_funds_dashboard(
                 "NY Fed 两条参考利率不属于同一刷新周期；继续保留上一版完整快照。"
             ),
         )
-        return [], {"fed-funds"}
+        return [], _fed_funds_stale_dashboard_keys()
     dataset_batches = {
         key: run.batch_id for key, run in selected.items()
     }
@@ -4869,7 +5195,7 @@ def _coordinate_fed_funds_dashboard(
                 "分位、成交量、许可及批次完整性检查未通过；继续保留上一版。"
             ),
         )
-        return [], {"fed-funds"}
+        return [], _fed_funds_stale_dashboard_keys()
     candidate_date = date.fromisoformat(
         str(metrics[0]["metadata"]["common_effective_date"])
     )
@@ -4886,7 +5212,7 @@ def _coordinate_fed_funds_dashboard(
                 "保留上一版完整数据。"
             ),
         )
-        return [], {"fed-funds"}
+        return [], _fed_funds_stale_dashboard_keys()
     dashboards = publish_official_dashboards(
         keys={"fed-funds"},
         dataset_batches=dataset_batches,
@@ -4907,8 +5233,11 @@ def _coordinate_fed_funds_dashboard(
                 "等待下一次双源刷新。"
             ),
         )
-        return [], {"fed-funds"}
-    return dashboards, set()
+        return [], _fed_funds_stale_dashboard_keys()
+    rates_dashboards, rates_stale = (
+        _rebuild_treasury_rates_parent_from_latest_components()
+    )
+    return [*dashboards, *rates_dashboards], rates_stale
 
 
 def _parse_payload_datetime(raw_value: Any) -> datetime | None:
@@ -22205,6 +22534,9 @@ def _liquidity_fed_funds_component(
                 "component_snapshot_id": snapshot.pk,
                 "component_publication_batch_id": str(snapshot.batch_id),
                 "component_fingerprint": fingerprint,
+                "component_payload_integrity_hash": data.get(
+                    "payload_integrity_hash"
+                ),
                 "component_metric_snapshot_id": normalized.pk,
                 "component_metric_snapshot_key": normalized.key,
                 "component_metric_snapshot_batch_id": str(normalized.batch_id),
@@ -22229,9 +22561,11 @@ def _liquidity_fed_funds_component(
         "snapshot_id": snapshot.pk,
         "publication_batch_id": str(snapshot.batch_id),
         "fingerprint": fingerprint,
+        "payload_integrity_hash": data.get("payload_integrity_hash"),
         "component_batches": sorted(expected_batches),
         "metric_snapshot_ids": metric_snapshot_ids,
         "common_effective_date": value_dates.pop(),
+        "fresh_until": data.get("fresh_until"),
     }
     return copied_metrics, reference
 
@@ -24827,15 +25161,28 @@ def _coordinate_rrp_tga_dashboard(
 
 
 def _latest_treasury_contract_snapshot(page_key: str) -> DashboardSnapshot | None:
-    return (
+    candidates = (
         DashboardSnapshot.objects.filter(
             key=page_key,
             is_published=True,
             data__contract_version=TREASURY_CURVE_CONTRACT_VERSION,
         )
         .exclude(source__key="demo-market")
+        .select_related("source")
         .order_by("-created_at", "-id")
-        .first()
+        [:50]
+    )
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if _treasury_rate_snapshot_static_replay(
+                candidate,
+                page_key=page_key,
+            )
+            is not None
+        ),
+        None,
     )
 
 
@@ -24847,7 +25194,7 @@ def _mark_treasury_curve_dashboards_stale(
 ) -> None:
     checked_at = timezone.now().isoformat()
     for page_key in page_keys:
-        latest = (
+        candidates = list(
             DashboardSnapshot.objects.select_for_update()
             .filter(
                 key=page_key,
@@ -24855,8 +25202,21 @@ def _mark_treasury_curve_dashboards_stale(
                 data__contract_version=TREASURY_CURVE_CONTRACT_VERSION,
             )
             .exclude(source__key="demo-market")
+            .select_related("source")
             .order_by("-created_at", "-id")
-            .first()
+            [:50]
+        )
+        latest = next(
+            (
+                candidate
+                for candidate in candidates
+                if _treasury_rate_snapshot_static_replay(
+                    candidate,
+                    page_key=page_key,
+                )
+                is not None
+            ),
+            None,
         )
         if latest is None:
             continue
@@ -24880,6 +25240,62 @@ def _mark_treasury_curve_dashboards_stale(
         latest.save(update_fields=["data", "quality_status", "updated_at"])
 
 
+def _mark_treasury_rates_for_fed_failure(
+    fed_snapshot: DashboardSnapshot,
+    *,
+    states: list[dict[str, Any]],
+    reason: str,
+) -> None:
+    candidates = list(
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="rates",
+            is_published=True,
+            data__contract_version=TREASURY_CURVE_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")[:50]
+    )
+    parent = next(
+        (
+            candidate
+            for candidate in candidates
+            if _treasury_rate_snapshot_static_replay(
+                candidate,
+                page_key="rates",
+            )
+            is not None
+            and any(
+                item.get("component") == "fed-funds"
+                and item.get("snapshot_id") == fed_snapshot.pk
+                and item.get("publication_batch_id")
+                == str(fed_snapshot.batch_id)
+                for item in (candidate.data or {}).get(
+                    "component_snapshots", []
+                )
+                if isinstance(item, dict)
+            )
+        ),
+        None,
+    )
+    if parent is None:
+        return
+    checked_at = datetime.now(UTC).isoformat()
+    data = dict(parent.data or {})
+    data["refresh_failure"] = {
+        "kind": "fed-funds-child",
+        "checked_at": checked_at,
+        "reason": reason,
+        "fed_snapshot_id": fed_snapshot.pk,
+        "fed_publication_batch_id": str(fed_snapshot.batch_id),
+        "components": states,
+    }
+    parent.data = data
+    parent.quality_status = Observation.Quality.STALE
+    parent.save(update_fields=["data", "quality_status", "updated_at"])
+
+
 def _treasury_prepared_contract_is_buildable(
     page_key: str,
     prepared: tuple[
@@ -24891,26 +25307,55 @@ def _treasury_prepared_contract_is_buildable(
     *,
     expected_batches: set[str],
 ) -> bool:
-    metrics, charts, _sections, extra_data = prepared
+    metrics, charts, sections, extra_data = prepared
     required_metrics = {
         "yield-curve": YIELD_CURVE_REQUIRED_METRIC_KEYS,
         "real-rates": REAL_RATES_REQUIRED_METRIC_KEYS,
     }.get(page_key)
     required_charts = {
-        "yield-curve": {"nominal-curve-comparison", "curve-spreads-history"},
-        "real-rates": {"nominal-real-breakeven-history"},
+        "yield-curve": YIELD_CURVE_REQUIRED_CHART_KEYS,
+        "real-rates": REAL_RATES_REQUIRED_CHART_KEYS,
+    }.get(page_key)
+    required_sections = {
+        "yield-curve": YIELD_CURVE_REQUIRED_SECTION_KEYS,
+        "real-rates": REAL_RATES_REQUIRED_SECTION_KEYS,
     }.get(page_key)
     if (
         extra_data.get("contract_version") != TREASURY_CURVE_CONTRACT_VERSION
         or not extra_data.get("common_effective_date")
+        or extra_data.get("formula_version") != TREASURY_CURVE_FORMULA_VERSION
         or not isinstance(extra_data.get("annual_runs"), list)
+        or not isinstance(extra_data.get("all_annual_runs"), list)
+        or len(extra_data["all_annual_runs"])
+        != (TREASURY_CURVE_HISTORY_YEARS + 1) * 2
+        or len(extra_data["annual_runs"])
+        != (
+            TREASURY_CURVE_HISTORY_YEARS + 1
+            if page_key == "yield-curve"
+            else (TREASURY_CURVE_HISTORY_YEARS + 1) * 2
+        )
         or any(
             item.get("status") != IngestionRun.Status.SUCCESS
             or not item.get("batch_id")
             for item in extra_data["annual_runs"]
         )
+        or any(
+            item.get("status") != IngestionRun.Status.SUCCESS
+            or not item.get("ingestion_run_id")
+            or not item.get("batch_id")
+            or not isinstance(item.get("artifact"), dict)
+            or not item["artifact"].get("sha256")
+            for item in extra_data["all_annual_runs"]
+        )
         or (required_metrics is not None and {item.get("key") for item in metrics} != set(required_metrics))
         or (required_charts is not None and {item.get("key") for item in charts} != required_charts)
+        or (
+            required_sections is not None
+            and {item.get("key") for item in sections} != set(required_sections)
+        )
+        or extra_data.get("required_metric_keys") != sorted(required_metrics or ())
+        or extra_data.get("required_chart_keys") != sorted(required_charts or ())
+        or extra_data.get("required_section_keys") != sorted(required_sections or ())
         or any(
             item.get("value") is None
             or item.get("fallback_source")
@@ -24927,6 +25372,12 @@ def _treasury_prepared_contract_is_buildable(
             or not item.get("fresh_until")
             or item.get("time_axis") not in {"date", "tenor"}
             for item in charts
+        )
+        or any(
+            not item.get("rows")
+            or not item.get("fresh_until")
+            or item.get("status") != Observation.Quality.FRESH
+            for item in sections
         )
         or not publicly_displayable_source_keys(
             _payload_source_keys([metrics, charts])
@@ -24947,6 +25398,8 @@ def _treasury_rates_overview_prepared(
             dict[str, Any],
         ],
     ],
+    *,
+    fed_component: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> tuple[
     tuple[
         list[dict[str, Any]],
@@ -24957,12 +25410,14 @@ def _treasury_rates_overview_prepared(
     | None,
     dict[str, Any] | None,
 ]:
-    fed_component = _liquidity_fed_funds_component(now=timezone.now())
-    if isinstance(fed_component, dict):
-        return None, fed_component
-    policy_metrics, policy_reference = fed_component
-    yield_metrics, yield_charts, _yield_sections, yield_extra = prepared["yield-curve"]
-    real_metrics, real_charts, _real_sections, _real_extra = prepared["real-rates"]
+    resolved_fed_component = fed_component or _liquidity_fed_funds_component(
+        now=timezone.now()
+    )
+    if isinstance(resolved_fed_component, dict):
+        return None, resolved_fed_component
+    policy_metrics, policy_reference = resolved_fed_component
+    yield_metrics, yield_charts, _yield_sections, _yield_extra = prepared["yield-curve"]
+    real_metrics, real_charts, _real_sections, real_extra = prepared["real-rates"]
     yield_by_key = {item["key"]: deepcopy(item) for item in yield_metrics}
     real_by_key = {item["key"]: deepcopy(item) for item in real_metrics}
     metrics = [
@@ -24977,16 +25432,37 @@ def _treasury_rates_overview_prepared(
     for chart in charts:
         chart["tab"] = "treasury"
     extra_data = {
-        **deepcopy(yield_extra),
+        **deepcopy(real_extra),
         "curve_scope": "rates-overview",
         "component_snapshots": [policy_reference],
+        "required_metric_keys": sorted(
+            str(item["key"]) for item in metrics
+        ),
+        "required_chart_keys": sorted(
+            str(item["key"]) for item in charts
+        ),
+        "required_section_keys": ["rates-composite-methodology"],
     }
     sections = [
         {
+            "key": "rates-composite-methodology",
             "title": "组合口径",
             "body": (
                 "政策利率继承已验证的 Fed Funds 原子快照；国债、实际利率与 BEI "
-                "继承同一 Treasury curve v1 合同。任一子组件失败时保留上一版。"
+                "继承同一 Treasury curve v2 合同。任一子组件失败时保留上一版。"
+            ),
+            "fresh_until": min(
+                str(item["fresh_until"])
+                for item in metrics
+                if item.get("fresh_until")
+            ),
+            "status": (
+                Observation.Quality.FRESH
+                if all(
+                    item.get("quality_status") == Observation.Quality.FRESH
+                    for item in metrics
+                )
+                else Observation.Quality.ESTIMATED
             ),
             "full_width": True,
         }
@@ -25000,11 +25476,24 @@ def _coordinate_treasury_curve_dashboards(
     *,
     end_year: int,
 ) -> tuple[list[DashboardSnapshot], set[str]]:
-    ensure_source("us-treasury-rates")
-    ensure_source("internal")
+    for source_key in (
+        "federal-reserve",
+        "internal",
+        "ny-fed-markets",
+        "us-treasury-rates",
+    ):
+        if not Source.objects.filter(key=source_key).exists():
+            ensure_source(source_key)
     list(
         Source.objects.select_for_update()
-        .filter(key__in={"us-treasury-rates", "internal"})
+        .filter(
+            key__in={
+                "federal-reserve",
+                "internal",
+                "ny-fed-markets",
+                "us-treasury-rates",
+            }
+        )
         .order_by("key")
         .values_list("pk", flat=True)
     )
@@ -25098,7 +25587,15 @@ def _coordinate_treasury_curve_dashboards(
         )
         return [], {"yield-curve", "real-rates", "rates"}
 
-    rates_prepared, rates_failure = _treasury_rates_overview_prepared(prepared)
+    frozen_fed_component = _liquidity_fed_funds_component(now=timezone.now())
+    rates_prepared, rates_failure = _treasury_rates_overview_prepared(
+        prepared,
+        fed_component=(
+            frozen_fed_component
+            if not isinstance(frozen_fed_component, dict)
+            else None
+        ),
+    )
     selected_keys = {"yield-curve", "real-rates"}
     stale_keys: set[str] = set()
     if rates_prepared is not None:
@@ -25117,12 +25614,18 @@ def _coordinate_treasury_curve_dashboards(
 
     try:
         with transaction.atomic():
-            dashboards = publish_official_dashboards(
-                keys=selected_keys,
-                prepared_treasury_curve_data=prepared,
+            dashboards = _publish_treasury_curve_revisions(
+                selected_runs=selected,
+                include_rates="rates" in selected_keys,
+                batch_id=uuid.uuid4(),
+                fed_component=(
+                    frozen_fed_component
+                    if not isinstance(frozen_fed_component, dict)
+                    else None
+                ),
             )
             for key in ("yield-curve", "real-rates"):
-                latest = _latest_treasury_contract_snapshot(key)
+                latest = select_public_treasury_curve_snapshot(key)
                 expected_batches = (
                     expected_nominal_batches
                     if key == "yield-curve"
@@ -25150,8 +25653,23 @@ def _coordinate_treasury_curve_dashboards(
                     raise ValueError(
                         f"Treasury {key} publication postcondition failed"
                     )
+            if "rates" in selected_keys:
+                latest_rates = select_public_treasury_curve_snapshot("rates")
+                if (
+                    latest_rates is None
+                    or latest_rates.data.get("refresh_failure")
+                    or latest_rates.data.get("common_effective_date")
+                    != candidate_date.isoformat()
+                ):
+                    raise ValueError(
+                        "Treasury rates publication postcondition failed"
+                    )
     except ValueError as exc:
         failures = [
+            *[
+                _treasury_run_state(component, year, run)
+                for (component, year), run in sorted(selected.items())
+            ],
             {
                 "component": "publication",
                 "year": end_year,
@@ -25169,6 +25687,976 @@ def _coordinate_treasury_curve_dashboards(
         )
         return [], {"yield-curve", "real-rates", "rates"}
     return dashboards, stale_keys
+
+
+def _treasury_rates_fed_component_from_parent(
+    snapshot: DashboardSnapshot,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    references = [
+        item
+        for item in (snapshot.data or {}).get("component_snapshots", [])
+        if isinstance(item, dict) and item.get("component") == "fed-funds"
+    ]
+    if len(references) != 1:
+        raise ValueError("Treasury rates parent lacks one Fed Funds reference")
+    reference = references[0]
+    child = (
+        DashboardSnapshot.objects.filter(
+            pk=reference.get("snapshot_id"),
+            key="fed-funds",
+            batch_id=reference.get("publication_batch_id"),
+            is_published=True,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .first()
+    )
+    if child is None or child.source.key != "internal":
+        raise ValueError("Treasury rates referenced Fed Funds snapshot is missing")
+    child_data = dict(child.data or {})
+    fingerprint = _dashboard_content_fingerprint(
+        title=child.title,
+        summary=child.summary,
+        snapshot_data=child_data,
+    )
+    payload_hash = _dashboard_payload_integrity_hash(
+        title=child.title,
+        summary=child.summary,
+        snapshot_data=child_data,
+    )
+    if (
+        child_data.get("demo") is not False
+        or child_data.get("publication_batch_id") != str(child.batch_id)
+        or child_data.get("fingerprint") != fingerprint
+        or child_data.get("payload_integrity_hash") != payload_hash
+        or reference.get("fingerprint") != fingerprint
+        or reference.get("payload_integrity_hash") != payload_hash
+        or reference.get("component_batches")
+        != sorted(child_data.get("component_batches", []))
+        or reference.get("fresh_until") != child_data.get("fresh_until")
+    ):
+        raise ValueError("Treasury rates Fed Funds payload no longer replays")
+    child_metrics = {
+        str(item.get("key")): item
+        for item in child_data.get("metrics", [])
+        if isinstance(item, dict) and item.get("key")
+    }
+    copied_metrics: list[dict[str, Any]] = []
+    metric_snapshot_ids: list[int] = []
+    value_dates: set[str] = set()
+    for metric_key in sorted(LIQUIDITY_FED_FUNDS_METRIC_KEYS):
+        metric = child_metrics.get(metric_key)
+        if metric is None:
+            raise ValueError("Treasury rates Fed Funds metric is missing")
+        normalized = (
+            MetricSnapshot.objects.filter(
+                key=f"fed-funds-{metric_key}",
+                batch_id=child.batch_id,
+            )
+            .select_related("source", "fallback_source")
+            .first()
+        )
+        if (
+            normalized is None
+            or not _dashboard_metric_snapshot_matches_payload(
+                normalized,
+                metric,
+                fingerprint=fingerprint,
+                payload_integrity_hash=payload_hash,
+            )
+        ):
+            raise ValueError("Treasury rates Fed Funds normalized metric drifted")
+        copied = deepcopy(metric)
+        copied_metadata = dict(copied.get("metadata") or {})
+        input_lineage = deepcopy(copied_metadata.get("input_lineage") or [])
+        if not input_lineage:
+            raise ValueError("Treasury rates Fed Funds lineage is missing")
+        for lineage_item in input_lineage:
+            lineage_source = Source.objects.filter(
+                key=lineage_item.get("source_key")
+            ).first()
+            licence = (
+                _effective_source_license(lineage_source, require_public=True)
+                if lineage_source is not None
+                else None
+            )
+            if licence is None:
+                raise ValueError("Treasury rates Fed Funds lineage is unlicensed")
+            lineage_item["license_scope"] = licence.scope
+        metric_licence = _effective_source_license(
+            normalized.source,
+            require_public=True,
+        )
+        if metric_licence is None or normalized.fallback_source_id is not None:
+            raise ValueError("Treasury rates Fed Funds metric is not public")
+        copied_metadata.update(
+            {
+                "input_lineage": input_lineage,
+                "component_page_key": "fed-funds",
+                "component_snapshot_id": child.pk,
+                "component_publication_batch_id": str(child.batch_id),
+                "component_fingerprint": fingerprint,
+                "component_payload_integrity_hash": payload_hash,
+                "component_metric_snapshot_id": normalized.pk,
+                "component_metric_snapshot_key": normalized.key,
+                "component_metric_snapshot_batch_id": str(normalized.batch_id),
+                "inherited_license_scope": metric_licence.scope,
+            }
+        )
+        copied["metadata"] = copied_metadata
+        copied["license_scope"] = metric_licence.scope
+        copied_metrics.append(copied)
+        metric_snapshot_ids.append(normalized.pk)
+        metric_date = _parse_payload_datetime(
+            copied.get("value_date") or copied.get("as_of")
+        )
+        if metric_date is None:
+            raise ValueError("Treasury rates Fed Funds metric date is invalid")
+        value_dates.add(metric_date.isoformat())
+    if (
+        len(value_dates) != 1
+        or reference.get("metric_snapshot_ids") != metric_snapshot_ids
+        or reference.get("common_effective_date") != value_dates.pop()
+    ):
+        raise ValueError("Treasury rates Fed Funds reference is inconsistent")
+    canonical_reference = {
+        "component": "fed-funds",
+        "kind": "dashboard_snapshot",
+        "status": "valid",
+        "snapshot_id": child.pk,
+        "publication_batch_id": str(child.batch_id),
+        "fingerprint": fingerprint,
+        "payload_integrity_hash": payload_hash,
+        "component_batches": sorted(child_data.get("component_batches", [])),
+        "metric_snapshot_ids": metric_snapshot_ids,
+        "common_effective_date": reference["common_effective_date"],
+        "fresh_until": child_data.get("fresh_until"),
+    }
+    if reference != canonical_reference:
+        raise ValueError("Treasury rates Fed Funds reference fields drifted")
+    return copied_metrics, canonical_reference
+
+
+def _treasury_expected_page_payload(
+    page_key: str,
+    selected_runs: dict[tuple[str, int], IngestionRun],
+    *,
+    snapshot: DashboardSnapshot | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
+    prepared, failures = _treasury_curve_page_data(
+        selected_runs,
+        allow_expired=True,
+    )
+    if prepared is None:
+        raise ValueError(
+            "Treasury curve v2 replay is not buildable: "
+            + "; ".join(str(item.get("reason") or "") for item in failures)
+        )
+    if page_key in TREASURY_CURVE_PAGE_KEYS:
+        return prepared[page_key]
+    if page_key != "rates":
+        raise ValueError("unknown Treasury rate publication key")
+    if snapshot is None:
+        raise ValueError("Treasury rates replay requires its immutable parent")
+    fed_component = _treasury_rates_fed_component_from_parent(snapshot)
+    rates_prepared, failure = _treasury_rates_overview_prepared(
+        prepared,
+        fed_component=fed_component,
+    )
+    if rates_prepared is None:
+        raise ValueError(
+            "Treasury rates parent replay is not buildable: "
+            + str((failure or {}).get("reason") or "missing strict Fed Funds child")
+        )
+    metrics, charts, sections, extra_data = rates_prepared
+    stored_references = [
+        item
+        for item in (snapshot.data or {}).get("component_snapshots", [])
+        if isinstance(item, dict) and item.get("component_page_key")
+    ]
+    if len(stored_references) != len(TREASURY_CURVE_PAGE_KEYS):
+        raise ValueError("Treasury rates child reference count is invalid")
+    stored_by_key = {
+        str(item.get("component_page_key")): item
+        for item in stored_references
+    }
+    if set(stored_by_key) != TREASURY_CURVE_PAGE_KEYS:
+        raise ValueError("Treasury rates child reference keys are invalid")
+    child_references = []
+    for child_key in sorted(TREASURY_CURVE_PAGE_KEYS):
+        stored_reference = stored_by_key[child_key]
+        child = (
+            DashboardSnapshot.objects.filter(
+                pk=stored_reference.get("component_snapshot_id"),
+                key=child_key,
+                batch_id=stored_reference.get(
+                    "component_publication_batch_id"
+                ),
+                is_published=True,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .first()
+        )
+        replay = (
+            _treasury_rate_snapshot_static_replay(child, page_key=child_key)
+            if child is not None
+            else None
+        )
+        if child is None or replay is None:
+            raise ValueError(
+                f"Treasury rates parent cannot verify {child_key} child"
+            )
+        if any(
+            replay.selected_runs[identity].pk != run.pk
+            for identity, run in selected_runs.items()
+        ):
+            raise ValueError("Treasury rates child run set is inconsistent")
+        canonical_reference = {
+            "component_page_key": child_key,
+            "component_snapshot_id": child.pk,
+            "component_publication_batch_id": str(child.batch_id),
+            "component_fingerprint": child.data.get("fingerprint"),
+            "component_payload_integrity_hash": child.data.get(
+                "payload_integrity_hash"
+            ),
+            "component_contract_version": TREASURY_CURVE_CONTRACT_VERSION,
+            "fresh_until": child.data.get("fresh_until"),
+        }
+        if stored_reference != canonical_reference:
+            raise ValueError("Treasury rates child reference fields drifted")
+        child_references.append(canonical_reference)
+    extra_data = deepcopy(extra_data)
+    extra_data["component_snapshots"] = [
+        *list(extra_data.get("component_snapshots") or []),
+        *child_references,
+    ]
+    return metrics, charts, sections, extra_data
+
+
+def _normalized_treasury_snapshot_data(
+    *,
+    title: str,
+    summary: str,
+    batch_id: uuid.UUID,
+    prepared: tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ],
+) -> tuple[dict[str, Any], datetime, str]:
+    """Recreate the generic storage projection without writing anything."""
+
+    metrics, charts, sections, extra_data = deepcopy(prepared)
+    normalized_metrics = []
+    for metric in metrics:
+        source_key = str(metric.get("source_key") or "")
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(source, require_public=True)
+            if source is not None
+            else None
+        )
+        if source is None or licence is None:
+            raise ValueError("Treasury metric source licence is unavailable")
+        metric["source_key"] = source_key
+        metric["license_scope"] = licence.scope
+        normalized_metrics.append(metric)
+    normalized_charts = []
+    for raw_chart in charts:
+        chart = dict(raw_chart)
+        chart.setdefault("data", [])
+        chart.setdefault("kind", "line")
+        chart.setdefault("title", "趋势")
+        source_keys = set(chart.get("source_keys", [])) | _payload_source_keys(
+            chart.get("data", [])
+        )
+        chart["source_keys"] = sorted(source_keys)
+        scopes = []
+        for source in Source.objects.filter(key__in=source_keys).order_by("key"):
+            licence = _effective_source_license(source, require_public=True)
+            if licence is None:
+                raise ValueError("Treasury chart source licence is unavailable")
+            scopes.append(f"{source.name}: {licence.scope}")
+        if len(scopes) != len(source_keys):
+            raise ValueError("Treasury chart declares an unknown source")
+        chart["license_scopes"] = scopes
+        chart["fallback_sources"] = sorted(
+            _payload_fallback_source_keys(chart)
+        )
+        normalized_charts.append(chart)
+    if not normalized_charts:
+        raise ValueError("Treasury strict pages require explicit charts")
+    as_of_values = [
+        datetime.fromisoformat(str(item["as_of"]))
+        for item in [*normalized_metrics, *normalized_charts]
+        if item.get("as_of")
+    ]
+    if not as_of_values:
+        raise ValueError("Treasury page has no component as-of time")
+    as_of = min(
+        item.replace(tzinfo=UTC) if item.tzinfo is None else item
+        for item in as_of_values
+    )
+    component_qualities = {
+        item.get("quality_status")
+        for item in [*normalized_metrics, *normalized_charts]
+    }
+    if Observation.Quality.ERROR in component_qualities:
+        quality = Observation.Quality.ERROR
+    elif Observation.Quality.STALE in component_qualities:
+        quality = Observation.Quality.STALE
+    elif component_qualities == {Observation.Quality.FRESH}:
+        quality = Observation.Quality.FRESH
+    else:
+        quality = Observation.Quality.ESTIMATED
+    component_batches = sorted(
+        _payload_batch_ids([normalized_metrics, normalized_charts, sections])
+    )
+    source_keys = sorted(
+        _payload_source_keys([normalized_metrics, normalized_charts, sections])
+    )
+    snapshot_data = {
+        "demo": False,
+        "metrics": normalized_metrics,
+        "charts": normalized_charts,
+        "chart_data": normalized_charts[0]["data"],
+        "sections": sections,
+        "component_batches": component_batches,
+        "source_keys": source_keys,
+        "required_notices": public_source_notices(source_keys),
+        "fresh_until": min(
+            str(item["fresh_until"])
+            for item in [*normalized_metrics, *normalized_charts, *sections]
+            if item.get("fresh_until")
+        ),
+        "publication_batch_id": str(batch_id),
+        **extra_data,
+    }
+    snapshot_data["fingerprint"] = _dashboard_content_fingerprint(
+        title=title,
+        summary=summary,
+        snapshot_data=snapshot_data,
+    )
+    snapshot_data["payload_integrity_hash"] = _dashboard_payload_integrity_hash(
+        title=title,
+        summary=summary,
+        snapshot_data=snapshot_data,
+    )
+    return snapshot_data, as_of, quality
+
+
+def _treasury_snapshot_runs(
+    snapshot: DashboardSnapshot,
+) -> dict[tuple[str, int], IngestionRun]:
+    raw_witnesses = (snapshot.data or {}).get("all_annual_runs")
+    if not isinstance(raw_witnesses, list):
+        raise ValueError("Treasury snapshot lacks all annual run witnesses")
+    expected_count = (TREASURY_CURVE_HISTORY_YEARS + 1) * 2
+    if len(raw_witnesses) != expected_count:
+        raise ValueError("Treasury snapshot annual run witness count is invalid")
+    selected: dict[tuple[str, int], IngestionRun] = {}
+    for raw_witness in raw_witnesses:
+        if not isinstance(raw_witness, dict):
+            raise ValueError("Treasury annual run witness is malformed")
+        try:
+            run_id = int(raw_witness.get("ingestion_run_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Treasury annual run id is invalid") from exc
+        run = (
+            IngestionRun.objects.filter(pk=run_id)
+            .select_related("source")
+            .first()
+        )
+        if run is None or _treasury_run_witness(run) != raw_witness:
+            raise ValueError("Treasury annual run witness no longer replays")
+        identity = _treasury_curve_identity(run.dataset)
+        if identity is None:
+            raise ValueError("Treasury annual run dataset identity is invalid")
+        component, _fields, year = identity
+        if (component, year) in selected:
+            raise ValueError("Treasury snapshot repeats an annual run identity")
+        selected[(component, year)] = run
+    years = sorted({year for _component, year in selected})
+    if (
+        not years
+        or years
+        != list(
+            range(
+                years[-1] - TREASURY_CURVE_HISTORY_YEARS,
+                years[-1] + 1,
+            )
+        )
+        or set(selected)
+        != {
+            (component, year)
+            for year in years
+            for component in TREASURY_CURVE_DATASET_PREFIXES
+        }
+    ):
+        raise ValueError("Treasury snapshot annual run coverage is not exact")
+    current_cycles = {
+        str((selected[(component, years[-1])].metadata or {}).get("refresh_cycle_id") or "")
+        for component in TREASURY_CURVE_DATASET_PREFIXES
+    }
+    if len(current_cycles) != 1 or "" in current_cycles:
+        raise ValueError("Treasury current-year runs do not share one refresh cycle")
+    return selected
+
+
+def _treasury_snapshot_input_state(
+    snapshot: DashboardSnapshot,
+    selected_runs: dict[tuple[str, int], IngestionRun],
+) -> str:
+    newer: list[IngestionRun] = []
+    for run in selected_runs.values():
+        latest = _latest_treasury_attempt(*_treasury_component_year(run))
+        if latest is None:
+            raise ValueError("Treasury latest annual attempt is missing")
+        if latest.pk != run.pk:
+            if latest.started_at < run.started_at:
+                raise ValueError("Treasury latest annual attempt chronology regressed")
+            newer.append(latest)
+    terminal_failures = [
+        run
+        for run in newer
+        if run.status in {
+            IngestionRun.Status.FAILED,
+            IngestionRun.Status.PARTIAL,
+        }
+        or (
+            run.status == IngestionRun.Status.SUCCESS
+            and run.row_count <= 0
+        )
+    ]
+    running_attempts = [
+        run for run in newer if run.status == IngestionRun.Status.RUNNING
+    ]
+    wall_now = timezone.now()
+    if any(
+        run.started_at < wall_now - TREASURY_CURVE_RUNNING_TIMEOUT
+        for run in running_attempts
+    ):
+        raise ValueError("Treasury running attempt exceeded its transition timeout")
+    raw_marker = (snapshot.data or {}).get("refresh_failure")
+    marker = (
+        None
+        if isinstance(raw_marker, dict)
+        and raw_marker.get("kind") == "fed-funds-child"
+        else raw_marker
+    )
+
+    def marker_attempts() -> list[IngestionRun] | None:
+        if not isinstance(marker, dict):
+            return None
+        checked_at = _parse_payload_datetime(marker.get("checked_at"))
+        components = marker.get("components")
+        if (
+            checked_at is None
+            or checked_at < snapshot.created_at
+            or checked_at
+            > max(timezone.now(), datetime.now(UTC)) + timedelta(minutes=5)
+            or not isinstance(components, list)
+        ):
+            return None
+        bound: list[IngestionRun] = []
+        for item in components:
+            if not isinstance(item, dict) or not item.get("ingestion_run_id"):
+                continue
+            try:
+                run_id = int(item["ingestion_run_id"])
+            except (TypeError, ValueError):
+                return None
+            run = IngestionRun.objects.filter(pk=run_id).first()
+            if (
+                run is None
+                or item.get("dataset") != run.dataset
+                or item.get("batch_id") != str(run.batch_id)
+                or item.get("status") != run.status
+                or (
+                    run.completed_at is not None
+                    and checked_at < run.completed_at
+                )
+            ):
+                return None
+            bound.append(run)
+        return bound or None
+
+    bound_attempts = marker_attempts()
+    marker_matches_newer = bool(
+        bound_attempts is not None
+        and all(any(bound.pk == run.pk for bound in bound_attempts) for run in newer)
+    )
+    marker_matches_terminal = bool(
+        bound_attempts is not None
+        and all(
+            any(bound.pk == run.pk for bound in bound_attempts)
+            for run in terminal_failures
+        )
+    )
+    if terminal_failures:
+        state = "retained_failure"
+    elif running_attempts:
+        state = "transition_pending"
+    elif newer:
+        if marker_matches_newer:
+            state = "retained_failure"
+        else:
+            raise ValueError(
+                "Treasury snapshot is superseded by an unpublished successful run"
+            )
+    else:
+        deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+        if deadline is None:
+            raise ValueError("Treasury snapshot freshness deadline is invalid")
+        state = "natural_expiry" if deadline < timezone.now() else "current_candidate"
+    if state == "retained_failure":
+        if not marker_matches_terminal:
+            raise ValueError("Treasury refresh failure marker is not bound to attempts")
+    elif state == "transition_pending":
+        if marker is not None and bound_attempts is None:
+            raise ValueError("Treasury transition carries an invalid prior failure marker")
+    elif marker is not None:
+        raise ValueError("Treasury current or transitional snapshot has a failure marker")
+    return state
+
+
+def _treasury_component_year(run: IngestionRun) -> tuple[str, int]:
+    identity = _treasury_curve_identity(run.dataset)
+    if identity is None:
+        raise ValueError("Treasury run has an unknown dataset")
+    component, _fields, year = identity
+    return component, year
+
+
+def _treasury_rates_fed_input_state(snapshot: DashboardSnapshot) -> str:
+    references = [
+        item
+        for item in (snapshot.data or {}).get("component_snapshots", [])
+        if isinstance(item, dict) and item.get("component") == "fed-funds"
+    ]
+    if len(references) != 1:
+        raise ValueError("rates parent has no exact Fed Funds reference")
+    reference = references[0]
+    child = DashboardSnapshot.objects.filter(
+        pk=reference.get("snapshot_id"),
+        key="fed-funds",
+        batch_id=reference.get("publication_batch_id"),
+        is_published=True,
+    ).first()
+    if child is None:
+        raise ValueError("rates parent Fed Funds child is missing")
+    referenced_runs: dict[str, IngestionRun] = {}
+    component_batches = set(reference.get("component_batches") or [])
+    for identity, (source_key, dataset) in FED_FUNDS_DATASETS.items():
+        matches = list(
+            IngestionRun.objects.filter(
+                source__key=source_key,
+                dataset=dataset,
+                batch_id__in=component_batches,
+            )[:2]
+        )
+        if (
+            len(matches) != 1
+            or matches[0].status != IngestionRun.Status.SUCCESS
+            or matches[0].row_count <= 0
+        ):
+            raise ValueError("rates parent Fed Funds run reference is invalid")
+        referenced_runs[identity] = matches[0]
+    if {str(run.batch_id) for run in referenced_runs.values()} != component_batches:
+        raise ValueError("rates parent Fed Funds batch coverage is not exact")
+    latest_runs = {
+        identity: _latest_fed_funds_attempt(identity)
+        for identity in FED_FUNDS_DATASETS
+    }
+    if any(run is None for run in latest_runs.values()):
+        raise ValueError("rates parent latest Fed Funds attempt is missing")
+    newer = [
+        run
+        for identity, run in latest_runs.items()
+        if run is not None and run.pk != referenced_runs[identity].pk
+    ]
+    child_marker = (child.data or {}).get("refresh_failure")
+    raw_parent_marker = (snapshot.data or {}).get("refresh_failure")
+    parent_marker = (
+        raw_parent_marker
+        if isinstance(raw_parent_marker, dict)
+        and raw_parent_marker.get("kind") == "fed-funds-child"
+        else None
+    )
+
+    def bound_runs(
+        marker: Any,
+        *,
+        items_key: str,
+        owner_created_at: datetime,
+    ) -> list[IngestionRun] | None:
+        if not isinstance(marker, dict):
+            return None
+        checked_at = _parse_payload_datetime(marker.get("checked_at"))
+        items = marker.get(items_key)
+        if (
+            checked_at is None
+            or checked_at < owner_created_at
+            or checked_at
+            > max(timezone.now(), datetime.now(UTC)) + timedelta(minutes=5)
+            or not isinstance(items, list)
+        ):
+            return None
+        bound: list[IngestionRun] = []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("batch_id"):
+                continue
+            run = (
+                IngestionRun.objects.filter(
+                    source__key=item.get("source"),
+                    dataset=item.get("dataset"),
+                    batch_id=item.get("batch_id"),
+                )
+                .order_by("-id")
+                .first()
+            )
+            if (
+                run is None
+                or item.get("status") != run.status
+                or (
+                    run.completed_at is not None
+                    and checked_at < run.completed_at
+                )
+            ):
+                return None
+            bound.append(run)
+        return bound or None
+
+    child_bound = bound_runs(
+        child_marker,
+        items_key="sources",
+        owner_created_at=child.created_at,
+    )
+    parent_bound = bound_runs(
+        parent_marker,
+        items_key="components",
+        owner_created_at=snapshot.created_at,
+    )
+    marker_pair_valid = bool(
+        child_bound is not None
+        and parent_bound is not None
+        and isinstance(parent_marker, dict)
+        and parent_marker.get("kind") == "fed-funds-child"
+        and parent_marker.get("fed_snapshot_id") == child.pk
+        and parent_marker.get("fed_publication_batch_id") == str(child.batch_id)
+        and parent_marker.get("components")
+        == (child_marker or {}).get("sources")
+        and {run.pk for run in child_bound} == {run.pk for run in parent_bound}
+    )
+    marker_matches = bool(
+        marker_pair_valid
+        and all(
+            any(bound.pk == run.pk for bound in child_bound)
+            and any(bound.pk == run.pk for bound in parent_bound)
+            for run in newer
+        )
+    )
+    terminal = [
+        run
+        for run in newer
+        if run.status in {
+            IngestionRun.Status.FAILED,
+            IngestionRun.Status.PARTIAL,
+        }
+        or (run.status == IngestionRun.Status.SUCCESS and run.row_count <= 0)
+    ]
+    running = [run for run in newer if run.status == IngestionRun.Status.RUNNING]
+    wall_now = timezone.now()
+    if any(
+        run.started_at < wall_now - TREASURY_CURVE_RUNNING_TIMEOUT
+        for run in running
+    ):
+        raise ValueError("rates parent Fed Funds attempt exceeded its transition timeout")
+    if terminal:
+        marker_matches_terminal = bool(
+            marker_pair_valid
+            and all(
+                any(bound.pk == run.pk for bound in child_bound)
+                and any(bound.pk == run.pk for bound in parent_bound)
+                for run in terminal
+            )
+        )
+        if not marker_matches_terminal:
+            raise ValueError("rates parent Fed Funds failure marker is invalid")
+        return "retained_failure"
+    if running:
+        if (
+            child_marker is not None or parent_marker is not None
+        ) and not marker_pair_valid:
+            raise ValueError("rates parent carries an invalid prior Fed marker")
+        return "transition_pending"
+    if newer:
+        latest_child = _latest_fed_funds_snapshot()
+        if latest_child is not None and latest_child.pk != child.pk:
+            raise ValueError("rates parent was superseded by a newer Fed child")
+        if child_marker is not None or parent_marker is not None:
+            if marker_matches:
+                return "retained_failure"
+            raise ValueError("rates parent Fed marker does not bind successful attempts")
+        return "transition_pending"
+    if child_marker is not None or parent_marker is not None:
+        raise ValueError("rates parent carries a marker without a newer Fed attempt")
+    return "current_candidate"
+
+
+def _treasury_rate_snapshot_static_replay(
+    snapshot: DashboardSnapshot,
+    *,
+    page_key: str,
+) -> SimpleNamespace | None:
+    """Replay immutable evidence without consulting latest-attempt state."""
+
+    try:
+        titles = {
+            "yield-curve": (TREASURY_YIELD_TITLE, TREASURY_YIELD_SUMMARY),
+            "real-rates": (TREASURY_REAL_TITLE, TREASURY_REAL_SUMMARY),
+            "rates": (TREASURY_RATES_TITLE, TREASURY_RATES_SUMMARY),
+        }
+        title, summary = titles[page_key]
+        data = dict(snapshot.data or {})
+        if (
+            snapshot.key != page_key
+            or not snapshot.is_published
+            or snapshot.source.key != "internal"
+            or snapshot.title != title
+            or snapshot.summary != summary
+            or data.get("contract_version") != TREASURY_CURVE_CONTRACT_VERSION
+            or data.get("formula_version") != TREASURY_CURVE_FORMULA_VERSION
+            or data.get("demo") is not False
+            or data.get("fallback_state") != "none"
+            or data.get("fallback_source") is not None
+            or data.get("publication_batch_id") != str(snapshot.batch_id)
+        ):
+            return None
+        selected_runs = _treasury_snapshot_runs(snapshot)
+        prepared = _treasury_expected_page_payload(
+            page_key,
+            selected_runs,
+            snapshot=snapshot,
+        )
+        expected_data, expected_as_of, expected_quality = (
+            _normalized_treasury_snapshot_data(
+                title=title,
+                summary=summary,
+                batch_id=snapshot.batch_id,
+                prepared=prepared,
+            )
+        )
+        actual_without_marker = dict(data)
+        actual_without_marker.pop("refresh_failure", None)
+        if actual_without_marker != expected_data or snapshot.as_of != expected_as_of:
+            return None
+        metrics = list(expected_data["metrics"])
+        stored_metrics = {
+            item.key: item
+            for item in MetricSnapshot.objects.filter(
+                batch_id=snapshot.batch_id,
+                key__startswith=f"{page_key}-",
+            ).select_related("source", "fallback_source")
+        }
+        expected_metric_keys = {
+            f"{page_key}-{item['key']}" for item in metrics
+        }
+        if set(stored_metrics) != expected_metric_keys or any(
+            not _dashboard_metric_snapshot_matches_payload(
+                stored_metrics[f"{page_key}-{metric['key']}"],
+                metric,
+                fingerprint=str(expected_data["fingerprint"]),
+                payload_integrity_hash=str(
+                    expected_data["payload_integrity_hash"]
+                ),
+            )
+            for metric in metrics
+        ):
+            return None
+        return SimpleNamespace(
+            data=data,
+            selected_runs=selected_runs,
+            expected_data=expected_data,
+            expected_quality=expected_quality,
+        )
+    except (
+        ArithmeticError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def treasury_rate_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+    *,
+    page_key: str,
+) -> bool:
+    """Fail closed unless a v2 rate snapshot replays through every layer."""
+
+    try:
+        replay = _treasury_rate_snapshot_static_replay(
+            snapshot,
+            page_key=page_key,
+        )
+        if replay is None:
+            return False
+        treasury_state = _treasury_snapshot_input_state(
+            snapshot,
+            replay.selected_runs,
+        )
+        if page_key == "rates":
+            fed_state = _treasury_rates_fed_input_state(snapshot)
+            if "retained_failure" in {treasury_state, fed_state}:
+                state = "retained_failure"
+            elif "transition_pending" in {treasury_state, fed_state}:
+                state = "transition_pending"
+            elif "natural_expiry" in {treasury_state, fed_state}:
+                state = "natural_expiry"
+            else:
+                state = "current_candidate"
+        else:
+            state = treasury_state
+        if state in {"current_candidate", "transition_pending"}:
+            if snapshot.quality_status not in {
+                replay.expected_quality,
+                *(
+                    {Observation.Quality.STALE}
+                    if state == "transition_pending"
+                    else set()
+                ),
+            }:
+                return False
+        elif state == "retained_failure":
+            if snapshot.quality_status != Observation.Quality.STALE:
+                return False
+        elif snapshot.quality_status not in {
+            replay.expected_quality,
+            Observation.Quality.STALE,
+        }:
+            return False
+        snapshot.treasury_publication_state = state
+        return True
+    except (
+        ArithmeticError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def select_public_treasury_curve_snapshot(
+    page_key: str,
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if page_key not in TREASURY_RATE_PUBLICATION_KEYS:
+        raise ValueError("unknown Treasury rate publication key")
+    queryset = candidates
+    if queryset is None:
+        queryset = (
+            DashboardSnapshot.objects.filter(
+                key=page_key,
+                is_published=True,
+                data__contract_version=TREASURY_CURVE_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    for candidate in queryset:
+        if treasury_rate_snapshot_is_publicly_displayable(
+            candidate,
+            page_key=page_key,
+        ):
+            state = getattr(candidate, "treasury_publication_state", None)
+            presented = deepcopy(candidate)
+            presented.data = deepcopy(candidate.data or {})
+            if state != "retained_failure":
+                presented.data.pop("refresh_failure", None)
+            presented.treasury_publication_state = state
+            return presented
+    return None
+
+
+def _rebuild_treasury_rates_parent_from_latest_components(
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    """Recompose only ``rates`` after a successful Fed Funds revision."""
+
+    has_treasury_contract = DashboardSnapshot.objects.filter(
+        key__in={"yield-curve", "real-rates", "rates"},
+        is_published=True,
+        data__contract_version=TREASURY_CURVE_CONTRACT_VERSION,
+    ).exists()
+    if not has_treasury_contract:
+        return [], set()
+    yield_snapshot = select_public_treasury_curve_snapshot("yield-curve")
+    real_snapshot = select_public_treasury_curve_snapshot("real-rates")
+    if yield_snapshot is None or real_snapshot is None:
+        return [], {"rates"}
+    if (
+        getattr(yield_snapshot, "treasury_publication_state", None)
+        != "current_candidate"
+        or getattr(real_snapshot, "treasury_publication_state", None)
+        != "current_candidate"
+    ):
+        return [], {"rates"}
+    selected = _treasury_snapshot_runs(real_snapshot)
+    yield_selected = _treasury_snapshot_runs(yield_snapshot)
+    if any(
+        yield_selected[("nominal", year)].pk
+        != selected[("nominal", year)].pk
+        for year in {
+            period for component, period in selected if component == "nominal"
+        }
+    ):
+        return [], {"rates"}
+    fed_component = _liquidity_fed_funds_component(now=timezone.now())
+    if isinstance(fed_component, dict):
+        return [], {"rates"}
+    published = _publish_treasury_curve_revisions(
+        selected_runs=selected,
+        include_rates=True,
+        batch_id=uuid.uuid4(),
+        fed_component=fed_component,
+    )
+    latest = select_public_treasury_curve_snapshot("rates")
+    latest_fed = _latest_fed_funds_snapshot()
+    if latest is None or latest_fed is None:
+        raise ValueError("rates parent-only publication did not replay")
+    references = list((latest.data or {}).get("component_snapshots") or [])
+    fed_references = [
+        item
+        for item in references
+        if isinstance(item, dict) and item.get("component") == "fed-funds"
+    ]
+    child_references = {
+        str(item.get("component_page_key")): item
+        for item in references
+        if isinstance(item, dict) and item.get("component_page_key")
+    }
+    if (
+        len(fed_references) != 1
+        or fed_references[0].get("snapshot_id") != latest_fed.pk
+        or set(child_references) != TREASURY_CURVE_PAGE_KEYS
+        or child_references["yield-curve"].get("component_snapshot_id")
+        != yield_snapshot.pk
+        or child_references["real-rates"].get("component_snapshot_id")
+        != real_snapshot.pk
+    ):
+        raise ValueError("rates parent-only child references are not exact")
+    return [item for item in published if item.key == "rates"], set()
 
 
 def _gdp_vintage_chart_and_section() -> tuple[
@@ -25648,134 +27136,230 @@ def _store_series_with_artifacts(result, source, run) -> int:
     return row_count
 
 
-def _store_treasury_curve_observations(result, source, run) -> int:
-    """Persist one annual Treasury curve without allowing its stored tail to regress."""
-
-    incoming_series = {
-        str(record.get("series_id") or "").lower()
-        for record in result.records
-        if record.get("series_id") and record.get("date")
-    }
-    incoming_dates = [
-        date.fromisoformat(str(record["date"])[:10])
-        for record in result.records
-        if record.get("series_id") and record.get("date")
-    ]
-    requested_year = int((result.metadata or {}).get("requested_year") or 0)
-    if not incoming_dates or requested_year <= 0:
-        raise ValueError("Treasury annual curve has no dated rows or requested year")
-    if {period.year for period in incoming_dates} != {requested_year}:
-        raise ValueError("Treasury annual curve contains an out-of-year observation")
-    existing_latest = (
-        Observation.objects.filter(
-            source=source,
-            series__key__in=incoming_series,
-            value_date__year=requested_year,
-        )
-        .order_by("-value_date")
-        .first()
+def _treasury_curve_record_contract(record: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        str(record.get("series_id") or "").upper(),
+        str(record.get("date") or "")[:10],
+        f"{Decimal(str(record.get('value'))):.8f}",
+        json.dumps(
+            record.get("metadata") or {},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ),
     )
-    if (
-        existing_latest is not None
-        and max(incoming_dates) < existing_latest.value_date.date()
-    ):
-        raise ValueError(
-            "Treasury annual curve latest date regressed behind the stored official source"
-        )
-    series_by_key: dict[str, SeriesDefinition] = {}
-    for series_key in sorted(incoming_series):
-        series_id = series_key.upper()
-        series, _created = SeriesDefinition.objects.get_or_create(
-            key=series_key,
-            defaults={
-                "name": series_id.replace("UST-", "U.S. Treasury ").replace(
-                    "TIPS-", "Treasury Real "
-                ),
-                "unit": "%",
-                "source": source,
-                "frequency": "daily",
-                "description": f"Imported directly from {source.name}.",
-            },
-        )
-        series_by_key[series_key] = series
 
-    existing = {
-        (item.series.key, item.value_date.date()): item
-        for item in Observation.objects.filter(
-            source=source,
-            series__key__in=incoming_series,
-            value_date__year=requested_year,
-        ).select_related("series")
-    }
+
+def _treasury_curve_identity(
+    dataset: str,
+) -> tuple[str, Mapping[str, str], int] | None:
+    for component, prefix in TREASURY_CURVE_DATASET_PREFIXES.items():
+        marker = f"{prefix}:"
+        if not dataset.startswith(marker):
+            continue
+        try:
+            year = int(dataset.removeprefix(marker))
+        except ValueError:
+            return None
+        fields = (
+            TreasuryRatesProvider.NOMINAL_FIELDS
+            if component == "nominal"
+            else TreasuryRatesProvider.REAL_FIELDS
+        )
+        return component, fields, year
+    return None
+
+
+def _store_treasury_curve_observations(result, source, run) -> int:
+    """Retain one exact annual Treasury XML response as an immutable batch."""
+
+    identity = _treasury_curve_identity(result.dataset)
+    if (
+        identity is None
+        or source.key != "us-treasury-rates"
+        or result.provider != source.key
+        or run.source_id != source.pk
+        or run.dataset != result.dataset
+        or not isinstance(result.raw_bytes, (bytes, bytearray))
+        or not result.raw_bytes
+    ):
+        raise ValueError("Treasury curve source, dataset, run or raw bytes are invalid")
+    component, fields, requested_year = identity
+    curve = TREASURY_CURVE_DATASET_PREFIXES[component]
+    metadata = dict(result.metadata or {})
+    if (
+        metadata.get("curve") != curve
+        or metadata.get("requested_year") != requested_year
+        or requested_year < 1990
+        or requested_year > timezone.now().year
+    ):
+        raise ValueError("Treasury curve provider identity metadata is invalid")
+    endpoint = urlparse(str(metadata.get("endpoint") or ""))
+    content_type = str(metadata.get("content_type") or "")
+    if (
+        endpoint.scheme != "https"
+        or endpoint.netloc.lower() != "home.treasury.gov"
+        or endpoint.path
+        != "/resource-center/data-chart-center/interest-rates/pages/xml"
+        or parse_qs(endpoint.query) != {
+            "data": [curve],
+            "field_tdr_date_value": [str(requested_year)],
+        }
+        or not content_type.lower().startswith(
+            ("application/xml", "application/atom+xml", "text/xml")
+        )
+        or int(metadata.get("byte_length") or 0) != len(result.raw_bytes)
+        or str(metadata.get("sha256") or "").lower()
+        != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError("Treasury curve HTTP response witness is invalid")
     fetched_at = result.fetched_at
     if timezone.is_naive(fetched_at):
         fetched_at = fetched_at.replace(tzinfo=UTC)
-    now = timezone.now()
-    to_create: list[Observation] = []
-    to_update: list[Observation] = []
-    for record in result.records:
-        series_key = str(record["series_id"]).lower()
-        period = date.fromisoformat(str(record["date"])[:10])
-        value_date = datetime.combine(period, datetime.min.time(), tzinfo=UTC)
-        item = existing.get((series_key, period))
-        if item is None:
-            to_create.append(
-                Observation(
-                    series=series_by_key[series_key],
-                    instrument=None,
-                    value=record["value"],
-                    value_date=value_date,
-                    as_of=value_date,
-                    fetched_at=fetched_at,
-                    batch_id=run.batch_id,
-                    source=source,
-                    fallback_source=None,
-                    quality_status=Observation.Quality.FRESH,
-                    metadata=dict(record.get("metadata") or {}),
-                )
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("Treasury curve fetched_at is in the future")
+    replayed, evidence = TreasuryRatesProvider.parse_curve_xml_bytes(
+        bytes(result.raw_bytes),
+        curve=curve,
+        fields=fields,
+        year=requested_year,
+        fetched_at=fetched_at,
+    )
+    for key in (
+        "curve",
+        "requested_year",
+        "feed_title",
+        "feed_id",
+        "feed_updated_time",
+        "entry_count",
+        "record_count",
+        "series_coverage",
+        "latest_value_date",
+        "missing_latest_series",
+    ):
+        if metadata.get(key) != evidence.get(key):
+            raise ValueError(f"Treasury curve {key} metadata does not replay")
+    incoming = [_treasury_curve_record_contract(record) for record in result.records]
+    replay_contract = [_treasury_curve_record_contract(record) for record in replayed]
+    incoming_identities = {(item[0], item[1]) for item in incoming}
+    if (
+        len(incoming) != len(set(incoming))
+        or len(incoming) != len(incoming_identities)
+        or sorted(incoming) != sorted(replay_contract)
+    ):
+        raise ValueError(
+            "Treasury normalized observations do not replay from the exact XML"
+        )
+
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError(
+            "Treasury curve source lacks a current historical-storage licence"
+        )
+    latest_attempt = (
+        IngestionRun.objects.filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded Treasury curve run cannot persist observations")
+    previous_runs = list(
+        IngestionRun.objects.filter(
+            source=source,
+            dataset=run.dataset,
+            status=IngestionRun.Status.SUCCESS,
+            row_count__gt=0,
+        )
+        .exclude(pk=run.pk)
+        .order_by("-started_at", "-id")
+    )
+    candidate_latest = date.fromisoformat(str(evidence["latest_value_date"]))
+    previous_latest_dates = []
+    previous_release_times = []
+    for previous in previous_runs:
+        previous_metadata = dict(previous.metadata or {})
+        try:
+            previous_latest_dates.append(
+                date.fromisoformat(str(previous_metadata.get("latest_value_date") or ""))
             )
+        except ValueError:
             continue
-        item.value = record["value"]
-        item.as_of = value_date
-        item.fetched_at = fetched_at
-        item.batch_id = run.batch_id
-        item.fallback_source = None
-        item.quality_status = Observation.Quality.FRESH
-        item.metadata = dict(record.get("metadata") or {})
-        item.updated_at = now
-        to_update.append(item)
-    if to_create:
-        Observation.objects.bulk_create(to_create, batch_size=1000)
-    if to_update:
-        Observation.objects.bulk_update(
-            to_update,
-            fields=[
-                "value",
-                "as_of",
-                "fetched_at",
-                "batch_id",
-                "fallback_source",
-                "quality_status",
-                "metadata",
-                "updated_at",
-            ],
-            batch_size=1000,
+        parsed_release = _parse_payload_datetime(
+            previous_metadata.get("feed_updated_time")
         )
-    for artifact in result.metadata.get("artifacts", []):
-        url = str(artifact.get("url") or "")
-        digest = str(artifact.get("sha256") or "")
-        if not url or not digest:
-            continue
-        RawArtifact.objects.create(
-            run=run,
-            uri=f"{url}#sha256={digest}",
-            sha256=digest,
-            content_type=str(
-                artifact.get("content_type") or "application/octet-stream"
+        if parsed_release is not None:
+            previous_release_times.append(parsed_release)
+    if previous_latest_dates and candidate_latest < max(previous_latest_dates):
+        raise ValueError(
+            "Treasury annual curve latest date regressed behind the stored official source"
+        )
+    candidate_release = _parse_payload_datetime(evidence["feed_updated_time"])
+    if candidate_release is None or (
+        previous_release_times and candidate_release < max(previous_release_times)
+    ):
+        raise ValueError("Treasury curve feed release watermark regressed")
+
+    existing_artifacts = list(RawArtifact.objects.filter(run=run).order_by("pk"))
+    if existing_artifacts:
+        if len(existing_artifacts) != 1:
+            raise ValueError("Treasury curve run has multiple raw artifacts")
+        artifact = existing_artifacts[0]
+        digest = hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+        if (
+            artifact.sha256 != digest
+            or artifact.size_bytes != len(result.raw_bytes)
+            or artifact.uri
+            != f"private://{source.key}/{digest[:2]}/{digest}.bin"
+        ):
+            raise ValueError("Treasury curve existing raw artifact is inconsistent")
+    else:
+        artifact = persist_private_raw_artifact(
+            run=run, result=result, namespace=source.key
+        )
+    count = store_series_observations(
+        result, source, run, preserve_batches=True
+    )
+    rows = list(
+        Observation.objects.filter(batch_id=run.batch_id)
+        .select_related("series", "source", "fallback_source")
+        .order_by("series__key", "value_date", "pk")
+    )
+    stored_contract = [
+        (
+            row.series.key.upper(),
+            row.value_date.date().isoformat(),
+            f"{row.value:.8f}",
+            json.dumps(
+                row.metadata or {},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
             ),
-            size_bytes=int(artifact.get("size") or 0),
         )
-    return len(to_create) + len(to_update)
+        for row in rows
+        if row.series_id
+        and row.series.source_id == source.pk
+        and row.source_id == source.pk
+        and row.instrument_id is None
+        and row.as_of == row.value_date
+        and row.fetched_at == fetched_at
+        and row.quality_status == Observation.Quality.FRESH
+        and row.fallback_source_id is None
+    ]
+    if (
+        count != len(incoming)
+        or len(rows) != len(incoming)
+        or len(stored_contract) != len(rows)
+        or sorted(stored_contract) != sorted(replay_contract)
+        or RawArtifact.objects.filter(run=run).count() != 1
+        or artifact.sha256 != hashlib.sha256(bytes(result.raw_bytes)).hexdigest()
+    ):
+        raise ValueError(
+            "Treasury curve artifact and exact-batch observations failed postconditions"
+        )
+    run.metadata = {**dict(run.metadata or {}), **metadata}
+    run.save(update_fields=["metadata", "updated_at"])
+    return count
 
 
 def _store_treasury_bill_observations(result, source, run) -> int:
@@ -27561,6 +29145,7 @@ def _dashboard_metric_snapshot_matches_payload(
 
 _ASSETS_FX_CORE_PUBLISH_CAPABILITY = object()
 _TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY = object()
+_TREASURY_CURVE_CORE_PUBLISH_CAPABILITY = object()
 
 
 def _publish_dashboard_core(
@@ -27581,6 +29166,15 @@ def _publish_dashboard_core(
 ) -> DashboardSnapshot | None:
     if key in CREDIT_PUBLICATION_KEYS:
         raise ValueError(f"{key} must be published by its dedicated Credit Official v1 publisher")
+    if key in FX_VOL_PUBLICATION_KEYS:
+        raise ValueError(f"{key} must be published by its dedicated H.10 RV publisher")
+    if (
+        key in TREASURY_RATE_PUBLICATION_KEYS
+        and _publish_capability is not _TREASURY_CURVE_CORE_PUBLISH_CAPABILITY
+    ):
+        raise ValueError(
+            f"{key} must be published by its dedicated Treasury curve v2 publisher"
+        )
     if (
         key == "assets-fx"
         and _publish_capability is not _ASSETS_FX_CORE_PUBLISH_CAPABILITY
@@ -27866,16 +29460,19 @@ def _publish_dashboard_core(
             },
         )
 
-    latest_query = DashboardSnapshot.objects.filter(key=key, is_published=True)
-    if normalized_extra_data.get("contract_version") is not None:
-        latest_query = latest_query.filter(
-            data__contract_version=normalized_extra_data["contract_version"]
+    if key in TREASURY_RATE_PUBLICATION_KEYS:
+        latest = _latest_treasury_contract_snapshot(key)
+    else:
+        latest_query = DashboardSnapshot.objects.filter(key=key, is_published=True)
+        if normalized_extra_data.get("contract_version") is not None:
+            latest_query = latest_query.filter(
+                data__contract_version=normalized_extra_data["contract_version"]
+            )
+        latest = (
+            latest_query.exclude(source__key="demo-market")
+            .order_by("-created_at")
+            .first()
         )
-    latest = (
-        latest_query.exclude(source__key="demo-market")
-        .order_by("-created_at")
-        .first()
-    )
     if latest and latest.data.get("fingerprint") == fingerprint:
         idempotent_data = deepcopy(snapshot_data)
         idempotent_data["publication_batch_id"] = str(latest.batch_id)
@@ -27904,11 +29501,26 @@ def _publish_dashboard_core(
                 latest.title == title
                 and latest.summary == summary
                 and audited_latest_data == idempotent_data
-                and "refresh_failure" not in (latest.data or {})
-                and latest.quality_status
-                not in {Observation.Quality.ERROR, Observation.Quality.STALE}
             ):
-                return None
+                if (
+                    "refresh_failure" not in (latest.data or {})
+                    and latest.quality_status
+                    not in {Observation.Quality.ERROR, Observation.Quality.STALE}
+                ):
+                    return None
+                if key in TREASURY_RATE_PUBLICATION_KEYS:
+                    latest.data = idempotent_data
+                    latest.as_of = as_of
+                    latest.quality_status = quality
+                    latest.save(
+                        update_fields=[
+                            "data",
+                            "as_of",
+                            "quality_status",
+                            "updated_at",
+                        ]
+                    )
+                    return None
         else:
             snapshot_data = idempotent_data
             payload_integrity_hash = str(
@@ -27953,7 +29565,12 @@ def _publish_dashboard(
 ) -> DashboardSnapshot | None:
     """Publish generic dashboards; independent contracts are never writable here."""
 
-    if key in {"assets-fx", "transmission-chain", *CREDIT_PUBLICATION_KEYS}:
+    if key in {
+        "assets-fx",
+        "transmission-chain",
+        *CREDIT_PUBLICATION_KEYS,
+        *FX_VOL_PUBLICATION_KEYS,
+    }:
         raise ValueError(f"{key} must be published by its dedicated v1 publisher")
     return _publish_dashboard_core(
         key=key,
@@ -28059,6 +29676,135 @@ def _publish_transmission_chain_revision(
         snapshot_fresh_until=snapshot_fresh_until,
         _publish_capability=_TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY,
     )
+
+
+def _publish_treasury_curve_revisions(
+    *,
+    selected_runs: dict[tuple[str, int], IngestionRun],
+    include_rates: bool,
+    batch_id: uuid.UUID,
+    fed_component: tuple[list[dict[str, Any]], dict[str, Any]] | None = None,
+) -> list[DashboardSnapshot]:
+    """Publish only payloads recomputed from strict annual Treasury runs."""
+
+    for (component, year), run in selected_runs.items():
+        latest = _latest_treasury_attempt(component, year)
+        if latest is None or latest.pk != run.pk:
+            raise ValueError(
+                "Treasury curve publisher received a superseded annual run"
+            )
+        _validate_treasury_curve_run(run)
+
+    prepared, failures = _treasury_curve_page_data(selected_runs)
+    if prepared is None:
+        raise ValueError(
+            "Treasury curve v2 payload is not buildable: "
+            + "; ".join(str(item.get("reason") or "") for item in failures)
+        )
+    expected_nominal_batches = {
+        str(run.batch_id)
+        for (component, _year), run in selected_runs.items()
+        if component == "nominal"
+    }
+    expected_all_batches = {str(run.batch_id) for run in selected_runs.values()}
+    if not _treasury_prepared_contract_is_buildable(
+        "yield-curve",
+        prepared["yield-curve"],
+        expected_batches=expected_nominal_batches,
+    ) or not _treasury_prepared_contract_is_buildable(
+        "real-rates",
+        prepared["real-rates"],
+        expected_batches=expected_all_batches,
+    ):
+        raise ValueError("Treasury curve v2 child contract is invalid")
+    rates_prepared = None
+    if include_rates:
+        rates_prepared, rates_failure = _treasury_rates_overview_prepared(
+            prepared,
+            fed_component=fed_component,
+        )
+        if rates_prepared is None:
+            raise ValueError(
+                "Treasury rates v2 parent is not buildable: "
+                + str((rates_failure or {}).get("reason") or "missing Fed Funds child")
+            )
+    definitions = (
+        (
+            "yield-curve",
+            TREASURY_YIELD_TITLE,
+            TREASURY_YIELD_SUMMARY,
+            prepared["yield-curve"],
+            YIELD_CURVE_REQUIRED_METRIC_KEYS,
+        ),
+        (
+            "real-rates",
+            TREASURY_REAL_TITLE,
+            TREASURY_REAL_SUMMARY,
+            prepared["real-rates"],
+            REAL_RATES_REQUIRED_METRIC_KEYS,
+        ),
+    )
+    published: list[DashboardSnapshot] = []
+    for key, title, summary, payload, required_metrics in definitions:
+        metrics, charts, sections, extra_data = payload
+        snapshot = _publish_dashboard_core(
+            key=key,
+            title=title,
+            summary=summary,
+            metrics=metrics,
+            charts=charts,
+            sections=sections,
+            extra_data=extra_data,
+            required_metric_keys=required_metrics,
+            batch_id=batch_id,
+            _publish_capability=_TREASURY_CURVE_CORE_PUBLISH_CAPABILITY,
+        )
+        if snapshot is not None:
+            published.append(snapshot)
+    if rates_prepared is not None:
+        metrics, charts, sections, extra_data = rates_prepared
+        child_references = []
+        for page_key in sorted(TREASURY_CURVE_PAGE_KEYS):
+            child = select_public_treasury_curve_snapshot(page_key)
+            if child is None:
+                raise ValueError(
+                    f"Treasury rates parent lacks the {page_key} v2 child"
+                )
+            child_references.append(
+                {
+                    "component_page_key": page_key,
+                    "component_snapshot_id": child.pk,
+                    "component_publication_batch_id": str(child.batch_id),
+                    "component_fingerprint": child.data.get("fingerprint"),
+                    "component_payload_integrity_hash": child.data.get(
+                        "payload_integrity_hash"
+                    ),
+                    "component_contract_version": TREASURY_CURVE_CONTRACT_VERSION,
+                    "fresh_until": child.data.get("fresh_until"),
+                }
+            )
+        extra_data = deepcopy(extra_data)
+        extra_data["component_snapshots"] = [
+            *list(extra_data.get("component_snapshots") or []),
+            *child_references,
+        ]
+        snapshot = _publish_dashboard_core(
+            key="rates",
+            title=TREASURY_RATES_TITLE,
+            summary=TREASURY_RATES_SUMMARY,
+            metrics=metrics,
+            charts=charts,
+            sections=sections,
+            extra_data=extra_data,
+            required_metric_keys=frozenset(
+                str(item["key"]) for item in metrics
+            ),
+            batch_id=batch_id,
+            _publish_capability=_TREASURY_CURVE_CORE_PUBLISH_CAPABILITY,
+        )
+        if snapshot is not None:
+            published.append(snapshot)
+    return published
 
 
 def _latest_successful_source_batch(source_key: str) -> uuid.UUID | None:
@@ -28585,6 +30331,8 @@ def publish_official_dashboards(
     ]
     with transaction.atomic():
         for definition in definitions:
+            if definition["key"] in INDEPENDENT_PUBLICATION_KEYS:
+                continue
             if selected_keys is not None and definition["key"] not in selected_keys:
                 continue
             snapshot = _publish_dashboard(batch_id=batch_id, **definition)
@@ -28651,16 +30399,6 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
         (
             TreasuryRatesProvider(),
             (
-                (
-                    "yield_curve",
-                    {"year": year},
-                    _store_treasury_curve_observations,
-                ),
-                (
-                    "real_yield_curve",
-                    {"year": year},
-                    _store_treasury_curve_observations,
-                ),
                 (
                     "treasury_bill_rates_13w_coupon_equivalent",
                     {"current_year": year},
@@ -28870,6 +30608,9 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     )
     dashboards.extend(assets_fx_dashboards)
     stale_dashboard_keys |= stale_assets_fx_keys
+    fx_vol_dashboards, stale_fx_vol_keys = coordinate_fx_vol_dashboard(runs)
+    dashboards.extend(fx_vol_dashboards)
+    stale_dashboard_keys |= stale_fx_vol_keys
     global_dollar_dashboards, stale_global_dollar_keys = (
         _coordinate_global_dollar_dashboard(runs)
     )
@@ -28915,7 +30656,7 @@ def refresh_treasury_curve_data(
     end_year: int | None = None,
     publish: bool = True,
 ) -> dict[str, Any]:
-    """Backfill explicit annual Treasury curve datasets, then coordinate v1 pages."""
+    """Backfill annual Treasury curves without exposing a half-finished cycle."""
 
     resolved_end = end_year or timezone.now().year
     resolved_start = (
@@ -28929,36 +30670,74 @@ def refresh_treasury_curve_data(
         raise ValueError("Treasury curve years are outside the supported historical range")
 
     refresh_cycle_id = str(uuid.uuid4())
-    runs: list[IngestionRun] = []
+    plan: list[tuple[int, str, str, IngestionRun]] = []
     for year in range(resolved_start, resolved_end + 1):
-        for method_name in ("yield_curve", "real_yield_curve"):
-            provider = TreasuryRatesProvider()
-            try:
-                result = getattr(provider, method_name)(year=year)
-            finally:
-                provider.close()
-            try:
-                result.metadata = {
-                    **result.metadata,
+        for component, method_name in (
+            ("nominal", "yield_curve"),
+            ("real", "real_yield_curve"),
+        ):
+            dataset = _treasury_dataset(component, year)
+            run = begin_ingestion(
+                "us-treasury-rates",
+                dataset,
+                metadata={
+                    "provider": "us-treasury-rates",
                     "refresh_cycle_id": refresh_cycle_id,
                     "backfill_start_year": resolved_start,
                     "backfill_end_year": resolved_end,
-                }
+                    "publication_intent": publish,
+                },
+            )
+            plan.append((year, method_name, dataset, run))
+
+    runs: list[IngestionRun] = []
+    dashboards: list[DashboardSnapshot] = []
+    stale_keys: set[str] = set()
+    for index, (year, method_name, dataset, pending_run) in enumerate(plan):
+        provider = TreasuryRatesProvider()
+        try:
+            try:
+                result = getattr(provider, method_name)(year=year)
+            except Exception as exc:  # provider exceptions become durable attempts
+                result = ProviderResult.failure(
+                    "us-treasury-rates",
+                    dataset,
+                    f"{type(exc).__name__}: {exc}",
+                )
+        finally:
+            provider.close()
+        result.metadata = {
+            **result.metadata,
+            "refresh_cycle_id": refresh_cycle_id,
+            "backfill_start_year": resolved_start,
+            "backfill_end_year": resolved_end,
+            "publication_intent": publish,
+        }
+        final_attempt = index == len(plan) - 1
+        if publish and final_attempt:
+            # Readers keep seeing at least one RUNNING shard until the final
+            # attempt and the replacement dashboards commit atomically.
+            with transaction.atomic():
                 runs.append(
                     record_provider_result(
                         result,
                         persist=_store_treasury_curve_observations,
+                        run=pending_run,
                     )
                 )
-            finally:
-                del result
-    if publish:
-        dashboards, stale_keys = _coordinate_treasury_curve_dashboards(
-            runs,
-            end_year=resolved_end,
-        )
-    else:
-        dashboards, stale_keys = [], set()
+                dashboards, stale_keys = _coordinate_treasury_curve_dashboards(
+                    runs,
+                    end_year=resolved_end,
+                )
+        else:
+            runs.append(
+                record_provider_result(
+                    result,
+                    persist=_store_treasury_curve_observations,
+                    run=pending_run,
+                )
+            )
+        del result
     return {
         "runs": [
             {
@@ -29150,6 +30929,8 @@ def refresh_h10_data() -> dict[str, Any]:
     dashboards, stale_assets_fx_keys = _coordinate_assets_fx_dashboard(
         [run]
     )
+    fx_vol_dashboards, stale_fx_vol_keys = coordinate_fx_vol_dashboard([run])
+    dashboards.extend(fx_vol_dashboards)
     global_dollar_dashboards, stale_global_dollar_keys = (
         _coordinate_global_dollar_dashboard([run])
     )
@@ -29172,6 +30953,7 @@ def refresh_h10_data() -> dict[str, Any]:
         "dashboard_keys": [dashboard.key for dashboard in dashboards],
         "stale_dashboard_keys": sorted(
             stale_assets_fx_keys
+            | stale_fx_vol_keys
             | stale_global_dollar_keys
             | stale_transmission_keys
         ),

@@ -173,6 +173,39 @@ class HTTPProvider:
         except httpx.HTTPError as exc:
             return None, ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
 
+    def _get_bytes(
+        self,
+        dataset: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> tuple[bytes | None, dict[str, Any], ProviderResult | None]:
+        """Return the exact HTTP response bytes and their transport witness."""
+
+        try:
+            response = self.client.get(path, params=params, headers=headers)
+            response.raise_for_status()
+            raw_bytes = bytes(response.content)
+        except httpx.HTTPError as exc:
+            return (
+                None,
+                {},
+                ProviderResult.failure(
+                    self.key, dataset, f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        return (
+            raw_bytes,
+            {
+                "endpoint": str(response.url),
+                "content_type": response.headers.get("content-type", ""),
+                "byte_length": len(raw_bytes),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            },
+            None,
+        )
+
     def fetch(self, dataset: str, **kwargs: Any) -> ProviderResult:
         method = getattr(self, dataset, None)
         if method is None or dataset.startswith("_"):
@@ -1644,6 +1677,11 @@ class TreasuryRatesProvider(HTTPProvider):
         "TC_20YEAR": "TIPS-20Y",
         "TC_30YEAR": "TIPS-30Y",
     }
+    CURVE_TITLES = {
+        "daily_treasury_yield_curve": "DailyTreasuryYieldCurveRateData",
+        "daily_treasury_real_yield_curve": "DailyTreasuryRealYieldCurveRateData",
+    }
+    FOUR_MONTH_CMT_START = date(2022, 10, 19)
     XML_NS = {
         "atom": "http://www.w3.org/2005/Atom",
         "data": "http://schemas.microsoft.com/ado/2007/08/dataservices",
@@ -1909,111 +1947,226 @@ class TreasuryRatesProvider(HTTPProvider):
             },
         )
 
-    def _curve(self, *, curve: str, fields: Mapping[str, str], year: int) -> ProviderResult:
-        dataset = f"{curve}:{year}"
-        payload, failure = self._get_text(
-            dataset,
-            "/resource-center/data-chart-center/interest-rates/pages/xml",
-            params={"data": curve, "field_tdr_date_value": str(year)},
-        )
-        if failure:
-            return failure
-        try:
-            root = ElementTree.fromstring(payload or "")
-        except ElementTree.ParseError as exc:
-            return ProviderResult.failure(self.key, dataset, f"ParseError: {exc}")
+    @classmethod
+    def parse_curve_xml_bytes(
+        cls,
+        raw_bytes: bytes,
+        *,
+        curve: str,
+        fields: Mapping[str, str],
+        year: int,
+        fetched_at: datetime,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Replay one exact annual Treasury Atom feed into normalized rows."""
 
-        records = []
-        seen: dict[tuple[str, str], Decimal] = {}
-        today = datetime.now(UTC).date()
-        for entry in root.findall("atom:entry", self.XML_NS):
-            properties = entry.find("atom:content/meta:properties", self.XML_NS)
+        if curve not in cls.CURVE_TITLES or not raw_bytes:
+            raise ValueError("Treasury curve identity or raw XML bytes are invalid")
+        if fetched_at.tzinfo is None:
+            fetched_at = fetched_at.replace(tzinfo=UTC)
+        wall_now = datetime.now(UTC)
+        if year < 1990 or year > min(fetched_at.astimezone(UTC).year, wall_now.year):
+            raise ValueError("Treasury curve year is outside the supported historical range")
+        try:
+            root = ElementTree.fromstring(raw_bytes)
+        except ElementTree.ParseError as exc:
+            raise ValueError(f"Treasury curve XML parse failed: {exc}") from exc
+        atom_namespace = cls.XML_NS["atom"]
+        if root.tag != f"{{{atom_namespace}}}feed":
+            raise ValueError("Treasury curve XML root is not the expected Atom feed")
+        title = (
+            root.findtext("atom:title", default="", namespaces=cls.XML_NS) or ""
+        ).strip()
+        if title != cls.CURVE_TITLES[curve]:
+            raise ValueError("Treasury curve feed title does not match the dataset")
+        feed_id = (
+            root.findtext("atom:id", default="", namespaces=cls.XML_NS) or ""
+        ).strip()
+        expected_feed_identity = f"https://home.treasury.gov/xml-item?data={curve}"
+        if feed_id != expected_feed_identity:
+            raise ValueError("Treasury curve feed id does not match the dataset")
+        raw_updated = (
+            root.findtext("atom:updated", default="", namespaces=cls.XML_NS) or ""
+        ).strip()
+        feed_updated = cls._treasury_timestamp(raw_updated)
+        if (
+            feed_updated is None
+            or feed_updated > fetched_at.astimezone(UTC) + timedelta(minutes=5)
+            or feed_updated > wall_now + timedelta(minutes=5)
+        ):
+            raise ValueError("Treasury curve feed updated time is invalid or future")
+
+        entries = root.findall("atom:entry", cls.XML_NS)
+        if not entries:
+            raise ValueError("Treasury curve feed contains no entries")
+        metadata_type = f"{{{cls.XML_NS['meta']}}}type"
+        metadata_null = f"{{{cls.XML_NS['meta']}}}null"
+        records: list[dict[str, Any]] = []
+        seen_dates: set[date] = set()
+        series_by_date: dict[date, set[str]] = {}
+        series_coverage: set[str] = set()
+        for entry in entries:
+            content = entry.find("atom:content", cls.XML_NS)
+            if content is None or content.attrib.get("type") != "application/xml":
+                raise ValueError("Treasury curve entry content type drifted")
+            properties = content.find("meta:properties", cls.XML_NS)
             if properties is None:
-                continue
-            values = {child.tag.rsplit("}", 1)[-1]: child.text for child in properties}
-            value_date = (values.get("NEW_DATE") or "")[:10]
-            if not value_date:
-                continue
+                raise ValueError("Treasury curve entry lacks properties")
+            elements: dict[str, ElementTree.Element] = {}
+            for child in properties:
+                local_name = child.tag.rsplit("}", 1)[-1]
+                if local_name in elements:
+                    raise ValueError(
+                        "Treasury curve entry contains duplicate field "
+                        f"{local_name}"
+                    )
+                elements[local_name] = child
+            date_element = elements.get("NEW_DATE")
+            raw_date = str(date_element.text if date_element is not None else "")[:10]
+            if (
+                date_element is None
+                or date_element.attrib.get(metadata_type) != "Edm.DateTime"
+            ):
+                raise ValueError("Treasury curve NEW_DATE type drifted")
             try:
-                parsed_date = date.fromisoformat(value_date)
-            except ValueError:
-                return ProviderResult.failure(
-                    self.key, dataset, f"invalid Treasury observation date: {value_date}"
+                value_date = date.fromisoformat(raw_date)
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid Treasury observation date: {raw_date}"
+                ) from exc
+            if value_date in seen_dates:
+                raise ValueError(
+                    f"duplicate Treasury curve entry for {value_date.isoformat()}"
                 )
-            if parsed_date.year != year:
-                return ProviderResult.failure(
-                    self.key,
-                    dataset,
-                    f"Treasury response year {parsed_date.year} does not match requested year {year}",
+            if value_date.year != year:
+                raise ValueError(
+                    f"Treasury response year {value_date.year} does not match requested year {year}"
                 )
-            if parsed_date > today:
-                return ProviderResult.failure(
-                    self.key, dataset, f"Treasury response contains future date {value_date}"
+            if value_date > fetched_at.astimezone(UTC).date() or value_date > wall_now.date():
+                raise ValueError(
+                    f"Treasury response contains future date {value_date.isoformat()}"
                 )
+            seen_dates.add(value_date)
+            series_by_date[value_date] = set()
             for field_name, series_id in fields.items():
-                value = _decimal_or_none(values.get(field_name))
-                if value is None:
+                element = elements.get(field_name)
+                if element is None:
                     continue
-                identity = (value_date, series_id)
-                if identity in seen:
-                    if seen[identity] != value:
-                        return ProviderResult.failure(
-                            self.key,
-                            dataset,
-                            f"conflicting duplicate Treasury value for {series_id} on {value_date}",
-                        )
+                is_null = str(element.attrib.get(metadata_null) or "").lower() == "true"
+                if element.attrib.get(metadata_type) != "Edm.Double":
+                    raise ValueError(
+                        f"Treasury curve field type drifted for {field_name}"
+                    )
+                if is_null or element.text in {None, ""}:
                     continue
-                seen[identity] = value
+                value = _decimal_or_none(element.text)
+                if value is None or not value.is_finite():
+                    raise ValueError(
+                        f"Treasury curve contains a non-finite value for {field_name}"
+                    )
+                series_by_date[value_date].add(series_id)
+                series_coverage.add(series_id)
                 records.append(
                     {
                         "series_id": series_id,
-                        "date": value_date,
+                        "date": value_date.isoformat(),
                         "value": value,
                         "metadata": {
                             "treasury_field": field_name,
                             "curve": curve,
                             "requested_year": year,
-                            "dataset": dataset,
+                            "dataset": f"{curve}:{year}",
                         },
                     }
                 )
-        latest_date = max((item[0] for item in seen), default=None)
-        latest_series = {
-            series_id
-            for value_date, series_id in seen
-            if value_date == latest_date
+            if not series_by_date[value_date]:
+                raise ValueError(
+                    f"Treasury curve entry has no usable values on {value_date.isoformat()}"
+                )
+        latest_date = max(seen_dates)
+        missing_latest = sorted(series_coverage - series_by_date[latest_date])
+        if missing_latest:
+            raise ValueError(
+                "Treasury curve latest date is missing previously published series: "
+                + ", ".join(missing_latest)
+            )
+        if year >= 2021:
+            minimum_series = (
+                set(cls.REAL_FIELDS.values())
+                if curve == "daily_treasury_real_yield_curve"
+                else set(cls.NOMINAL_FIELDS.values()) - {"UST-4M"}
+            )
+            if (
+                curve == "daily_treasury_yield_curve"
+                and latest_date >= cls.FOUR_MONTH_CMT_START
+            ):
+                minimum_series.add("UST-4M")
+            if not minimum_series <= series_coverage:
+                raise ValueError(
+                    "Treasury curve annual series coverage is incomplete"
+                )
+        records.sort(key=lambda item: (str(item["date"]), str(item["series_id"])))
+        return records, {
+            "curve": curve,
+            "requested_year": year,
+            "feed_title": title,
+            "feed_id": feed_id,
+            "feed_updated_time": feed_updated.isoformat(),
+            "entry_count": len(entries),
+            "record_count": len(records),
+            "series_coverage": sorted(series_coverage),
+            "latest_value_date": latest_date.isoformat(),
+            "missing_latest_series": [],
         }
-        required_latest = set(fields.values())
-        missing_latest = sorted(required_latest - latest_series)
-        if not records:
+
+    def _curve(self, *, curve: str, fields: Mapping[str, str], year: int) -> ProviderResult:
+        dataset = f"{curve}:{year}"
+        current_year = datetime.now(UTC).year
+        if year < 1990 or year > current_year:
             return ProviderResult.failure(
                 self.key,
                 dataset,
-                "Treasury response contains no usable curve observations",
+                "Treasury curve year is outside the supported historical range",
             )
-        content = (payload or "").encode()
-        source_url = (
-            f"{self.base_url}/resource-center/data-chart-center/interest-rates/pages/xml"
-            f"?data={curve}&field_tdr_date_value={year}"
+        raw_bytes, response_metadata, failure = self._get_bytes(
+            dataset,
+            "/resource-center/data-chart-center/interest-rates/pages/xml",
+            params={"data": curve, "field_tdr_date_value": str(year)},
+            headers={"Accept": "application/atom+xml, application/xml, text/xml"},
         )
+        if failure:
+            return failure
+        content_type = str(response_metadata.get("content_type") or "").lower()
+        if not content_type.startswith(("application/xml", "application/atom+xml", "text/xml")):
+            return ProviderResult.failure(
+                self.key, dataset, "Treasury curve response is not XML"
+            )
+        fetched_at = datetime.now(UTC)
+        try:
+            records, evidence = self.parse_curve_xml_bytes(
+                bytes(raw_bytes or b""),
+                curve=curve,
+                fields=fields,
+                year=year,
+                fetched_at=fetched_at,
+            )
+        except ValueError as exc:
+            return ProviderResult.failure(self.key, dataset, str(exc))
+        artifact = {
+            "url": response_metadata["endpoint"],
+            "sha256": response_metadata["sha256"],
+            "size": response_metadata["byte_length"],
+            "content_type": response_metadata["content_type"],
+        }
         return ProviderResult(
             provider=self.key,
             dataset=dataset,
             records=records,
+            fetched_at=fetched_at,
+            raw_bytes=raw_bytes,
             metadata={
-                "curve": curve,
-                "requested_year": year,
-                "latest_value_date": latest_date,
-                "series_coverage": sorted({item[1] for item in seen}),
-                "missing_latest_series": missing_latest,
-                "artifacts": [
-                    {
-                        "url": source_url,
-                        "sha256": hashlib.sha256(content).hexdigest(),
-                        "size": len(content),
-                        "content_type": "application/atom+xml",
-                    }
-                ],
+                **response_metadata,
+                **evidence,
+                "artifacts": [artifact],
             },
         )
 

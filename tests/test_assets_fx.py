@@ -607,6 +607,14 @@ def test_route_renders_cells_and_overview_cannot_use_raw_dxy(
     assert "market-data" not in content
     assert "Broad Dollar=2026" in content
     assert "h10-broad-dollar=" not in content
+    assert [metric["change_display"] for metric in response.context["metrics"]] == [
+        "+0.01",
+        "+0.01",
+        "+0.01",
+        "+0.01",
+    ]
+    assert content.count("+0.01") >= 4
+    assert "0.008476012883539583" not in content
     assert response.context["selected_period"] == "3y"
     assert response.context["selected_tab"] == "major-fx"
     assert len(response.context["charts"]) == 1
@@ -640,6 +648,12 @@ def test_route_renders_cells_and_overview_cannot_use_raw_dxy(
     assert len(broad_keys - {"date"}) == 1
 
     persisted = DashboardSnapshot.objects.get(pk=snapshot.pk)
+    assert all(
+        "change_display" not in metric for metric in persisted.data["metrics"]
+    )
+    assert [metric["change"] for metric in persisted.data["metrics"]] == [
+        metric["change"] for metric in snapshot.data["metrics"]
+    ]
     persisted_charts = {item["key"]: item for item in persisted.data["charts"]}
     assert "lineage" in persisted_charts["fx-broad-dollar-history"]["data"][0]
     assert (

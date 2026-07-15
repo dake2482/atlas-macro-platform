@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import calendar
 import csv
+import hashlib
 import io
 import zipfile
 from collections.abc import Iterable, Mapping
@@ -71,6 +72,38 @@ class BinaryHTTPProvider(HTTPProvider):
             return response.content, None
         except httpx.HTTPError as exc:
             return None, ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
+
+    def _get_bytes_with_evidence(
+        self,
+        dataset: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> tuple[bytes | None, dict[str, Any], ProviderResult | None]:
+        """Fetch binary input while binding parsing to the exact response bytes."""
+
+        try:
+            response = self.client.get(path, params=params)
+            response.raise_for_status()
+            payload = bytes(response.content)
+        except httpx.HTTPError as exc:
+            return (
+                None,
+                {},
+                ProviderResult.failure(
+                    self.key, dataset, f"{type(exc).__name__}: {exc}"
+                ),
+            )
+        return (
+            payload,
+            {
+                "endpoint": str(response.url),
+                "content_type": response.headers.get("content-type", ""),
+                "byte_length": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            },
+            None,
+        )
 
 
 class ChicagoFedNFCIProvider(HTTPProvider):
@@ -197,6 +230,8 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
         ),
     }
     MAX_XML_SIZE = 50_000_000
+    MAX_ARCHIVE_SIZE = 75_000_000
+    MAX_COMPRESSION_RATIO = 250
 
     @staticmethod
     def _short_description(series: ElementTree.Element) -> str:
@@ -221,7 +256,7 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
         if not requested:
             return ProviderResult.failure(self.key, dataset, "series_ids cannot be empty")
 
-        payload, failure = self._get_bytes(
+        payload, response_evidence, failure = self._get_bytes_with_evidence(
             dataset,
             self.DATA_PATH,
             params={"rel": "SLOOS", "filetype": "zip"},
@@ -230,13 +265,82 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
             return failure
 
         try:
-            with zipfile.ZipFile(io.BytesIO(payload or b"")) as archive:
-                member = archive.getinfo("SLOOS_data.xml")
-                if member.file_size > self.MAX_XML_SIZE:
-                    raise ValueError("SLOOS XML exceeds safe size limit")
-                root = ElementTree.fromstring(archive.read(member))
+            records, archive_evidence = self.parse_archive_bytes(
+                payload or b"", series_ids=requested
+            )
         except (zipfile.BadZipFile, KeyError, ValueError, ElementTree.ParseError) as exc:
             return ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
+
+        missing = sorted(requested - set(archive_evidence["found_series"]))
+        if not records:
+            detail = f"; missing series: {', '.join(missing)}" if missing else ""
+            return ProviderResult.failure(self.key, dataset, f"no SLOOS observations found{detail}")
+        metadata = {
+            "frequency": "quarterly",
+            "date_convention": "survey quarter end",
+            "prepared_at": archive_evidence["prepared_at"],
+            "file_prepared_at": archive_evidence["file_prepared_at"],
+            "requested_series": sorted(requested),
+            "found_series": archive_evidence["found_series"],
+            "missing_series": missing,
+            "source_page": self.SOURCE_PAGE,
+            "download_url": f"{self.base_url}{self.DATA_PATH}?rel=SLOOS&filetype=zip",
+            "terms_url": FEDERAL_RESERVE_BOARD_TERMS_URL,
+            "license_status": "open",
+            "public_display_allowed": True,
+            "license_note": (
+                "Board-produced website information is public domain unless otherwise "
+                "indicated; cite the Board and do not reuse seals or imply endorsement."
+            ),
+            **response_evidence,
+            **archive_evidence,
+        }
+        return ProviderResult(
+            provider=self.key,
+            dataset=dataset,
+            records=records,
+            metadata=metadata,
+            raw_bytes=payload,
+        )
+
+    @classmethod
+    def parse_archive_bytes(
+        cls,
+        payload: bytes,
+        *,
+        series_ids: Iterable[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Replay the exact Board ZIP and return normalized rows plus member evidence."""
+
+        requested = set(cls.DEFAULT_SERIES if series_ids is None else series_ids)
+        if not payload:
+            raise ValueError("SLOOS archive bytes are empty")
+        if len(payload) > cls.MAX_ARCHIVE_SIZE:
+            raise ValueError("SLOOS archive exceeds safe size limit")
+
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            names = archive.namelist()
+            if names.count("SLOOS_data.xml") != 1:
+                raise ValueError("SLOOS archive must contain one exact XML member")
+            member = archive.getinfo("SLOOS_data.xml")
+            if member.filename != "SLOOS_data.xml" or "/" in member.filename:
+                raise ValueError("SLOOS XML member path is invalid")
+            if member.flag_bits & 0x1:
+                raise ValueError("SLOOS XML member must not be encrypted")
+            if member.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+                raise ValueError("SLOOS XML member compression method is not allowed")
+            if member.file_size > cls.MAX_XML_SIZE:
+                raise ValueError("SLOOS XML exceeds safe size limit")
+            if member.file_size and not member.compress_size:
+                raise ValueError("SLOOS XML compressed size is invalid")
+            if (
+                member.compress_size
+                and member.file_size / member.compress_size
+                > cls.MAX_COMPRESSION_RATIO
+            ):
+                raise ValueError("SLOOS XML compression ratio exceeds safe limit")
+            member_bytes = archive.read(member)
+        root = ElementTree.fromstring(member_bytes)
 
         prepared = next(
             (
@@ -248,14 +352,19 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
         )
         records: list[dict[str, Any]] = []
         found_series: set[str] = set()
+        series_occurrences: dict[str, int] = {}
+        observation_keys: set[tuple[str, str]] = set()
         for series in root.iter():
             if _local_name(series.tag) != "Series":
                 continue
             series_id = series.attrib.get("SERIES_NAME", "")
             if series_id not in requested:
                 continue
+            series_occurrences[series_id] = series_occurrences.get(series_id, 0) + 1
+            if series_occurrences[series_id] != 1:
+                raise ValueError(f"duplicate SLOOS series element: {series_id}")
             found_series.add(series_id)
-            description = self._short_description(series)
+            description = cls._short_description(series)
             for observation in series:
                 if _local_name(observation.tag) != "Obs":
                     continue
@@ -263,6 +372,12 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
                 value_date = observation.attrib.get("TIME_PERIOD")
                 if value is None or not value_date:
                     continue
+                observation_key = (series_id, value_date)
+                if observation_key in observation_keys:
+                    raise ValueError(
+                        f"duplicate SLOOS observation: {series_id} {value_date}"
+                    )
+                observation_keys.add(observation_key)
                 records.append(
                     {
                         "series_id": series_id,
@@ -270,10 +385,10 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
                         "value": value,
                         "metadata": {
                             "description": description,
-                            "dashboard_label": self.DEFAULT_SERIES.get(series_id, (series_id, ""))[
+                            "dashboard_label": cls.DEFAULT_SERIES.get(series_id, (series_id, ""))[
                                 0
                             ],
-                            "interpretation": self.DEFAULT_SERIES.get(series_id, ("", ""))[1],
+                            "interpretation": cls.DEFAULT_SERIES.get(series_id, ("", ""))[1],
                             "unit": series.attrib.get("UNIT", "Percentage"),
                             "unit_multiplier": series.attrib.get("UNIT_MULT", "1"),
                             "frequency": "quarterly",
@@ -284,8 +399,8 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
                             "loan_group": series.attrib.get("LOANGROUP"),
                             "loan_type": series.attrib.get("LOANTYPE"),
                             "bank_size": series.attrib.get("BANKSIZE"),
-                            "official_source_url": self.SOURCE_PAGE,
-                            "download_url": f"{self.base_url}{self.DATA_PATH}?rel=SLOOS&filetype=zip",
+                            "official_source_url": cls.SOURCE_PAGE,
+                            "download_url": f"{cls.base_url}{cls.DATA_PATH}?rel=SLOOS&filetype=zip",
                             "terms_url": FEDERAL_RESERVE_BOARD_TERMS_URL,
                             "license_status": "open",
                             "public_display_allowed": True,
@@ -294,32 +409,15 @@ class FederalReserveSLOOSProvider(BinaryHTTPProvider):
                     }
                 )
 
-        missing = sorted(requested - found_series)
-        if not records:
-            detail = f"; missing series: {', '.join(missing)}" if missing else ""
-            return ProviderResult.failure(self.key, dataset, f"no SLOOS observations found{detail}")
-        return ProviderResult(
-            provider=self.key,
-            dataset=dataset,
-            records=records,
-            metadata={
-                "frequency": "quarterly",
-                "date_convention": "survey quarter end",
-                "prepared_at": prepared,
-                "requested_series": sorted(requested),
-                "found_series": sorted(found_series),
-                "missing_series": missing,
-                "source_page": self.SOURCE_PAGE,
-                "download_url": f"{self.base_url}{self.DATA_PATH}?rel=SLOOS&filetype=zip",
-                "terms_url": FEDERAL_RESERVE_BOARD_TERMS_URL,
-                "license_status": "open",
-                "public_display_allowed": True,
-                "license_note": (
-                    "Board-produced website information is public domain unless otherwise "
-                    "indicated; cite the Board and do not reuse seals or imply endorsement."
-                ),
-            },
-        )
+        return records, {
+            "archive_member": "SLOOS_data.xml",
+            "archive_member_name": "SLOOS_data.xml",
+            "archive_member_size": len(member_bytes),
+            "archive_member_sha256": hashlib.sha256(member_bytes).hexdigest(),
+            "prepared_at": prepared,
+            "file_prepared_at": prepared,
+            "found_series": sorted(found_series),
+        }
 
 
 class TreasuryHQMProvider(BinaryHTTPProvider):
@@ -332,6 +430,7 @@ class TreasuryHQMProvider(BinaryHTTPProvider):
         "https://home.treasury.gov/data/treasury-coupon-issues-and-corporate-bond-"
         "yield-curve/corporate-bond-yield-curve"
     )
+    MAX_WORKBOOK_SIZE = 25_000_000
 
     @staticmethod
     def _parse_month(value: Any, datemode: int) -> datetime | None:
@@ -360,66 +459,14 @@ class TreasuryHQMProvider(BinaryHTTPProvider):
 
     def par_yields(self) -> ProviderResult:
         dataset = "monthly-average-par-yields"
-        payload, failure = self._get_bytes(dataset, self.DATA_PATH)
+        payload, response_evidence, failure = self._get_bytes_with_evidence(
+            dataset, self.DATA_PATH
+        )
         if failure:
             return failure
 
         try:
-            workbook = xlrd.open_workbook(file_contents=payload or b"", on_demand=True)
-            sheet = workbook.sheet_by_index(0)
-            date_header_row = next(
-                row
-                for row in range(min(sheet.nrows, 20))
-                if str(sheet.cell_value(row, 0)).strip().lower() == "date"
-            )
-            maturity_row = date_header_row + 1
-            maturities = {
-                column: maturity
-                for column in range(sheet.ncols)
-                if (maturity := self._maturity_years(sheet.cell_value(maturity_row, column)))
-            }
-            if not maturities:
-                raise ValueError("HQM maturity headers not found")
-
-            records: list[dict[str, Any]] = []
-            for row in range(maturity_row + 1, sheet.nrows):
-                parsed_month = self._parse_month(sheet.cell_value(row, 0), workbook.datemode)
-                if parsed_month is None:
-                    continue
-                last_day = calendar.monthrange(parsed_month.year, parsed_month.month)[1]
-                value_date = parsed_month.replace(day=last_day)
-                for column, maturity in maturities.items():
-                    value = _decimal_or_none(sheet.cell_value(row, column))
-                    if value is None:
-                        continue
-                    records.append(
-                        {
-                            "series_id": f"HQM-PAR-{maturity}Y",
-                            "date": value_date.date().isoformat(),
-                            "value": value,
-                            "metadata": {
-                                "description": (
-                                    f"Treasury HQM high-quality corporate-bond {maturity}-year "
-                                    "monthly-average par yield"
-                                ),
-                                "maturity_years": maturity,
-                                "curve": "HQM high-quality corporate bond",
-                                "rate_type": "par yield",
-                                "statistic": "monthly average",
-                                "unit": "percent",
-                                "frequency": "monthly",
-                                "date_convention": "reference month end",
-                                "official_source_url": self.SOURCE_PAGE,
-                                "download_url": f"{self.base_url}{self.DATA_PATH}",
-                                "terms_url": TREASURY_SITE_POLICIES_URL,
-                                "copyright_basis_url": US_GOVERNMENT_WORKS_URL,
-                                "license_status": "open",
-                                "public_display_allowed": True,
-                                "attribution": "U.S. Department of the Treasury",
-                                "not_oas": True,
-                            },
-                        }
-                    )
+            records, workbook_evidence = self.parse_workbook_bytes(payload or b"")
         except (StopIteration, IndexError, ValueError, xlrd.XLRDError) as exc:
             return ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
 
@@ -435,7 +482,7 @@ class TreasuryHQMProvider(BinaryHTTPProvider):
                 "curve": "HQM high-quality corporate bond",
                 "rate_type": "par yield",
                 "statistic": "monthly average",
-                "tenors": sorted(maturities.values()),
+                "tenors": list(workbook_evidence["workbook_validation"]["maturities"]),
                 "source_page": self.SOURCE_PAGE,
                 "download_url": f"{self.base_url}{self.DATA_PATH}",
                 "terms_url": TREASURY_SITE_POLICIES_URL,
@@ -447,5 +494,92 @@ class TreasuryHQMProvider(BinaryHTTPProvider):
                     "17 U.S.C. 105; attribute Treasury, do not imply endorsement, and do not "
                     "present HQM as an OAS or CDS quote."
                 ),
+                **response_evidence,
+                **workbook_evidence,
             },
+            raw_bytes=payload,
         )
+
+    @classmethod
+    def parse_workbook_bytes(
+        cls, payload: bytes
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Replay the exact Treasury XLS and freeze the validated workbook shape."""
+
+        if not payload:
+            raise ValueError("HQM workbook bytes are empty")
+        if len(payload) > cls.MAX_WORKBOOK_SIZE:
+            raise ValueError("HQM workbook exceeds safe size limit")
+        workbook = xlrd.open_workbook(file_contents=payload, on_demand=True)
+        sheet = workbook.sheet_by_index(0)
+        date_header_row = next(
+            row
+            for row in range(min(sheet.nrows, 20))
+            if str(sheet.cell_value(row, 0)).strip().lower() == "date"
+        )
+        maturity_row = date_header_row + 1
+        maturities = {
+            column: maturity
+            for column in range(sheet.ncols)
+            if (maturity := cls._maturity_years(sheet.cell_value(maturity_row, column)))
+        }
+        if not maturities:
+            raise ValueError("HQM maturity headers not found")
+
+        records: list[dict[str, Any]] = []
+        for row in range(maturity_row + 1, sheet.nrows):
+            parsed_month = cls._parse_month(
+                sheet.cell_value(row, 0), workbook.datemode
+            )
+            if parsed_month is None:
+                continue
+            last_day = calendar.monthrange(parsed_month.year, parsed_month.month)[1]
+            value_date = parsed_month.replace(day=last_day)
+            for column, maturity in maturities.items():
+                value = _decimal_or_none(sheet.cell_value(row, column))
+                if value is None:
+                    continue
+                records.append(
+                    {
+                        "series_id": f"HQM-PAR-{maturity}Y",
+                        "date": value_date.date().isoformat(),
+                        "value": value,
+                        "metadata": {
+                            "description": (
+                                "Treasury HQM high-quality corporate-bond "
+                                f"{maturity}-year monthly-average par yield"
+                            ),
+                            "maturity_years": maturity,
+                            "curve": "HQM high-quality corporate bond",
+                            "rate_type": "par yield",
+                            "statistic": "monthly average",
+                            "unit": "percent",
+                            "frequency": "monthly",
+                            "date_convention": "reference month end",
+                            "official_source_url": cls.SOURCE_PAGE,
+                            "download_url": f"{cls.base_url}{cls.DATA_PATH}",
+                            "terms_url": TREASURY_SITE_POLICIES_URL,
+                            "copyright_basis_url": US_GOVERNMENT_WORKS_URL,
+                            "license_status": "open",
+                            "public_display_allowed": True,
+                            "attribution": "U.S. Department of the Treasury",
+                            "not_oas": True,
+                        },
+                    }
+                )
+        sheet_name = str(getattr(sheet, "name", "Sheet 1"))
+        return records, {
+            "file_type": "application/vnd.ms-excel",
+            "workbook_file_type": "xls",
+            "workbook_validation": {
+                "sheet_index": 0,
+                "sheet_name": sheet_name,
+                "date_header_row": date_header_row,
+                "maturity_header_row": maturity_row,
+                "maturities": sorted(maturities.values()),
+                "series_ids": sorted(
+                    {str(record["series_id"]) for record in records}
+                ),
+                "headers_validated": True,
+            },
+        }

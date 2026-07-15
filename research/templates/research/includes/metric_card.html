@@ -8,7 +8,7 @@
   <p class="metric-value">{% if metric.display_value %}{{ metric.display_value }}{% elif metric.value != None %}{{ metric.value }}{% else %}—{% endif %}{% if metric.unit and not metric.display_value %}<small class="ml-1 text-[11px] text-[var(--muted)]">{{ metric.unit }}</small>{% endif %}</p>
   {% if metric.change != None %}
     <p class="metric-delta {% if metric.change > 0 %}positive{% elif metric.change < 0 %}negative{% else %}muted{% endif %}">
-      {% if metric.change > 0 %}+{% endif %}{{ metric.change }}
+      {% if metric.change_display != None %}{{ metric.change_display }}{% else %}{% if metric.change > 0 %}+{% endif %}{{ metric.change }}{% endif %}
       {% if metric.change_unit %}<span>{{ metric.change_unit }}</span>{% endif %}
       <span class="ml-1 text-[var(--faint)]">较前值</span>
     </p>

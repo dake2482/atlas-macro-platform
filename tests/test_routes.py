@@ -10,6 +10,7 @@ from research.context_processors import NAV_GROUPS
 from research.models import (
     CodingAgentProfile,
     Company,
+    DataRequirement,
     FedDocument,
     FundLetter,
     ModelProfile,
@@ -234,6 +235,38 @@ def test_retired_credit_routes_return_gone(client, path):
     response = client.get(path)
     assert response.status_code == 410
     assert "不再提供" in response.content.decode() or "gone" in response.content.decode().lower()
+
+
+@pytest.mark.django_db
+def test_credit_cds_is_a_page_specific_no_number_purchase_boundary(
+    client, seeded_platform
+):
+    DataRequirement.objects.create(
+        key="credit-cds-route-fixture",
+        page_key="credit-cds",
+        metric_name="CDX IG/HY 与单名 CDS",
+        status=DataRequirement.Status.PURCHASE_REQUIRED,
+        vendor="S&P Global / ICE / LSEG",
+        reason="Composite history and public display rights are required.",
+    )
+    response = client.get("/credit/cds/")
+    body = response.content.decode()
+
+    assert response.status_code == 200
+    assert "Composite、成交与代理不是同一口径" in body
+    assert "采购后最低字段合同" in body
+    assert "数据覆盖与采购状态" in body
+    assert "CDX IG/HY 与单名 CDS" in body
+    for forbidden in (
+        "322bp",
+        "KBWB 14D",
+        "银行代理",
+        "主权代理",
+        "HY 保护代理",
+        "Yahoo 代理",
+        "38 / 100",
+    ):
+        assert forbidden not in body
 
 
 @pytest.mark.django_db

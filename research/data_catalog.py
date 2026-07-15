@@ -846,10 +846,42 @@ DATA_REQUIREMENTS = [
             "单一 SEF 成交或新闻报价不等于完整市场序列。"
         ),
         "proxy_description": (
-            "可将公开 SEC SDR/SEF 的稀疏成交与获许可的 HYG、LQD、银行 ETF "
-            "作为代理并披露覆盖缺口，不得冒充 Markit composite。"
+            "SEC SDR/SEF 单笔成交不等于 composite；HYG、LQD、银行 ETF "
+            "或国债变化只能另行命名为方向代理，不得发布为 CDX/CDS 数字。"
         ),
         "priority": 1,
+    },
+    {
+        "key": "credit-trace-pricing",
+        "page_key": "credit",
+        "metric_name": "FINRA TRACE 全量成交、定价与流动性派生",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "FINRA TRACE / licensed fixed-income data distributor",
+        "product": "Bulk history with storage, derived analytics and public-display rights",
+        "reason": "公开查询界面不等于可批量建库、派生计算并向公众再分发。",
+        "proxy_description": "Treasury HQM 只描述高质量企业债 par yield，不替代 TRACE 成交或流动性。",
+        "priority": 2,
+    },
+    {
+        "key": "credit-licensed-market-proxies",
+        "page_key": "credit",
+        "metric_name": "HYG/LQD、银行 ETF 与授权跨资产行情",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "Exchange-authorized / LSEG / FactSet / Bloomberg market data",
+        "product": "Price caching, derived analytics and public website-display rights",
+        "reason": "即使只作方向代理，行情缓存、历史存储和网站派生展示仍需明确授权。",
+        "proxy_description": "未授权前不用 Yahoo/FRED 镜像回退，也不用 ETF 数值冒充 OAS 或 CDS。",
+        "priority": 2,
+    },
+    {
+        "key": "credit-issuance-ratings-defaults",
+        "page_key": "credit",
+        "metric_name": "信用发行、评级变化与违约事件",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "Bloomberg / LSEG / Dealogic / Moody's / S&P / Fitch",
+        "product": "Structured issuance and credit-event history with public-display rights",
+        "reason": "发行、评级与违约页面继续返回 410，直到取得可建库与公开展示的结构化许可。",
+        "priority": 2,
     },
     {
         "key": "crypto-spot-perps",

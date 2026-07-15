@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 import zipfile
-from datetime import UTC, datetime
 from decimal import Decimal
 
 import httpx
@@ -15,8 +14,6 @@ from research.credit_official import (
     TreasuryHQMProvider,
 )
 from research.official_data import publish_official_dashboards
-from research.providers import ProviderResult
-from research.services import record_provider_result, store_series_observations
 
 
 def _client(handler):
@@ -122,6 +119,13 @@ def test_sloos_normalizes_selected_board_series_with_open_licence_metadata():
     assert result.metadata["license_status"] == "open"
     assert result.metadata["public_display_allowed"] is True
     assert result.metadata["missing_series"] == []
+    assert result.raw_bytes == payload
+    assert result.metadata["byte_length"] == len(payload)
+    assert len(result.metadata["sha256"]) == 64
+    assert result.metadata["archive_member_name"] == "SLOOS_data.xml"
+    assert result.metadata["archive_member_size"] > 0
+    assert len(result.metadata["archive_member_sha256"]) == 64
+    assert result.metadata["file_prepared_at"] == "2026-04-30T15:25:34"
 
 
 def test_sloos_rejects_invalid_archive():
@@ -144,6 +148,47 @@ def test_sloos_rejects_an_explicitly_empty_series_selection():
 
     assert not result.ok
     assert result.error == "series_ids cannot be empty"
+
+
+@pytest.mark.parametrize("compression", [zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA])
+def test_sloos_rejects_unapproved_member_compression(compression):
+    target = io.BytesIO()
+    with zipfile.ZipFile(target, "w", compression=compression) as archive:
+        archive.writestr("SLOOS_data.xml", b"<root />")
+
+    result = FederalReserveSLOOSProvider(
+        client=_client(lambda _request: httpx.Response(200, content=target.getvalue()))
+    ).quarterly_series(series_ids=("SUBLPDMBS_XWB_N.Q",))
+
+    assert not result.ok
+    assert "compression method" in result.error
+
+
+def test_sloos_rejects_duplicate_exact_member_names():
+    target = io.BytesIO()
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("SLOOS_data.xml", b"<root />")
+        archive.writestr("SLOOS_data.xml", b"<root />")
+
+    result = FederalReserveSLOOSProvider(
+        client=_client(lambda _request: httpx.Response(200, content=target.getvalue()))
+    ).quarterly_series(series_ids=("SUBLPDMBS_XWB_N.Q",))
+
+    assert not result.ok
+    assert "one exact XML member" in result.error
+
+
+def test_sloos_rejects_excessive_member_compression_ratio():
+    target = io.BytesIO()
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("SLOOS_data.xml", b"0" * 1_000_000)
+
+    result = FederalReserveSLOOSProvider(
+        client=_client(lambda _request: httpx.Response(200, content=target.getvalue()))
+    ).quarterly_series(series_ids=("SUBLPDMBS_XWB_N.Q",))
+
+    assert not result.ok
+    assert "compression ratio" in result.error
 
 
 class _FakeSheet:
@@ -212,50 +257,22 @@ def test_treasury_hqm_normalizes_monthly_par_curve(monkeypatch, hqm_workbook):
     assert result.metadata["license_status"] == "open"
     assert result.metadata["public_display_allowed"] is True
     assert "USCODE-2024-title17-chap1-sec105" in result.metadata["copyright_basis_url"]
+    assert result.raw_bytes == b"official-xls-fixture"
+    assert result.metadata["byte_length"] == len(result.raw_bytes)
+    assert len(result.metadata["sha256"]) == 64
+    assert result.metadata["workbook_file_type"] == "xls"
+    assert result.metadata["workbook_validation"]["headers_validated"] is True
+    assert result.metadata["workbook_validation"]["series_ids"] == [
+        "HQM-PAR-10Y",
+        "HQM-PAR-2Y",
+        "HQM-PAR-30Y",
+        "HQM-PAR-5Y",
+    ]
 
 
 @pytest.mark.django_db
-def test_official_credit_proxies_publish_without_impersonating_oas():
-    fetched_at = datetime(2026, 7, 12, tzinfo=UTC)
-    hqm = ProviderResult(
-        provider="us-treasury-hqm",
-        dataset="hqm-fixture",
-        fetched_at=fetched_at,
-        records=[
-            {"series_id": f"HQM-PAR-{tenor}Y", "date": "2026-06-30", "value": value}
-            for tenor, value in ((2, "4.46"), (5, "4.70"), (10, "5.18"), (30, "5.78"))
-        ],
-    )
-    sloos = ProviderResult(
-        provider="federal-reserve-sloos",
-        dataset="sloos-fixture",
-        fetched_at=fetched_at,
-        records=[
-            {
-                "series_id": series_id,
-                "date": "2026-06-30",
-                "value": value,
-            }
-            for series_id, value in (
-                ("SUBLPDMBS_XWB_N.Q", "1.5"),
-                ("SUBLPDMBD_XWB_N.Q", "6.2"),
-                ("SUBLPDCILS_N.Q", "9.1"),
-                ("SUBLPDCISS_N.Q", "10.4"),
-            )
-        ],
-    )
-    record_provider_result(hqm, persist=store_series_observations)
-    record_provider_result(sloos, persist=store_series_observations)
-
-    dashboards = {item.key: item for item in publish_official_dashboards()}
-
-    assert {"credit", "credit-spreads", "credit-stress"} <= dashboards.keys()
-    assert "不是 OAS" in dashboards["credit-spreads"].summary
-    spread_metrics = {
-        item["key"]: item for item in dashboards["credit-spreads"].data["metrics"]
-    }
-    assert spread_metrics["hqm-par-10y"]["display_value"] == "5.18%"
-    stress_metrics = {
-        item["key"]: item for item in dashboards["credit-stress"].data["metrics"]
-    }
-    assert stress_metrics["sublpdmbs_xwb_n.q"]["source_key"] == "federal-reserve-sloos"
+def test_generic_publisher_cannot_publish_credit_official_pages():
+    assert publish_official_dashboards() == []
+    for key in ("credit", "credit-spreads", "credit-stress"):
+        with pytest.raises(ValueError, match="dedicated publishers"):
+            publish_official_dashboards(keys={key})

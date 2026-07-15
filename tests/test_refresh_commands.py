@@ -8,12 +8,53 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from research.tasks import (
+    refresh_credit_official_sources,
     refresh_h8_sources,
     refresh_h10_sources,
     refresh_h41_sources,
     refresh_official_sources,
     refresh_prates_sources,
 )
+
+
+def test_credit_command_and_task_fail_only_when_no_strict_publication_is_available(
+    monkeypatch,
+):
+    unavailable = {
+        "runs": [
+            {
+                "source": "us-treasury-hqm",
+                "dataset": "monthly-average-par-yields",
+                "status": "success",
+                "row_count": 480,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["credit", "credit-stress"],
+        "credit_refresh_id": "fixture-cycle",
+    }
+    with patch(
+        "research.management.commands.refresh_credit_data.refresh_credit_official_data",
+        return_value=unavailable,
+    ):
+        with pytest.raises(CommandError, match="official credit sources failed"):
+            call_command("refresh_credit_data", stdout=StringIO(), stderr=StringIO())
+
+    monkeypatch.setattr("research.tasks.refresh_credit_official_data", lambda: unavailable)
+    with pytest.raises(RuntimeError, match="Credit Official v1"):
+        refresh_credit_official_sources.run()
+
+    legally_retained = {
+        **unavailable,
+        "runs": [{**unavailable["runs"][0], "status": "failed", "row_count": 0}],
+        "stale_dashboard_keys": [],
+    }
+    with patch(
+        "research.management.commands.refresh_credit_data.refresh_credit_official_data",
+        return_value=legally_retained,
+    ):
+        call_command("refresh_credit_data", stdout=StringIO(), stderr=StringIO())
 
 
 @pytest.mark.parametrize(

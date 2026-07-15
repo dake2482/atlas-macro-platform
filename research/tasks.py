@@ -190,7 +190,14 @@ def refresh_h10_sources() -> dict[str, Any]:
 def refresh_credit_official_sources() -> dict[str, Any]:
     """Refresh Treasury HQM and Federal Reserve SLOOS official proxies."""
 
-    return refresh_credit_official_data()
+    summary = refresh_credit_official_data()
+    stale = summary.get("stale_dashboard_keys", [])
+    if stale:
+        raise RuntimeError(
+            "Credit Official v1 has no new or independently revalidatable retained "
+            "publication for: " + ", ".join(sorted(stale))
+        )
+    return summary
 
 
 @shared_task(

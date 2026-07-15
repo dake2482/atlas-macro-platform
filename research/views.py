@@ -52,6 +52,9 @@ from .models import (
 )
 from .official_data import (
     select_public_assets_fx_snapshot,
+    select_public_credit_snapshot,
+    select_public_credit_spreads_snapshot,
+    select_public_credit_stress_snapshot,
     select_public_fed_balance_sheet_snapshot,
     select_public_global_dollar_snapshot,
     select_public_operations_snapshot,
@@ -251,6 +254,40 @@ def _assets_fx_charts_for_presentation(charts: list[dict]) -> list[dict]:
             for row in raw_chart.get("data", [])
             if isinstance(row, dict) and all(field in row for field in fields)
         ]
+        presented.append(chart)
+    return presented
+
+
+def _credit_charts_for_presentation(charts: list[dict]) -> list[dict]:
+    """Project each audited chart to its declared axis and numeric series only."""
+
+    presented = []
+    for raw_chart in charts:
+        if not isinstance(raw_chart, dict):
+            continue
+        chart = deepcopy(raw_chart)
+        x_key = str(chart.get("x_key") or chart.get("time_axis") or "date")
+        series_keys = [
+            str(key)
+            for key in chart.get("series_keys", [])
+            if isinstance(key, str) and key and key != x_key
+        ]
+        display_x_key = x_key if x_key in {"date", "label", "name"} else "label"
+        projected_rows = []
+        for row in chart.get("data", []):
+            if not isinstance(row, dict) or x_key not in row:
+                continue
+            projected = {display_x_key: row[x_key]}
+            for series_key in series_keys:
+                value = row.get(series_key)
+                if isinstance(value, (int, float, Decimal)) and not isinstance(
+                    value, bool
+                ):
+                    projected[series_key] = value
+            if len(projected) == len(series_keys) + 1:
+                projected_rows.append(projected)
+        chart["data"] = projected_rows
+        chart["presentation_x_key"] = display_x_key
         presented.append(chart)
     return presented
 
@@ -1242,7 +1279,36 @@ def dashboard_page(request, page_key: str):
     snapshot = None
     snapshot_source_keys: set[str] = set()
     blocked_refresh_failure = None
-    if snapshot_key == "supply-chain-demand":
+    if snapshot_key == "credit-cds":
+        # This route is intentionally prose-only until a licensed CDS/CDX
+        # composite product is purchased.  Even a legacy/rogue snapshot is
+        # never eligible for presentation.
+        snapshot = None
+    elif snapshot_key == "credit":
+        snapshot = select_public_credit_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            selected_failure = (snapshot.data or {}).get("refresh_failure")
+            if isinstance(selected_failure, dict):
+                blocked_refresh_failure = selected_failure
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "credit-spreads":
+        snapshot = select_public_credit_spreads_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            selected_failure = (snapshot.data or {}).get("refresh_failure")
+            if isinstance(selected_failure, dict):
+                blocked_refresh_failure = selected_failure
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "credit-stress":
+        snapshot = select_public_credit_stress_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            selected_failure = (snapshot.data or {}).get("refresh_failure")
+            if isinstance(selected_failure, dict):
+                blocked_refresh_failure = selected_failure
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "supply-chain-demand":
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")
             if blocked_refresh_failure is None and isinstance(candidate_failure, dict):
@@ -1372,6 +1438,29 @@ def dashboard_page(request, page_key: str):
     if snapshot:
         snapshot_data = dict(snapshot.data or {})
         metrics = [dict(item) for item in snapshot_data.get("metrics", [])]
+        if snapshot_key == "assets-fx":
+            for item in metrics:
+                change = item.get("change")
+                if isinstance(change, (int, float, Decimal)) and not isinstance(
+                    change, bool
+                ):
+                    item["change_display"] = f"{Decimal(str(change)):+.2f}"
+        elif snapshot_key in {"credit", "credit-spreads", "credit-stress"}:
+            for item in metrics:
+                metadata = item.get("metadata")
+                change = item.get("change")
+                change_unit = (
+                    str(metadata.get("change_unit") or "")
+                    if isinstance(metadata, dict)
+                    else ""
+                )
+                if (
+                    change_unit in {"bp", "pp"}
+                    and isinstance(change, (int, float, Decimal))
+                    and not isinstance(change, bool)
+                ):
+                    item["change_unit"] = change_unit
+                    item["change_display"] = f"{Decimal(str(change)):+.2f}"
         now = timezone.now()
         for item in metrics:
             fresh_until = item.get("fresh_until")
@@ -1427,6 +1516,8 @@ def dashboard_page(request, page_key: str):
             ]
         if snapshot_key == "assets-fx":
             raw_charts = _assets_fx_charts_for_presentation(raw_charts)
+        elif snapshot_key in {"credit", "credit-spreads", "credit-stress"}:
+            raw_charts = _credit_charts_for_presentation(raw_charts)
         charts = []
         allowed_chart_kinds = {
             "line",
@@ -1511,6 +1602,18 @@ def dashboard_page(request, page_key: str):
         config["charts"] = charts
         config["chart_data"] = charts[0].get("data", [])
         config["sections"] = sections
+    elif page_key == "credit-cds":
+        config["metrics"] = []
+        config["chart_data"] = []
+        config["charts"] = []
+        config["sections"] = deepcopy(config.get("sections", []))
+        config["analysis"] = config.get("analysis") or (
+            "未取得具有公开展示和历史存储权的 CDX/CDS composite 产品，"
+            "本页不发布数字、替代指标或 fallback。"
+        )
+        config["source_notes"] = list(config.get("source_notes", []))
+        config["required_notices"] = []
+        config["refresh_failure"] = None
     else:
         static_metrics = config.get("metrics", [])
         requirements = list(DataRequirement.objects.filter(page_key=page_key))

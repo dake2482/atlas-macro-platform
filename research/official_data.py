@@ -32,6 +32,23 @@ from django.utils import timezone
 
 from .calculations import yield_spread
 from .consumer_credit import FederalReserveG19Provider, NYFedHouseholdDebtProvider
+from .credit_contract import (
+    CREDIT_CONTRACT_VERSION,  # noqa: F401 - public strict-contract re-export
+    CREDIT_FORMULA_VERSION,  # noqa: F401 - public strict-contract re-export
+    CREDIT_PUBLICATION_KEYS,
+    _coordinate_credit_dashboard,  # noqa: F401 - test/operations re-export
+    _coordinate_credit_dashboards,  # noqa: F401 - test/operations re-export
+    _coordinate_credit_spreads_dashboard,  # noqa: F401 - test/operations re-export
+    _coordinate_credit_stress_dashboard,  # noqa: F401 - test/operations re-export
+    coordinate_credit_dashboards,
+    credit_snapshot_is_publicly_displayable,  # noqa: F401 - public selector re-export
+    credit_spreads_snapshot_is_publicly_displayable,  # noqa: F401 - public selector re-export
+    credit_stress_snapshot_is_publicly_displayable,  # noqa: F401 - public selector re-export
+    persist_credit_official_result,
+    select_public_credit_snapshot,  # noqa: F401 - view/test re-export
+    select_public_credit_spreads_snapshot,  # noqa: F401 - view/test re-export
+    select_public_credit_stress_snapshot,  # noqa: F401 - view/test re-export
+)
 from .credit_official import FederalReserveSLOOSProvider, TreasuryHQMProvider
 from .fed_h8 import (
     H8_RELEASE_FRESHNESS_DAYS,
@@ -803,6 +820,9 @@ INDEPENDENT_PUBLICATION_KEYS = frozenset(
         "assets-fx",
         "global-dollar",
         "transmission-chain",
+        "credit",
+        "credit-spreads",
+        "credit-stress",
     }
 )
 APPEND_ONLY_PUBLICATION_KEYS = frozenset(
@@ -815,6 +835,9 @@ APPEND_ONLY_PUBLICATION_KEYS = frozenset(
         "assets-fx",
         "global-dollar",
         "transmission-chain",
+        "credit",
+        "credit-spreads",
+        "credit-stress",
     }
 )
 AUCTION_REQUIRED_METRIC_KEYS = frozenset(
@@ -881,7 +904,6 @@ REAL_RATES_REQUIRED_METRIC_KEYS = frozenset(
 H41_PUBLICATION_KEYS = frozenset()
 PRATES_PUBLICATION_KEYS = frozenset()
 H10_PUBLICATION_KEYS = frozenset()
-CREDIT_PUBLICATION_KEYS = frozenset({"credit", "credit-spreads", "credit-stress"})
 CONSUMER_CONTRACT_VERSION = 1
 MACRO_PUBLICATION_GROUPS = {
     "gdp": frozenset({"bea-release"}),
@@ -27557,6 +27579,8 @@ def _publish_dashboard_core(
     snapshot_fresh_until: str | None = None,
     _publish_capability: object | None = None,
 ) -> DashboardSnapshot | None:
+    if key in CREDIT_PUBLICATION_KEYS:
+        raise ValueError(f"{key} must be published by its dedicated Credit Official v1 publisher")
     if (
         key == "assets-fx"
         and _publish_capability is not _ASSETS_FX_CORE_PUBLISH_CAPABILITY
@@ -27929,7 +27953,7 @@ def _publish_dashboard(
 ) -> DashboardSnapshot | None:
     """Publish generic dashboards; independent contracts are never writable here."""
 
-    if key in {"assets-fx", "transmission-chain"}:
+    if key in {"assets-fx", "transmission-chain", *CREDIT_PUBLICATION_KEYS}:
         raise ValueError(f"{key} must be published by its dedicated v1 publisher")
     return _publish_dashboard_core(
         key=key,
@@ -28098,6 +28122,12 @@ def publish_official_dashboards(
     batch_id = uuid.uuid4()
     selected_keys = set(keys) if keys is not None else None
     if selected_keys is not None:
+        forbidden_credit = selected_keys & CREDIT_PUBLICATION_KEYS
+        if forbidden_credit:
+            raise ValueError(
+                "Credit Official v1 keys require dedicated publishers: "
+                + ", ".join(sorted(forbidden_credit))
+            )
         selected_keys -= INDEPENDENT_PUBLICATION_KEYS
         if not selected_keys:
             return []
@@ -28123,7 +28153,6 @@ def publish_official_dashboards(
         latest_census_release_batch = _latest_successful_source_batch("census-release")
         if latest_census_release_batch is not None:
             normalized_source_batches["census-release"] = latest_census_release_batch
-    hqm_curve = _curve_rows("hqm-par", ("2y", "5y", "10y", "30y"))
     consumer_metrics: list[dict[str, Any]] = []
     consumer_charts: list[dict[str, Any]] = []
     employment_metrics: list[dict[str, Any]] = []
@@ -28421,65 +28450,6 @@ def publish_official_dashboards(
             "sections": real_rates_prepared[2],
             "extra_data": real_rates_prepared[3],
             "required_metric_keys": REAL_RATES_REQUIRED_METRIC_KEYS,
-        },
-        {
-            "key": "credit",
-            "title": "信用市场",
-            "summary": "免费版发布 Treasury HQM 高质量企业债收益率与 Fed SLOOS 贷款标准；它们是信用环境代理，不是 ICE OAS 或 CDS。",
-            "metrics": _existing(
-                _metric("HQM-PAR-10Y", "HQM 10Y", suffix="%"),
-                _metric("HQM-PAR-30Y", "HQM 30Y", suffix="%"),
-                _metric("SUBLPDMBS_XWB_N.Q", "企业贷款标准", suffix="%"),
-                _metric("SUBLPDMBD_XWB_N.Q", "企业贷款需求", suffix="%"),
-            ),
-            "chart_data": _history_rows(
-                {
-                    "SUBLPDMBS_XWB_N.Q": "贷款标准",
-                    "SUBLPDMBD_XWB_N.Q": "贷款需求",
-                },
-                limit=24,
-            ),
-        },
-        {
-            "key": "credit-spreads",
-            "title": "信用利差与收益率代理",
-            "summary": "Treasury HQM 是高质量企业债月均 par yield 曲线，不含国债利差、不是 OAS；ICE 分评级 OAS 仍需商业许可。",
-            "metrics": _existing(
-                _metric("HQM-PAR-2Y", "HQM 2Y", suffix="%"),
-                _metric("HQM-PAR-5Y", "HQM 5Y", suffix="%"),
-                _metric("HQM-PAR-10Y", "HQM 10Y", suffix="%"),
-                _metric("HQM-PAR-30Y", "HQM 30Y", suffix="%"),
-            ),
-            "chart_data": [
-                {"label": item["label"], "HQM par yield": item["value"]}
-                for item in hqm_curve
-            ],
-            "sections": [
-                {
-                    "title": "Treasury HQM 月均高质量企业债曲线（代理）",
-                    "rows": hqm_curve,
-                    "fresh_until": _earliest_fresh_until(hqm_curve),
-                    "status": "estimated",
-                }
-            ],
-        },
-        {
-            "key": "credit-stress",
-            "title": "信用压力仪表盘",
-            "summary": "SLOOS 为季度银行调查：正值贷款标准表示净收紧，需求项按 Board 原始口径展示。尚未将其合成为自有压力总分。",
-            "metrics": _existing(
-                _metric("SUBLPDMBS_XWB_N.Q", "企业贷款标准", suffix="%"),
-                _metric("SUBLPDMBD_XWB_N.Q", "企业贷款需求", suffix="%"),
-                _metric("SUBLPDCILS_N.Q", "大中企业 C&I 标准", suffix="%"),
-                _metric("SUBLPDCISS_N.Q", "小企业 C&I 标准", suffix="%"),
-            ),
-            "chart_data": _history_rows(
-                {
-                    "SUBLPDMBS_XWB_N.Q": "贷款标准",
-                    "SUBLPDMBD_XWB_N.Q": "贷款需求",
-                },
-                limit=24,
-            ),
         },
         {
             "key": "reserves",
@@ -29209,8 +29179,9 @@ def refresh_h10_data() -> dict[str, Any]:
 
 
 def refresh_credit_official_data() -> dict[str, Any]:
-    """Refresh public-display-safe official credit proxies once per day."""
+    """Acquire one HQM/SLOOS cycle and coordinate all strict credit pages."""
 
+    credit_refresh_id = str(uuid.uuid4())
     providers = [
         (FederalReserveSLOOSProvider(), "quarterly_series"),
         (TreasuryHQMProvider(), "par_yields"),
@@ -29219,15 +29190,25 @@ def refresh_credit_official_data() -> dict[str, Any]:
     try:
         for provider, method_name in providers:
             result = getattr(provider, method_name)()
-            runs.append(record_provider_result(result, persist=store_series_observations))
+            result.metadata = {
+                **dict(result.metadata or {}),
+                "credit_refresh_id": credit_refresh_id,
+            }
+            run = record_provider_result(
+                result,
+                persist=persist_credit_official_result,
+            )
+            if (run.metadata or {}).get("credit_refresh_id") != credit_refresh_id:
+                run.metadata = {
+                    **dict(run.metadata or {}),
+                    "credit_refresh_id": credit_refresh_id,
+                }
+                run.save(update_fields=["metadata", "updated_at"])
+            runs.append(run)
     finally:
         for provider, _ in providers:
             provider.close()
-    dashboards = (
-        publish_official_dashboards(keys=CREDIT_PUBLICATION_KEYS)
-        if _has_publishable_run(runs)
-        else []
-    )
+    dashboards, stale_dashboard_keys = coordinate_credit_dashboards(runs)
     return {
         "runs": [
             {
@@ -29236,10 +29217,13 @@ def refresh_credit_official_data() -> dict[str, Any]:
                 "status": run.status,
                 "row_count": run.row_count,
                 "error": run.error,
+                "metadata": run.metadata,
             }
             for run in runs
         ],
         "dashboard_keys": [dashboard.key for dashboard in dashboards],
+        "stale_dashboard_keys": sorted(stale_dashboard_keys),
+        "credit_refresh_id": credit_refresh_id,
     }
 
 

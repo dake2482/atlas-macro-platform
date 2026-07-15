@@ -146,6 +146,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "research.tasks.refresh_h10_sources",
         "schedule": crontab(hour=6, minute=40),
     },
+    "refresh-treasury-curves-daily": {
+        "task": "research.tasks.refresh_treasury_curve_sources",
+        "schedule": crontab(hour=7, minute=5),
+    },
     "refresh-credit-official-daily": {
         "task": "research.tasks.refresh_credit_official_sources",
         "schedule": crontab(hour=11, minute=10),

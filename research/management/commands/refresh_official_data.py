@@ -41,6 +41,11 @@ class Command(BaseCommand):
                 "Official ingestion completed but the required assets-fx v1 "
                 "snapshot is stale or unavailable"
             )
+        if "fx-vol" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but the required fx-vol v1 "
+                "snapshot is stale or unavailable"
+            )
         if "global-dollar" in result.get("stale_dashboard_keys", []):
             raise CommandError(
                 "Official ingestion completed but the required global-dollar v1 "

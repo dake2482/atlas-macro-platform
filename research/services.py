@@ -742,23 +742,53 @@ def record_provider_result(
     *,
     source_key: str | None = None,
     persist: Callable[[ProviderResult, Source, IngestionRun], int] | None = None,
+    run: IngestionRun | None = None,
 ) -> IngestionRun:
-    """Persist a provider outcome and optionally normalize its records atomically."""
+    """Persist a provider outcome and optionally normalize its records atomically.
+
+    A caller may pre-create a RUNNING attempt before slow network I/O.  This is
+    useful for paired sources whose last complete public snapshot must remain
+    selectable while the replacement batch is in flight.
+    """
 
     key = source_key or result.provider
-    run = begin_ingestion(
-        key,
-        result.dataset,
-        metadata={"provider": result.provider, "fetched_at": result.fetched_at.isoformat()},
-    )
+    outcome_metadata = {
+        "provider": result.provider,
+        "fetched_at": result.fetched_at.isoformat(),
+        **dict(result.metadata),
+    }
+    if run is None:
+        run = begin_ingestion(
+            key,
+            result.dataset,
+            metadata={
+                "provider": result.provider,
+                "fetched_at": result.fetched_at.isoformat(),
+            },
+        )
+    else:
+        run = IngestionRun.objects.select_related("source").get(pk=run.pk)
+        if (
+            run.status != IngestionRun.Status.RUNNING
+            or run.source.key != key
+            or run.dataset != result.dataset
+        ):
+            raise ValueError(
+                "pre-created ingestion run does not match the provider result"
+            )
     if result.skipped:
         return finish_ingestion(
             run,
             status=IngestionRun.Status.PARTIAL,
-            metadata={**result.metadata, "skipped": True},
+            metadata={**outcome_metadata, "skipped": True},
         )
     if result.error:
-        return finish_ingestion(run, status=IngestionRun.Status.FAILED, error=result.error)
+        return finish_ingestion(
+            run,
+            status=IngestionRun.Status.FAILED,
+            error=result.error,
+            metadata=outcome_metadata,
+        )
 
     try:
         with transaction.atomic():
@@ -768,6 +798,7 @@ def record_provider_result(
             run,
             status=IngestionRun.Status.FAILED,
             error=f"{type(exc).__name__}: {exc}",
+            metadata={**outcome_metadata, **dict(result.metadata)},
         )
     partial_quality = bool(result.metadata.get("missing_series")) or (
         result.metadata.get("quality_status") == "partial"
@@ -783,7 +814,10 @@ def record_provider_result(
         if (row_count == 0 and not allow_empty_success) or partial_quality
         else IngestionRun.Status.SUCCESS
     )
-    metadata = dict(result.metadata)
+    # Persist callbacks may add publication evidence or a structured partial
+    # reason only after inspecting the locked database state.  Re-read the
+    # result metadata after the callback instead of freezing the pre-call copy.
+    metadata = {**outcome_metadata, **dict(result.metadata)}
     if row_count == 0 and not allow_empty_success:
         metadata.setdefault("quality_reason", "provider returned no persistable rows")
     return finish_ingestion(

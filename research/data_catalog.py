@@ -749,6 +749,54 @@ DATA_REQUIREMENTS = [
         "priority": 3,
     },
     {
+        "key": "fx-vol-h10-realized",
+        "page_key": "fx-vol",
+        "metric_name": "H.10 Broad Dollar 与三条参考汇率 20D/60D 实现波动率",
+        "status": PROXY,
+        "source_name": "Federal Reserve H.10 plus Atlas Macro transparent calculation",
+        "source_url": "https://www.federalreserve.gov/releases/h10/current/",
+        "reason": (
+            "使用可重放 H.10 官方参考 level 的相邻有效观察 log return、"
+            "样本标准差和 sqrt(252) 年化；这是实现波动率，不是期权 IV。"
+        ),
+        "proxy_description": (
+            "页面明确标为 H.10 reference-level realized volatility，"
+            "不替代 ATM IV、risk reversal、butterfly 或可执行外汇报价。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "volatility-treasury-rv-precondition",
+        "page_key": "volatility-dashboard",
+        "metric_name": "Treasury 收益率变动实现波动率严格输入",
+        "status": LIVE,
+        "source_name": "U.S. Treasury nominal par-yield curve",
+        "source_url": "https://home.treasury.gov/resource-center/data-chart-center/interest-rates",
+        "reason": (
+            "Treasury curve v2 已私有保存 exact XML、逐年度 append-only Observation，"
+            "并由 retained selector 从原始文件重放；本项只表示输入合同就绪，"
+            "尚未发布任何 Treasury 波动率数字。"
+        ),
+        "proxy_description": (
+            "未来只能命名为 Treasury yield-change realized volatility，"
+            "不得称为 MOVE、债券价格波动率或隐含波动率。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "volatility-cross-asset-parent",
+        "page_key": "volatility",
+        "metric_name": "跨资产严格波动率父级组合",
+        "status": NEEDS_SOURCE,
+        "source_name": "Atlas Macro strict child snapshots",
+        "source_url": "https://www.federalreserve.gov/releases/h10/current/",
+        "reason": (
+            "至少需要两个异资产子快照可独立重验；当前仅 H.10 FX child 就绪，"
+            "因此不发布综合分、状态或交易信号。"
+        ),
+        "priority": 1,
+    },
+    {
         "key": "vix-history",
         "page_key": "vix",
         "metric_name": "VIX 现货、分位与期限结构",
@@ -767,7 +815,7 @@ DATA_REQUIREMENTS = [
     },
     {
         "key": "move-index",
-        "page_key": "volatility-dashboard",
+        "page_key": "volatility-move",
         "metric_name": "ICE BofA MOVE Index",
         "status": PURCHASE_REQUIRED,
         "vendor": "ICE Data Indices",
@@ -1687,16 +1735,6 @@ DATA_REQUIREMENTS = [
         "vendor": "DTCC / BNY / Bloomberg / LSEG",
         "product": "Licensed repo microstructure and external-display rights",
         "reason": "官方免费数据不覆盖交易商账簿、实时 haircut、specials 与完整市场分层。",
-        "priority": 1,
-    },
-    {
-        "key": "move-page-data",
-        "page_key": "volatility-move",
-        "metric_name": "MOVE 指数历史、分位与期限分量",
-        "status": PURCHASE_REQUIRED,
-        "vendor": "ICE Data Indices",
-        "product": "ICE MOVE delayed/EOD/history with public-display rights",
-        "reason": "MOVE 为 ICE 指数，网页可见或经 FRED 提供均不授予 Atlas 再分发权。",
         "priority": 1,
     },
     {

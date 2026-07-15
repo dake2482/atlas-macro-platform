@@ -31,6 +31,37 @@ def metric(
     }
 
 
+def contract_table(key, title, description, columns, rows):
+    """Build a prose-only table whose rendered cell order is contractual."""
+
+    column_keys = tuple(item[0] for item in columns)
+    rendered_rows = []
+    for values in rows:
+        row = dict(zip(column_keys, values, strict=True))
+        cells = []
+        for column_key in column_keys:
+            value = str(row[column_key])
+            cell = (
+                {"kind": "url", "label": value, "href": value}
+                if value.startswith("/")
+                else {"kind": "text", "value": value}
+            )
+            cells.append({"key": column_key, "cell": cell})
+        row["cells_list"] = cells
+        rendered_rows.append(row)
+    return {
+        "key": key,
+        "title": title,
+        "description": description,
+        "columns": [
+            {"key": column_key, "label": label}
+            for column_key, label in columns
+        ],
+        "rows": rendered_rows,
+        "full_width": True,
+    }
+
+
 COMMON = {
     "source_notes": [
         "页面只发布通过许可与质量检查的官方或授权数据；缺数时显示空缺。",
@@ -73,7 +104,7 @@ PAGE_CONFIGS = {
             "这些数值不是债券或 ETF 价格、久期、信用利差或总回报。"
         ),
         "snapshot_key": "yield-curve",
-        "snapshot_contract_version": 1,
+        "snapshot_contract_version": 2,
         "period_options": [
             {"value": "1y", "label": "1 年", "months": 12},
             {"value": "3y", "label": "3 年", "months": 36},
@@ -162,7 +193,7 @@ PAGE_CONFIGS = {
         "title": "利率",
         "eyebrow": "Rates Command Center",
         "description": "从政策利率、整条收益率曲线、实际利率与拍卖需求判断金融条件。",
-        "snapshot_contract_version": 1,
+        "snapshot_contract_version": 2,
         "period_options": [
             {"value": "1y", "label": "1 年", "months": 12},
             {"value": "3y", "label": "3 年", "months": 36},
@@ -232,7 +263,7 @@ PAGE_CONFIGS = {
         "title": "收益率曲线",
         "eyebrow": "Treasury Curve",
         "description": "比较当前、1 周、1 月与 3 月前曲线，并拆分名义、实际和盈亏平衡通胀。",
-        "snapshot_contract_version": 1,
+        "snapshot_contract_version": 2,
         "period_options": [
             {"value": "1y", "label": "1 年", "months": 12},
             {"value": "3y", "label": "3 年", "months": 36},
@@ -270,7 +301,7 @@ PAGE_CONFIGS = {
         "title": "实际利率",
         "eyebrow": "TIPS & Inflation",
         "description": "名义收益率拆分为实际利率与盈亏平衡通胀。",
-        "snapshot_contract_version": 1,
+        "snapshot_contract_version": 2,
         "period_options": [
             {"value": "1y", "label": "1 年", "months": 12},
             {"value": "3y", "label": "3 年", "months": 36},
@@ -722,40 +753,103 @@ PAGE_CONFIGS = {
         "analysis": "消费仍有韧性但缓冲下降，低收入家庭的信用压力是领先风险。",
     },
     "volatility": {
-        "title": "波动率",
-        "eyebrow": "Volatility Regime",
-        "description": "权益、利率、外汇、商品与信用波动率的跨资产状态。",
-        "metrics": [
-            metric("VIX", "15.8", "-0.7pt", source="Cboe / FRED fallback"),
-            metric("MOVE", "96", "+2"),
-            metric("VIX9D", "14.9", "contango"),
-            metric("VXTLT", "17.4", "+0.8"),
+        "title": "波动率数据覆盖",
+        "eyebrow": "Audited Coverage Ledger",
+        "description": "区分可复算的实现波动率、已就绪但尚未启用的严格输入，以及必须采购的专有隐含波动率。",
+        "metrics": [],
+        "prose_only_contract": True,
+        "suppress_empty_chart": True,
+        "analysis": "在至少两个异资产严格子快照可独立重验前，不发布跨资产风险分、状态判断或交易信号。",
+        "sections": [
+            contract_table(
+                "volatility-coverage-ledger",
+                "当前数据覆盖",
+                "CONTRACT_READY 表示严格合同已实现；是否有当前可发布快照由 FX 子页的 selector 独立判断。",
+                (
+                    ("component", "组件"),
+                    ("status", "状态"),
+                    ("public-output", "公开输出"),
+                    ("next-action", "下一步"),
+                ),
+                (
+                    ("H.10 FX realized volatility", "CONTRACT_READY", "/volatility/fx-vol/", "子页只在严格 selector 通过时发布 20D/60D 数字"),
+                    ("Treasury yield-change realized volatility", "INPUT_READY", "—", "另立 requirement 定义 Atlas realized yield-vol 公式与发布合同"),
+                    ("Cboe VIX family / CFE VX", "PURCHASE_REQUIRED", "—", "采购历史存储与网站展示权"),
+                    ("ICE MOVE", "PURCHASE_REQUIRED", "—", "采购 ICE Data Indices 展示权"),
+                    ("FX / cross-asset implied volatility", "PURCHASE_REQUIRED", "—", "采购期权面与标的同批次数据"),
+                ),
+            )
         ],
-        "analysis": "权益波动率偏低而利率波动率仍高，风险被压在资产负债表与期限溢价层。",
     },
     "volatility-dashboard": {
-        "title": "波动率全景",
-        "eyebrow": "30-Index Vol Map",
-        "description": "按风险来源聚合 30 个波动率指数，并生成 Vol Trade Map。",
-        "metrics": [
-            metric("升温指标", "11 / 30", "+3"),
-            metric("降温指标", "14 / 30", "-2"),
-            metric("权益风险", "低", "VIX 15.8"),
-            metric("利率风险", "中高", "MOVE 96"),
+        "title": "波动率全景前置合同",
+        "eyebrow": "Cross-Asset Preconditions",
+        "description": "跨资产全景只有在各子组件使用严格、可重放且许可一致的数据合同后才发布。",
+        "metrics": [],
+        "prose_only_contract": True,
+        "suppress_empty_chart": True,
+        "analysis": "不恢复 30 指标热力图、升温/降温计数或高低风险判断；当前只公开数据可用性。",
+        "sections": [
+            contract_table(
+                "volatility-dashboard-preconditions",
+                "跨资产发布前置条件",
+                "任一输入缺失时页面保持无数字，不以 ETF、新闻或终端可见值补齐。",
+                (
+                    ("layer", "层"),
+                    ("required-contract", "必需合同"),
+                    ("current-state", "当前状态"),
+                    ("failure-policy", "失败策略"),
+                ),
+                (
+                    ("FX realized volatility", "H.10 ZIP exact replay", "CONTRACT_READY", "子页 selector 独立判断是否有可发布快照"),
+                    ("Rates realized volatility", "Treasury XML replay + append-only annual batches", "INPUT_READY", "另立公式与 selector 前不发布数字或 MOVE 代理"),
+                    ("Equity implied volatility", "Cboe index and CFE display licence", "PURCHASE_REQUIRED", "零指标、零图表"),
+                    ("Cross-asset parent", "At least two independently valid children", "NOT_READY", "不生成分数或状态"),
+                ),
+            )
         ],
-        "analysis": "最需要对冲的是利率波动而非现货股指；跨资产分化仍显著。",
     },
     "vix": {
-        "title": "VIX",
-        "eyebrow": "Equity Volatility",
-        "description": "现货水平、期限结构、分位数与实现波动率对照。",
-        "metrics": [
-            metric("VIX", "15.8", "-0.7pt"),
-            metric("1Y 分位", "34%", "正常偏低"),
-            metric("1M−Spot", "+1.6pt", "contango"),
-            metric("SPX 20D RV", "12.4%", "IV 溢价 3.4pt"),
+        "title": "VIX 数据采购合同",
+        "eyebrow": "Cboe / CFE Licence Boundary",
+        "description": "VIX family 指数、VX 期货期限结构与 SPX/SPY 实现波动率是不同口径。",
+        "metrics": [],
+        "prose_only_contract": True,
+        "suppress_empty_chart": True,
+        "analysis": "取得覆盖历史存储、网站展示和派生展示的 Cboe/CFE 许可前，本页不发布任何数值或替代指标。",
+        "sections": [
+            contract_table(
+                "vix-data-boundary",
+                "不可替代的数据口径",
+                "公开网页可见值或 SPY 实现波动率不能替代授权 VIX/VX 数据。",
+                (
+                    ("dataset", "数据集"),
+                    ("what-it-is", "含义"),
+                    ("why-not-substitute", "为何不可替代"),
+                    ("required-licence", "所需许可"),
+                ),
+                (
+                    ("VIX family index close", "Cboe methodology indices", "不是单只 ETF 或普通期权链字段", "Cboe Global Indices Feed public display + history"),
+                    ("CFE VX futures term structure", "逐到期月 futures settlement/close", "不能由 VIX spot 外推", "CFE market data storage + website display"),
+                    ("SPX/SPY realized volatility", "标的历史收益率标准差", "是 realized vol，不是 option-implied VIX", "授权 underlying bars + derived display"),
+                ),
+            ),
+            contract_table(
+                "vix-post-purchase-fields",
+                "采购后最低字段合同",
+                "字段不足或许可不完整时仍不进入公开 snapshot。",
+                (("field", "字段"), ("requirement", "要求"), ("reason", "原因")),
+                (
+                    ("family / symbol", "VIX/VIX9D/VIX3M/VXTLT 或 VX contract", "防止指数族混淆"),
+                    ("value timestamp", "带时区的 observation/settlement time", "区分盘中、收盘与结算"),
+                    ("close / settlement", "保留 vendor 原始字段语义", "不能把 settlement 冒充 close"),
+                    ("expiry", "VX 合约必须有到期日", "构建期限结构"),
+                    ("unit / method version", "指数单位和方法版本", "支持历史方法变更"),
+                    ("source licence", "存储、网站与派生展示范围", "控制公开发布"),
+                    ("batch / quality / fallback", "逐点血缘与失败状态", "支持重验与 stale 管理"),
+                ),
+            ),
         ],
-        "analysis": "期限结构健康但保护价格偏低，事件前短端波动率存在补涨空间。",
     },
     "credit": {
         "title": "美国信用市场",
@@ -794,11 +888,45 @@ PAGE_CONFIGS = {
         "eyebrow": "No Numeric CDS Proxy",
         "description": "未取得 composite 历史、存储与公开展示权前，不发布任何 CDX/CDS 数字或伪代理。",
         "metrics": [],
+        "prose_only_contract": True,
+        "suppress_empty_chart": True,
         "sections": [
             {
                 "key": "cds-market-data-boundary",
                 "title": "Composite、成交与代理不是同一口径",
                 "body": "S&P Global/Markit 等 composite 估值不等于单笔 SEF/SDR 成交。ETF、银行股或国债变化只能另行命名为方向代理，不能标为 CDX/CDS。",
+                "columns": [
+                    {"key": "quote-type", "label": "报价类型"},
+                    {"key": "what-it-is", "label": "它是什么"},
+                    {"key": "why-not-substitute", "label": "为何不能互相替代"},
+                    {"key": "required-licence", "label": "所需许可"},
+                ],
+                "rows": [
+                    {
+                        "cells_list": [
+                            {"key": "quote-type", "cell": {"kind": "text", "value": "Composite / index quote"}},
+                            {"key": "what-it-is", "cell": {"kind": "text", "value": "多贡献商或模型合成的指数、单名估值与期限曲线"}},
+                            {"key": "why-not-substitute", "cell": {"kind": "text", "value": "不是单笔成交，也不能由 ETF、银行股或国债变动反推"}},
+                            {"key": "required-licence", "cell": {"kind": "text", "value": "须明确授予历史存储、公开或 derived display 权"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "quote-type", "cell": {"kind": "text", "value": "SEF / SDR transaction"}},
+                            {"key": "what-it-is", "cell": {"kind": "text", "value": "带成交时间与申报字段的单笔交易记录"}},
+                            {"key": "why-not-substitute", "cell": {"kind": "text", "value": "单笔成交不能代表连续 composite 中间价或完整横截面"}},
+                            {"key": "required-licence", "cell": {"kind": "text", "value": "只能按申报源条款展示，并明确标为成交而非 composite"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "quote-type", "cell": {"kind": "text", "value": "Directional proxy"}},
+                            {"key": "what-it-is", "cell": {"kind": "text", "value": "ETF、股票、国债或其他市场变量的方向信号"}},
+                            {"key": "why-not-substitute", "cell": {"kind": "text", "value": "可另页命名为代理，但语义上不是 CDX/CDS 报价"}},
+                            {"key": "required-licence", "cell": {"kind": "text", "value": "遵守各代理源许可；任何许可都不能改变其指标名称"}},
+                        ]
+                    },
+                ],
             },
             {
                 "key": "cds-purchase-candidates",
@@ -809,6 +937,69 @@ PAGE_CONFIGS = {
                 "key": "cds-post-purchase-fields",
                 "title": "采购后最低字段合同",
                 "body": "reference entity/index、series/version、tenor、currency、restructuring clause、bid/mid/ask、timestamp、contributor/composite method、source licence、value date、fetch time、batch、quality、fallback。",
+                "columns": [
+                    {"key": "field", "label": "字段"},
+                    {"key": "requirement", "label": "最低要求"},
+                    {"key": "reason", "label": "原因"},
+                ],
+                "rows": [
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "reference entity / index"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "稳定标识、正式名称与 index family"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "防止指数与单名、不同家族之间误配"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "series / version"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "指数系列、版本与生效区间"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "滚动换券后仍能还原当时合约"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "tenor / currency / restructuring clause"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "期限、币种与重组条款不可缺省"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "这些条款直接决定报价是否可比较"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "bid / mid / ask"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "保存原始三边报价及缺失状态"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "不得把估算中间价伪装为可交易报价"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "timestamp / value date"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "带时区的观测时间与明确 value date"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "区分盘中报价、日终估值与数据修订"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "contributor / composite method"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "贡献商范围、合成方法与方法版本"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "支持跨供应商比较与方法变更审计"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "source licence"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "保存产品、账户、地域与展示范围"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "页面发布必须能证明公开展示权"}},
+                        ]
+                    },
+                    {
+                        "cells_list": [
+                            {"key": "field", "cell": {"kind": "text", "value": "fetch / batch / quality / fallback"}},
+                            {"key": "requirement", "cell": {"kind": "text", "value": "抓取时间、批次、质量状态与 fallback 明示"}},
+                            {"key": "reason", "cell": {"kind": "text", "value": "保证每个发布值可追溯且失败状态不被掩盖"}},
+                        ]
+                    },
+                ],
             },
         ],
         "analysis": "当前页面只解释采购原因、口径边界和上线后的字段契约，不提供交易或对冲报价。",
@@ -855,59 +1046,109 @@ PAGE_CONFIGS = {
         "source_notes": ["仅在当日必需数据完整且研判通过审核后发布。"],
     },
     "volatility-move": {
-        "title": "MOVE 指数",
-        "eyebrow": "Treasury Volatility",
-        "description": "跟踪美债期权隐含波动率、曲线波动分解与历史分位。",
+        "title": "MOVE 数据采购合同",
+        "eyebrow": "ICE Index Licence Boundary",
+        "description": "ICE MOVE 是美债期权隐含波动率指数；财政部收益率变化实现波动率不是 MOVE。",
         "metrics": [],
-        "chart_data": [],
+        "prose_only_contract": True,
+        "suppress_empty_chart": True,
         "analysis": "MOVE 是授权指数；在取得可公开展示的许可之前，不生成或填充代理数值。",
         "sections": [
-            {
-                "title": "数据缺口",
-                "body": "需要 ICE MOVE 延迟或收盘数据的展示与再分发许可，以及可选的期限分量。",
-            },
-            {
-                "title": "目标字段",
-                "body": "value_date、move_close、move_change_1d、move_change_5d、percentile_1y、percentile_10y、term_components、source_id、fetched_at、license_scope、quality_status。",
-            },
+            contract_table(
+                "move-data-boundary",
+                "MOVE 与可计算代理的边界",
+                "即使未来发布 Treasury yield-change RV，也必须明确是 Atlas 代理而非 MOVE。",
+                (
+                    ("dataset", "数据集"),
+                    ("what-it-is", "含义"),
+                    ("why-not-substitute", "为何不可替代"),
+                    ("required-licence", "所需许可"),
+                ),
+                (
+                    ("ICE MOVE index", "Treasury option implied-volatility index", "不能由现券收益率变化精确复原", "ICE Data Indices history + public display"),
+                    ("Treasury yield-change RV", "官方 par-yield 日变动样本标准差", "是 realized yield volatility，不是 option IV 或债券价格 vol", "Treasury raw replay + Atlas derived display"),
+                    ("Swaption / futures option surface", "期限与执行价维度隐含波动率", "单一 MOVE 点位也不能替代完整 surface", "授权 derivatives surface"),
+                ),
+            ),
+            contract_table(
+                "move-post-purchase-fields",
+                "采购后最低字段合同",
+                "必须保留指数版本、时间与许可血缘。",
+                (("field", "字段"), ("requirement", "要求"), ("reason", "原因")),
+                (
+                    ("index family / version", "MOVE family 与方法版本", "避免历史口径漂移"),
+                    ("close / timestamp", "带时区收盘值和时间", "区分不同 cut"),
+                    ("term components", "若产品提供则保留期限分量", "支持分解而非反推"),
+                    ("method version", "vendor methodology revision", "支持重算边界"),
+                    ("source licence", "历史存储、网站与派生展示", "许可闸门"),
+                    ("batch / quality / fallback", "逐批次状态", "失败可见并可重验"),
+                ),
+            ),
         ],
         "source_notes": ["建议向 ICE Data Indices 采购 MOVE 延迟、收盘或历史数据权限。"],
     },
     "fx-vol": {
-        "title": "外汇波动率",
-        "eyebrow": "FX Volatility",
-        "description": "比较主要货币对的隐含波动率、实现波动率、风险逆转与期限结构。",
+        "title": "H.10 外汇实现波动率",
+        "eyebrow": "Official Reference-Level RV",
+        "description": "以 Federal Reserve H.10 官方参考序列计算 20D/60D 年化实现波动率；不是 FX option IV。",
         "metrics": [],
-        "chart_data": [],
-        "analysis": "尚未接入具备公开展示授权的 FX 期权波动率面，页面保持空状态。",
-        "sections": [
-            {
-                "title": "数据缺口",
-                "body": "需要 G10 及主要新兴市场货币对的 ATM IV、25Δ risk reversal、butterfly 与日线现货历史。",
-            },
-            {
-                "title": "目标字段",
-                "body": "pair、tenor、atm_iv、realized_vol_20d、risk_reversal_25d、butterfly_25d、iv_rv_spread、percentile、value_date、source_id、license_scope、quality_status。",
-            },
+        "snapshot_contract_version": 1,
+        "period_options": [
+            {"value": "3m", "label": "3 个月", "months": 3},
+            {"value": "1y", "label": "1 年", "months": 12},
         ],
-        "source_notes": ["优先询价 CME FX/CVOL、LSEG、Bloomberg 或其他允许网页展示的授权供应商。"],
+        "tab_options": [
+            {"value": "20d", "label": "20D RV", "chart_keys": ["h10-fx-realized-volatility-20d"]},
+            {"value": "60d", "label": "60D RV", "chart_keys": ["h10-fx-realized-volatility-60d"]},
+        ],
+        "default_period": "1y",
+        "default_tab": "20d",
+        "analysis": "只发布相邻有效 H.10 observation 的样本标准差，不插值、不前值填充；ATM IV、risk reversal 与 butterfly 保持采购缺口。",
     },
     "implied-vs-realized": {
         "title": "隐含 vs 实现波动率",
         "eyebrow": "Implied / Realized Volatility",
         "description": "按资产和时间窗口对比期权隐含波动率、实现波动率与波动率风险溢价。",
         "metrics": [],
-        "chart_data": [],
+        "prose_only_contract": True,
+        "suppress_empty_chart": True,
         "analysis": "期权链和可追溯日线尚未形成同批次数据，因此不发布 IV-RV 差值。",
         "sections": [
-            {
-                "title": "数据缺口",
-                "body": "需要授权期权链、标的收盘价、统一交易日历与稳定的 ATM IV 选取方法。",
-            },
-            {
-                "title": "目标字段",
-                "body": "instrument、tenor、atm_iv、realized_vol_5d、realized_vol_20d、realized_vol_60d、variance_risk_premium、percentile、value_date、batch_id、source_id、quality_status。",
-            },
+            contract_table(
+                "iv-rv-input-boundary",
+                "IV-RV 输入边界",
+                "任一必需输入缺失、过期或不同批次时不计算差值或风险溢价。",
+                (
+                    ("input", "输入"),
+                    ("required-contract", "必需合同"),
+                    ("failure-policy", "失败策略"),
+                    ("licence", "许可"),
+                ),
+                (
+                    ("Option quote / chain", "bid/mid/ask、expiry、strike、call/put、timestamp", "零 IV 输出", "OPRA/Cboe 或授权 consolidated feed"),
+                    ("Underlying prices", "同标的、统一 calendar 的授权历史 bars", "零 RV/IV-RV 输出", "缓存、历史与 derived display"),
+                    ("Rates and dividends", "与 valuation timestamp 对齐的输入", "不静默用零", "可公开派生展示"),
+                    ("IV selection method", "ATM/moneyness/delta 与插值规则版本", "方法不完整则 fail closed", "Atlas method + vendor field rights"),
+                ),
+            ),
+            contract_table(
+                "iv-rv-post-purchase-fields",
+                "采购后最低字段合同",
+                "支持同批次复算、方法版本和许可审计。",
+                (("field", "字段"), ("requirement", "要求"), ("reason", "原因")),
+                (
+                    ("instrument", "唯一标的与市场标识", "绑定期权和现货"),
+                    ("expiry / tenor", "到期日与剩余期限", "统一比较窗口"),
+                    ("strike / moneyness / delta", "原始执行价及选择维度", "复算 ATM/25Δ"),
+                    ("call / put", "期权类型", "正确选择与 parity 检查"),
+                    ("bid / mid / ask", "保留报价口径", "避免用 last 冒充 composite"),
+                    ("IV method", "模型、插值与版本", "可复算隐含波动率"),
+                    ("rates / dividends", "估值输入及时间", "避免静默假设"),
+                    ("RV window", "5D/20D/60D 等精确观察数", "防止自然日混用"),
+                    ("timestamps", "quote、value 与 fetch 时点", "同批次对齐"),
+                    ("batch / source / licence / quality / fallback", "完整血缘", "发布安全"),
+                ),
+            ),
         ],
         "source_notes": ["期权与现货数据必须同批次对齐；缺任一输入时不生成结果。"],
     },

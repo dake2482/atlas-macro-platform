@@ -7,7 +7,7 @@
   {% else %}
     {% include "research/includes/page_header.html" with eyebrow=eyebrow page_title=title page_description=description show_copy=True %}
   {% endif %}
-  {% if snapshot.quality_status == "stale" or refresh_failure %}<div class="callout mb-4 !border-[var(--warning)] text-[12px]"><strong class="warning">数据已过期：</strong>{% if refresh_failure.reason %}{{ refresh_failure.reason }}{% else %}上游更新尚未通过完整性检查，当前保留上一批可用快照。{% endif %}{% if refresh_failure.sources %}<ul class="mt-2 grid gap-1 text-[10px] muted">{% for item in refresh_failure.sources %}{% if item.status != "success" or item.error %}<li><span class="font-medium">{{ item.source }}</span> · {{ item.status }}{% if item.error %} — {{ item.error }}{% endif %}</li>{% endif %}{% endfor %}</ul>{% elif refresh_failure.attempts %}<ul class="mt-2 grid gap-1 text-[10px] muted">{% for item in refresh_failure.attempts %}{% if item.status != "success" or item.error %}<li><span class="font-medium">{{ item.component_page_key }} / {{ item.input_role }}</span> · {{ item.status }}{% if item.error %} — {{ item.error }}{% endif %}</li>{% endif %}{% endfor %}</ul>{% endif %}</div>{% endif %}
+  {% if snapshot.quality_status == "stale" or refresh_failure or stale_notice %}<div class="callout mb-4 !border-[var(--warning)] text-[12px]"><strong class="warning">数据已过期：</strong>{% if stale_notice.reason %}{{ stale_notice.reason }}{% elif refresh_failure.reason %}{{ refresh_failure.reason }}{% else %}上游更新尚未通过完整性检查，当前保留上一批可用快照。{% endif %}{% if refresh_failure.sources %}<ul class="mt-2 grid gap-1 text-[10px] muted">{% for item in refresh_failure.sources %}{% if item.status != "success" or item.error %}<li><span class="font-medium">{{ item.source }}</span> · {{ item.status }}{% if item.error %} — {{ item.error }}{% endif %}</li>{% endif %}{% endfor %}</ul>{% elif refresh_failure.attempts %}<ul class="mt-2 grid gap-1 text-[10px] muted">{% for item in refresh_failure.attempts %}{% if item.status != "success" or item.error %}<li><span class="font-medium">{{ item.component_page_key }} / {{ item.input_role }}</span> · {{ item.status }}{% if item.error %} — {{ item.error }}{% endif %}</li>{% endif %}{% endfor %}</ul>{% endif %}</div>{% endif %}
   {% if required_notices %}<aside class="callout mb-4 text-[10px] leading-5" aria-label="数据授权声明">{% for notice in required_notices %}<p{% if not forloop.first %} class="mt-2"{% endif %}>{{ notice }}</p>{% endfor %}</aside>{% endif %}
   {% if period_options or tab_options %}
     <nav class="panel mb-4 px-4 py-3" aria-label="数据视图筛选">
@@ -22,12 +22,12 @@
     </nav>
   {% endif %}
   {% if metrics %}<section class="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6" aria-label="关键指标">{% for metric in metrics %}{% include "research/includes/metric_card.html" with metric=metric %}{% endfor %}</section>{% endif %}
-  <div class="grid gap-4 xl:grid-cols-[minmax(0,1.5fr)_minmax(18rem,.65fr)]">
+  <div class="grid gap-4 {% if charts %}xl:grid-cols-[minmax(0,1.5fr)_minmax(18rem,.65fr)]{% elif not suppress_empty_chart %}xl:grid-cols-[minmax(0,1.5fr)_minmax(18rem,.65fr)]{% endif %}">
     {% if charts %}
       {% with chart=charts.0 %}
         {% include "research/includes/chart_panel.html" with chart_id=chart.dom_id chart_title=chart.title chart_description=chart.description chart_data=chart.data chart_kind=chart.kind chart_class="chart-tall" sources=chart.sources as_of=chart.as_of fetched_at=chart.fetched_at quality_status=chart.quality_status batch_ids=chart.batch_ids license_scopes=chart.license_scopes fallback_sources=chart.fallback_sources %}
       {% endwith %}
-    {% else %}
+    {% elif not suppress_empty_chart %}
       {% include "research/includes/chart_panel.html" with chart_id="dashboard-primary-chart" chart_title="核心趋势" chart_data=chart_data chart_kind="line" chart_class="chart-tall" %}
     {% endif %}
     <div class="grid content-start gap-4">

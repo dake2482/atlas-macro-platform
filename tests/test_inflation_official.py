@@ -668,8 +668,15 @@ def test_inflation_get_controls_slice_group_and_sanitize(client):
 
 
 @pytest.mark.django_db
-def test_inflation_reuses_real_rates_breakeven_proxy_when_available(client):
-    _real_rates_snapshot()
+def test_inflation_reuses_real_rates_breakeven_proxy_when_available(
+    client,
+    monkeypatch,
+):
+    real_rates = _real_rates_snapshot()
+    monkeypatch.setattr(
+        "research.official_data.select_public_treasury_curve_snapshot",
+        lambda page_key: real_rates if page_key == "real-rates" else None,
+    )
     run = _inflation_run()
     pce_run = _pce_inflation_run()
     assert _inflation_page_is_buildable(
@@ -702,6 +709,23 @@ def test_inflation_reuses_real_rates_breakeven_proxy_when_available(client):
     body = html.unescape(response.content.decode())
     assert "Treasury 曲线派生盈亏平衡通胀" in body
     assert "不是可交易 breakeven" in body
+
+    monkeypatch.setattr(
+        "research.official_data.select_public_treasury_curve_snapshot",
+        lambda _page_key: None,
+    )
+    unavailable = client.get("/economy/inflation/", {"tab": "expectations"})
+    assert unavailable.status_code == 200
+    assert not any(
+        str(item.get("key") or "").startswith("market-")
+        for item in unavailable.context["metrics"]
+    )
+    assert "market-breakeven-inflation" not in {
+        item.get("key") for item in unavailable.context["charts"]
+    }
+    assert "Treasury 曲线派生盈亏平衡通胀" not in html.unescape(
+        unavailable.content.decode()
+    )
 
 
 def test_inflation_catalog_marks_official_inputs_and_missing_layers():
@@ -819,6 +843,7 @@ def test_refresh_official_data_wires_independent_inflation_gate(monkeypatch):
         "assets-fx",
         "economy",
         "employment",
+        "fx-vol",
     ]
     snapshot = DashboardSnapshot.objects.get(key="inflation")
     bls_run = IngestionRun.objects.filter(
@@ -839,6 +864,7 @@ def test_refresh_official_data_wires_independent_inflation_gate(monkeypatch):
         "assets-fx",
         "economy",
         "employment",
+        "fx-vol",
         "inflation",
     ]
     snapshot.refresh_from_db()

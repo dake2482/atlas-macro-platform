@@ -29,6 +29,11 @@ class Command(BaseCommand):
                 "H.10 ingestion completed but assets-fx v1 could not publish "
                 "or retain an audited snapshot"
             )
+        if "fx-vol" in summary.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "H.10 ingestion completed but fx-vol v1 could not publish "
+                "or retain an audited snapshot"
+            )
         if "global-dollar" in summary.get("stale_dashboard_keys", []):
             raise CommandError(
                 "H.10 ingestion completed but global-dollar v1 could not publish "

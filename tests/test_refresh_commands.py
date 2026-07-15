@@ -7,7 +7,127 @@ import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
 
-from research.tasks import refresh_official_sources, refresh_prates_sources
+from research.tasks import (
+    refresh_h8_sources,
+    refresh_h10_sources,
+    refresh_h41_sources,
+    refresh_official_sources,
+    refresh_prates_sources,
+)
+
+
+@pytest.mark.parametrize(
+    ("command_name", "command_target", "task", "task_target"),
+    [
+        (
+            "refresh_official_data",
+            "research.management.commands.refresh_official_data.refresh_official_data",
+            refresh_official_sources,
+            "research.tasks.refresh_official_data",
+        ),
+        (
+            "refresh_h41_data",
+            "research.management.commands.refresh_h41_data.refresh_h41_data",
+            refresh_h41_sources,
+            "research.tasks.refresh_h41_data",
+        ),
+        (
+            "refresh_h8_data",
+            "research.management.commands.refresh_h8_data.refresh_h8_data",
+            refresh_h8_sources,
+            "research.tasks.refresh_h8_data",
+        ),
+        (
+            "refresh_prates_data",
+            "research.management.commands.refresh_prates_data.refresh_prates_data",
+            refresh_prates_sources,
+            "research.tasks.refresh_prates_data",
+        ),
+        (
+            "refresh_h10_data",
+            "research.management.commands.refresh_h10_data.refresh_h10_data",
+            refresh_h10_sources,
+            "research.tasks.refresh_h10_data",
+        ),
+    ],
+)
+def test_all_required_commands_and_tasks_fail_loudly_for_transmission_chain(
+    monkeypatch,
+    command_name,
+    command_target,
+    task,
+    task_target,
+):
+    summary = {
+        "runs": [
+            {
+                "source": "official-fixture",
+                "dataset": "fixture",
+                "status": "success",
+                "row_count": 1,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["transmission-chain"],
+    }
+    with patch(command_target, return_value=summary):
+        with pytest.raises(CommandError, match="transmission-chain v1"):
+            call_command(
+                command_name,
+                stdout=StringIO(),
+                stderr=StringIO(),
+            )
+
+    monkeypatch.setattr(task_target, lambda: summary)
+    with pytest.raises(RuntimeError, match="transmission-chain v1"):
+        task.run()
+
+
+@pytest.mark.parametrize(
+    ("command_name", "command_target", "task", "task_target"),
+    [
+        (
+            "refresh_official_data",
+            "research.management.commands.refresh_official_data.refresh_official_data",
+            refresh_official_sources,
+            "research.tasks.refresh_official_data",
+        ),
+        (
+            "refresh_h10_data",
+            "research.management.commands.refresh_h10_data.refresh_h10_data",
+            refresh_h10_sources,
+            "research.tasks.refresh_h10_data",
+        ),
+    ],
+)
+def test_official_and_h10_commands_and_tasks_fail_loudly_for_assets_fx(
+    monkeypatch,
+    command_name,
+    command_target,
+    task,
+    task_target,
+):
+    summary = {
+        "runs": [
+            {
+                "source": "federal-reserve",
+                "dataset": "h10",
+                "status": "success",
+                "row_count": 1200,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["assets-fx"],
+    }
+    with patch(command_target, return_value=summary):
+        with pytest.raises(CommandError, match="assets-fx v1"):
+            call_command(command_name, stdout=StringIO(), stderr=StringIO())
+
+    monkeypatch.setattr(task_target, lambda: summary)
+    with pytest.raises(RuntimeError, match="assets-fx v1"):
+        task.run()
 
 
 @pytest.mark.parametrize(
@@ -368,6 +488,40 @@ def test_main_official_command_and_task_fail_when_subsurface_is_stale(
     monkeypatch.setattr("research.tasks.refresh_official_data", lambda: summary)
     with pytest.raises(
         RuntimeError, match="subsurface v1 atomic publication failed"
+    ):
+        refresh_official_sources.run()
+
+
+def test_main_official_command_and_task_fail_when_operations_is_stale(
+    monkeypatch,
+):
+    summary = {
+        "runs": [
+            {
+                "source": "ny-fed-markets",
+                "dataset": "treasury:purchases",
+                "status": "success",
+                "row_count": 35,
+                "error": "",
+            }
+        ],
+        "dashboard_keys": [],
+        "stale_dashboard_keys": ["operations"],
+    }
+    with patch(
+        "research.management.commands.refresh_official_data.refresh_official_data",
+        return_value=summary,
+    ):
+        with pytest.raises(
+            CommandError, match="operations v1 atomic publication failed"
+        ):
+            call_command(
+                "refresh_official_data", stdout=StringIO(), stderr=StringIO()
+            )
+
+    monkeypatch.setattr("research.tasks.refresh_official_data", lambda: summary)
+    with pytest.raises(
+        RuntimeError, match="operations v1 atomic publication failed"
     ):
         refresh_official_sources.run()
 

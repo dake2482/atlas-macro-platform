@@ -1105,8 +1105,38 @@ SERIES_CATALOG = {
     "HQM-PAR-10Y": ("Treasury HQM 10-year Par Yield", "%", "monthly"),
     "HQM-PAR-30Y": ("Treasury HQM 30-year Par Yield", "%", "monthly"),
     "ONRRP": ("Overnight Reverse Repo Accepted Amount", "USD millions", "daily"),
+    "ONRRP-NON-SMALL-VALUE-TOTAL": (
+        "Overnight Reverse Repo Non-Small-Value Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
+    "ONRRP-SMALL-VALUE-TOTAL": (
+        "Overnight Reverse Repo Small-Value Exercise Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
     "ONRRP-RATE": ("Overnight Reverse Repo Offering Rate", "%", "daily"),
     "ONRRP-PARTICIPANTS": ("Overnight Reverse Repo Counterparties", "count", "daily"),
+    "ONRRP-BANK": (
+        "Overnight Reverse Repo Bank Counterparty Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
+    "ONRRP-GSE": (
+        "Overnight Reverse Repo GSE Counterparty Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
+    "ONRRP-MMF": (
+        "Overnight Reverse Repo Money Market Fund Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
+    "ONRRP-PD": (
+        "Overnight Reverse Repo Primary Dealer Accepted Amount",
+        "USD millions",
+        "daily",
+    ),
     "SRP": ("Standing Repo Accepted Amount", "USD millions", "daily"),
     "SRP-TREASURY": ("Standing Repo Treasury Collateral", "USD millions", "daily"),
     "SRP-AGENCY": ("Standing Repo Agency Collateral", "USD millions", "daily"),
@@ -1155,6 +1185,11 @@ SERIES_CATALOG = {
     "SOMA-MBS": ("SOMA Agency MBS", "USD millions", "weekly"),
     "SOMA-CMBS": ("SOMA Agency CMBS", "USD millions", "weekly"),
     "SOMA-AGENCIES": ("SOMA Agency Debt", "USD millions", "weekly"),
+    "TREASURY-PURCHASES": (
+        "Treasury Secondary-Market Purchases",
+        "USD millions",
+        "daily",
+    ),
     "FXSWAP-USD-DRAWDOWN": ("USD Liquidity Swap Drawdowns", "USD millions", "daily"),
     "FXSWAP-USD-DRAWDOWN-NON-SMALL-VALUE": (
         "USD Liquidity Swap Non-Small-Value Drawdowns",
@@ -1190,8 +1225,19 @@ SERIES_CATALOG = {
 }
 
 
-def store_series_observations(result: ProviderResult, source: Source, run: IngestionRun) -> int:
-    """Upsert normalized observations from any official time-series provider."""
+def store_series_observations(
+    result: ProviderResult,
+    source: Source,
+    run: IngestionRun,
+    *,
+    preserve_batches: bool = False,
+) -> int:
+    """Upsert normalized observations from an official time-series provider.
+
+    Most providers intentionally retain the historical ``series/date/source``
+    upsert behaviour.  Exact archive contracts can opt in to batch-preserving
+    persistence so an older acquisition remains independently revalidatable.
+    """
 
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in result.records:
@@ -1226,11 +1272,16 @@ def store_series_observations(result: ProviderResult, source: Source, run: Inges
             for key in ("realtime_start", "realtime_end"):
                 if record.get(key) is not None:
                     metadata[key] = record[key]
+            lookup = {
+                "series": series,
+                "instrument": None,
+                "value_date": value_date,
+                "source": source,
+            }
+            if preserve_batches:
+                lookup["batch_id"] = run.batch_id
             Observation.objects.update_or_create(
-                series=series,
-                instrument=None,
-                value_date=value_date,
-                source=source,
+                **lookup,
                 defaults={
                     "value": record["value"],
                     "as_of": value_date,

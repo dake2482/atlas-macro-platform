@@ -44,6 +44,15 @@ INFLATION_SERIES = (
     "WPUFD4",
 )
 LATEST_PERIOD = date(2026, 5, 1)
+FROZEN_OFFICIAL_DATA_NOW = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_official_data_now(monkeypatch):
+    monkeypatch.setattr(
+        "research.official_data.timezone.now",
+        lambda: FROZEN_OFFICIAL_DATA_NOW,
+    )
 
 
 def _month(start: date, offset: int) -> date:
@@ -799,10 +808,18 @@ def test_refresh_official_data_wires_independent_inflation_gate(monkeypatch):
     monkeypatch.setattr(
         "research.official_data.BEAPIOReleaseProvider", FakeBEAPIOReleaseProvider
     )
+    monkeypatch.setattr(
+        "research.official_data._coordinate_transmission_chain_dashboard",
+        lambda runs: ([], set()),
+    )
 
     first = refresh_official_data(current_year=2026)
     assert first["dashboard_keys"] == ["inflation"]
-    assert first["stale_dashboard_keys"] == ["economy", "employment"]
+    assert first["stale_dashboard_keys"] == [
+        "assets-fx",
+        "economy",
+        "employment",
+    ]
     snapshot = DashboardSnapshot.objects.get(key="inflation")
     bls_run = IngestionRun.objects.filter(
         source__key="bls", status="success"
@@ -819,6 +836,7 @@ def test_refresh_official_data_wires_independent_inflation_gate(monkeypatch):
     second = refresh_official_data(current_year=2026)
     assert "inflation" not in second["dashboard_keys"]
     assert second["stale_dashboard_keys"] == [
+        "assets-fx",
         "economy",
         "employment",
         "inflation",

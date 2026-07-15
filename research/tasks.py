@@ -85,6 +85,26 @@ def refresh_official_sources() -> dict[str, Any]:
             "Official ingestion completed but the required subsurface v1 "
             "atomic publication failed"
         )
+    if "operations" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but the required operations v1 "
+            "atomic publication failed"
+        )
+    if "assets-fx" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but the required assets-fx v1 "
+            "snapshot is stale or unavailable"
+        )
+    if "global-dollar" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but the required global-dollar v1 "
+            "atomic publication failed"
+        )
+    if "transmission-chain" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "Official ingestion completed but transmission-chain v1 could not "
+            "publish or retain a fully audited current snapshot"
+        )
     return summary
 
 
@@ -103,6 +123,10 @@ def refresh_h41_sources() -> dict[str, Any]:
             "H.4.1 ingestion completed but the required fed-balance-sheet v1 "
             "atomic publication failed"
         )
+    if "transmission-chain" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.4.1 ingestion completed but transmission-chain v1 remained stale"
+        )
     return summary
 
 
@@ -115,6 +139,10 @@ def refresh_h8_sources() -> dict[str, Any]:
         raise RuntimeError(
             "H.8 ingestion completed but the required reserves v1 atomic "
             "publication failed"
+        )
+    if "transmission-chain" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.8 ingestion completed but transmission-chain v1 remained stale"
         )
     return summary
 
@@ -129,6 +157,10 @@ def refresh_prates_sources() -> dict[str, Any]:
             "PRATES ingestion completed but the required subsurface v1 "
             "atomic publication failed"
         )
+    if "transmission-chain" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "PRATES ingestion completed but transmission-chain v1 remained stale"
+        )
     return summary
 
 
@@ -136,7 +168,22 @@ def refresh_prates_sources() -> dict[str, Any]:
 def refresh_h10_sources() -> dict[str, Any]:
     """Refresh Board H.10 daily FX reference series."""
 
-    return refresh_h10_data()
+    summary = refresh_h10_data()
+    if "assets-fx" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.10 ingestion completed but the required assets-fx v1 "
+            "snapshot is stale or unavailable"
+        )
+    if "global-dollar" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.10 ingestion completed but the required global-dollar v1 "
+            "atomic publication failed"
+        )
+    if "transmission-chain" in summary.get("stale_dashboard_keys", []):
+        raise RuntimeError(
+            "H.10 ingestion completed but transmission-chain v1 remained stale"
+        )
+    return summary
 
 
 @shared_task(name="research.tasks.refresh_credit_official_sources")

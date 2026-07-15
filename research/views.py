@@ -51,10 +51,14 @@ from .models import (
     Thesis,
 )
 from .official_data import (
+    select_public_assets_fx_snapshot,
     select_public_fed_balance_sheet_snapshot,
+    select_public_global_dollar_snapshot,
+    select_public_operations_snapshot,
     select_public_reserves_rate_spreads_snapshot,
     select_public_reserves_snapshot,
     select_public_subsurface_snapshot,
+    select_public_transmission_chain_snapshot,
 )
 from .page_registry import get_page_config
 from .public_ai_contract import is_pending_ai_company_contract_slug
@@ -215,6 +219,40 @@ def _apply_dashboard_controls(request, config: dict, charts: list[dict]) -> list
         elif selected_tab != default_tab:
             config["selected_tab"] = default_tab
     return filtered
+
+
+_ASSETS_FX_CHART_DISPLAY_FIELDS = {
+    "fx-broad-dollar-history": (
+        "date",
+        "Nominal Broad Dollar Index",
+    ),
+    "fx-major-reference-rates-usd-strength-rebased": (
+        "date",
+        "EUR reciprocal USD strength",
+        "CNY per USD",
+        "JPY per USD",
+    ),
+}
+
+
+def _assets_fx_charts_for_presentation(charts: list[dict]) -> list[dict]:
+    """Keep audited chart lineage in storage but expose display series only."""
+
+    presented = []
+    for raw_chart in charts:
+        if not isinstance(raw_chart, dict):
+            continue
+        fields = _ASSETS_FX_CHART_DISPLAY_FIELDS.get(str(raw_chart.get("key") or ""))
+        if fields is None:
+            continue
+        chart = deepcopy(raw_chart)
+        chart["data"] = [
+            {field: row[field] for field in fields}
+            for row in raw_chart.get("data", [])
+            if isinstance(row, dict) and all(field in row for field in fields)
+        ]
+        presented.append(chart)
+    return presented
 
 
 def _public_theses(*, limit: int | None = None):
@@ -688,11 +726,15 @@ def assets_overview(request):
         "crypto": "加密货币",
     }
     for asset_class, label in labels.items():
-        instruments = list(
-            Instrument.objects.filter(asset_class=asset_class)
-            .filter(public_display_license_q("observations__source__licenses"))
-            .exclude(observations__source__key="demo-market")
-            .distinct()[:8]
+        instruments = (
+            []
+            if asset_class == "fx"
+            else list(
+                Instrument.objects.filter(asset_class=asset_class)
+                .filter(public_display_license_q("observations__source__licenses"))
+                .exclude(observations__source__key="demo-market")
+                .distinct()[:8]
+            )
         )
         rows = []
         for instrument in instruments:
@@ -826,6 +868,77 @@ def assets_overview(request):
                 "deck": "官方 Treasury 收益率与 Atlas 曲线利差；不是 ETF 行情",
                 "value_label": "收益率 / 利差",
                 "change_label": "较前值",
+            }
+        )
+    fx_snapshot = select_public_assets_fx_snapshot()
+    if fx_snapshot is not None:
+        fx_metrics = {
+            item.get("key"): item
+            for item in (fx_snapshot.data or {}).get("metrics", [])
+            if isinstance(item, dict)
+        }
+        fx_rows = []
+        state = getattr(fx_snapshot, "assets_fx_state", None)
+        for metric_key, symbol, name in (
+            (
+                "h10-broad-dollar",
+                "H.10 Broad Dollar",
+                "Federal Reserve H.10 Nominal Broad Dollar Index",
+            ),
+            (
+                "h10-eurusd",
+                "EUR/USD H.10",
+                "Federal Reserve H.10 U.S. dollars per euro reference",
+            ),
+            (
+                "h10-usdcny",
+                "USD/CNY H.10",
+                "Federal Reserve H.10 Chinese yuan per U.S. dollar reference",
+            ),
+            (
+                "h10-usdjpy",
+                "USD/JPY H.10",
+                "Federal Reserve H.10 Japanese yen per U.S. dollar reference",
+            ),
+        ):
+            metric = fx_metrics.get(metric_key)
+            if metric is None:
+                continue
+            try:
+                as_of = datetime.fromisoformat(
+                    str(metric.get("value_date") or metric.get("as_of"))
+                )
+            except (TypeError, ValueError):
+                as_of = fx_snapshot.as_of
+            change = metric.get("change")
+            fx_rows.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "value": metric.get("value"),
+                    "change": change,
+                    "value_display": metric.get("display_value") or "—",
+                    "change_display": (
+                        f"{float(change):+.2f}%" if change is not None else "—"
+                    ),
+                    "as_of": as_of,
+                    "status": (
+                        metric.get("quality_status") or "fresh"
+                        if state == "current_candidate"
+                        else Observation.Quality.STALE
+                    ),
+                }
+            )
+        fx_group = next(group for group in groups if group["key"] == "fx")
+        fx_group.update(
+            {
+                "rows": fx_rows,
+                "deck": (
+                    "Federal Reserve H.10 daily references; not ICE DXY, "
+                    "CNH or executable FX"
+                ),
+                "value_label": "H.10 reference level",
+                "change_label": "Previous valid observation",
             }
         )
     covered_groups = sum(bool(group["rows"]) for group in groups)
@@ -1013,6 +1126,95 @@ def _compose_reserves_components(
     return composed, source_keys
 
 
+def _transmission_sections_for_presentation(
+    sections: list[dict[str, Any]],
+    snapshot: DashboardSnapshot,
+    *,
+    now: datetime,
+) -> list[dict[str, Any]]:
+    """Overlay live parent state without mutating the hashed evidence ledger."""
+
+    presented = deepcopy(sections)
+    state = getattr(snapshot, "transmission_chain_state", None)
+    marker = (snapshot.data or {}).get("refresh_failure")
+    marker_attempts = (
+        marker.get("attempts", []) if isinstance(marker, dict) else []
+    )
+    changed_components = set(
+        getattr(snapshot, "transmission_chain_changed_components", ())
+    )
+    for section in presented:
+        if section.get("key") != "layer-evidence-ledger":
+            continue
+        for row in section.get("rows", []):
+            page_key = str(row.get("layer") or "")
+            failed_attempts = [
+                item
+                for item in marker_attempts
+                if isinstance(item, dict)
+                and item.get("component_page_key") == page_key
+                and (
+                    item.get("status") != "success"
+                    or int(item.get("row_count") or 0) <= 0
+                )
+            ]
+            deadline = None
+            try:
+                deadline = datetime.fromisoformat(str(row.get("fresh_until")))
+            except (TypeError, ValueError):
+                pass
+            if deadline is not None and deadline.tzinfo is None:
+                deadline = deadline.replace(
+                    tzinfo=timezone.get_current_timezone()
+                )
+            is_expired = deadline is not None and deadline < now
+            if state == "current_candidate":
+                stale = False
+                refresh_state = "none"
+            elif state == "natural_expiry":
+                stale = is_expired
+                refresh_state = "自然过期" if is_expired else "none"
+            elif state == "transition_pending":
+                stale = is_expired or page_key in changed_components
+                refresh_state = (
+                    "自然过期"
+                    if is_expired
+                    else "等待父页原子发布"
+                    if page_key in changed_components
+                    else "none"
+                )
+            elif state == "retained_failure":
+                component_changed = page_key in changed_components
+                stale = bool(failed_attempts) or is_expired or component_changed
+                refresh_state = (
+                    ", ".join(
+                        f"{item.get('input_role')}: {item.get('status')}"
+                        for item in failed_attempts
+                    )
+                    if failed_attempts
+                    else "自然过期"
+                    if is_expired
+                    else str((marker or {}).get("reason_code"))
+                    if component_changed
+                    else "none"
+                )
+            else:
+                stale = True
+                refresh_state = ", ".join(
+                    f"{item.get('input_role')}: {item.get('status')}"
+                    for item in failed_attempts
+                ) or str(
+                    (marker or {}).get("reason_code")
+                    or "父页保留上一完整版本"
+                )
+            row["stale"] = "true" if stale else "false"
+            row["refresh_failure"] = refresh_state
+            for item in row.get("cells_list", []):
+                if item.get("key") in {"stale", "refresh_failure"}:
+                    item["cell"]["value"] = row[item["key"]]
+    return presented
+
+
 def dashboard_page(request, page_key: str):
     if page_key == "fed-hawkish-dovish":
         return fed_hawkish_dovish(request)
@@ -1048,6 +1250,17 @@ def dashboard_page(request, page_key: str):
         snapshot = select_public_supply_chain_demand_snapshot(snapshot_candidates[:50])
         if snapshot is not None:
             snapshot_source_keys = {"sec"}
+    elif snapshot_key == "transmission-chain":
+        snapshot = select_public_transmission_chain_snapshot(
+            snapshot_candidates[:50]
+        )
+        if snapshot is not None:
+            selected_failure = (snapshot.data or {}).get("refresh_failure")
+            if isinstance(selected_failure, dict):
+                blocked_refresh_failure = selected_failure
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
     elif snapshot_key == "fed-balance-sheet":
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")
@@ -1070,6 +1283,40 @@ def dashboard_page(request, page_key: str):
             ):
                 blocked_refresh_failure = candidate_failure
         snapshot = select_public_subsurface_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "operations":
+        for candidate in snapshot_candidates[:50]:
+            candidate_failure = (candidate.data or {}).get("refresh_failure")
+            if blocked_refresh_failure is None and isinstance(
+                candidate_failure, dict
+            ):
+                blocked_refresh_failure = candidate_failure
+        snapshot = select_public_operations_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "assets-fx":
+        snapshot = select_public_assets_fx_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            if getattr(snapshot, "assets_fx_state", None) == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "global-dollar":
+        for candidate in snapshot_candidates[:50]:
+            candidate_failure = (candidate.data or {}).get("refresh_failure")
+            if blocked_refresh_failure is None and isinstance(
+                candidate_failure, dict
+            ):
+                blocked_refresh_failure = candidate_failure
+        snapshot = select_public_global_dollar_snapshot(snapshot_candidates[:50])
         if snapshot is not None:
             snapshot_source_keys = _snapshot_source_keys(snapshot.data)
             if snapshot.source_id:
@@ -1140,7 +1387,7 @@ def dashboard_page(request, page_key: str):
                 item["quality_status"] = "stale"
                 snapshot.quality_status = "stale"
         snapshot_data["metrics"] = metrics
-        sections = [dict(item) for item in snapshot_data.get("sections", [])]
+        sections = deepcopy(snapshot_data.get("sections", []))
         for section in sections:
             fresh_until = section.get("fresh_until")
             if not fresh_until:
@@ -1154,6 +1401,12 @@ def dashboard_page(request, page_key: str):
             if deadline < now:
                 section["status"] = "stale"
                 snapshot.quality_status = "stale"
+        if snapshot_key == "transmission-chain":
+            sections = _transmission_sections_for_presentation(
+                sections,
+                snapshot,
+                now=now,
+            )
         snapshot_data["sections"] = sections
         raw_charts = snapshot_data.get("charts")
         if not isinstance(raw_charts, list) or not raw_charts:
@@ -1172,6 +1425,8 @@ def dashboard_page(request, page_key: str):
                     "quality_status": snapshot.quality_status,
                 }
             ]
+        if snapshot_key == "assets-fx":
+            raw_charts = _assets_fx_charts_for_presentation(raw_charts)
         charts = []
         allowed_chart_kinds = {
             "line",
@@ -1243,7 +1498,11 @@ def dashboard_page(request, page_key: str):
         snapshot_data["charts"] = raw_charts
         snapshot.data = snapshot_data
         config["snapshot"] = snapshot
-        config["refresh_failure"] = snapshot_data.get("refresh_failure")
+        config["refresh_failure"] = (
+            blocked_refresh_failure
+            if snapshot_key == "assets-fx"
+            else snapshot_data.get("refresh_failure")
+        )
         config["required_notices"] = public_source_notices(snapshot_source_keys)
         config["analysis"] = snapshot.summary or (
             "本批次只发布了通过许可和质量校验的数值，尚未生成经审核的信号解读。"

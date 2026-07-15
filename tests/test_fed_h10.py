@@ -7,9 +7,17 @@ from decimal import Decimal
 import httpx
 import pytest
 
-from research.fed_h10 import H10_TARGET_SERIES, FederalReserveH10Provider
+from research.fed_h10 import (
+    H10_SOURCE_ATTRIBUTES,
+    H10_TARGET_SERIES,
+    FederalReserveH10Provider,
+)
 from research.models import RawArtifact
-from research.official_data import _store_h10_observations, publish_official_dashboards
+from research.official_data import (
+    _coordinate_assets_fx_dashboard,
+    _store_h10_observations,
+    publish_official_dashboards,
+)
 from research.services import record_provider_result
 
 
@@ -30,10 +38,12 @@ def _xml(*, omit: str | None = None) -> str:
             if index == 1
             else ""
         )
+        attributes = H10_SOURCE_ATTRIBUTES[board_id]
         series.append(
             f"""
-            <kf:Series SERIES_NAME="{board_id}" FREQ="9" CURRENCY="USD"
-                FX="TEST" UNIT="Currency" UNIT_MULT="1">
+            <kf:Series SERIES_NAME="{board_id}" FREQ="{attributes['FREQ']}"
+                CURRENCY="{attributes['CURRENCY']}" FX="{attributes['FX']}"
+                UNIT="{attributes['UNIT']}" UNIT_MULT="{attributes['UNIT_MULT']}">
               <frb:Annotations><common:Annotation>
                 <common:AnnotationText>{target["name"]}</common:AnnotationText>
               </common:Annotation></frb:Annotations>
@@ -85,15 +95,14 @@ def test_h10_provider_uses_status_to_reject_numeric_missing_sentinel():
     assert result.metadata["status_counts"] == {"A": 4, "ND": 1}
 
 
-def test_h10_provider_marks_absent_required_series_partial():
+def test_h10_provider_rejects_absent_required_series():
     omitted = "RXI_N.B.JA"
     result = FederalReserveH10Provider(
         client=_client(_archive(_xml(omit=omitted)))
     ).h10()
 
-    assert result.ok
-    assert result.metadata["missing_series"] == [omitted]
-    assert result.metadata["quality_status"] == "partial"
+    assert not result.ok
+    assert f"missing required H.10 series: {omitted}" in result.error
 
 
 def test_h10_provider_rejects_invalid_archive_and_unknown_series():
@@ -109,22 +118,16 @@ def test_h10_provider_rejects_invalid_archive_and_unknown_series():
 
 
 @pytest.mark.django_db
-def test_h10_ingestion_publishes_reference_fx_without_claiming_dxy():
+def test_h10_ingestion_never_uses_generic_assets_fx_publication():
     result = FederalReserveH10Provider(client=_client(_archive(_xml()))).h10()
     run = record_provider_result(result, persist=_store_h10_observations)
 
-    dashboards = publish_official_dashboards()
+    generic_dashboards = publish_official_dashboards()
+    dashboards, stale = _coordinate_assets_fx_dashboard([run])
 
     assert run.status == "success"
     artifact = RawArtifact.objects.get(run=run)
     assert artifact.sha256 == result.metadata["archive_sha256"]
-    fx = next(item for item in dashboards if item.key == "assets-fx")
-    metrics = {item["key"]: item for item in fx.data["metrics"]}
-    assert set(metrics) == {
-        "h10-broad-dollar",
-        "h10-eurusd",
-        "h10-usdcny",
-        "h10-usdjpy",
-    }
-    assert metrics["h10-eurusd"]["display_value"] == "2.2500"
-    assert "不是 ICE DXY" in fx.summary
+    assert all(item.key != "assets-fx" for item in generic_dashboards)
+    assert dashboards == []
+    assert stale == {"assets-fx"}

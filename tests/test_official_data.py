@@ -283,7 +283,7 @@ def test_ny_fed_provider_calculates_active_usd_fx_swaps_and_separates_small_valu
 
 
 @pytest.mark.django_db
-def test_ny_fed_desk_observations_publish_operations_and_global_dollar_pages():
+def test_wrong_dataset_same_named_swap_series_cannot_publish_global_dollar_v1():
     fetched_at = datetime(2026, 7, 12, 1, tzinfo=UTC)
     result = ProviderResult(
         provider="ny-fed-markets",
@@ -328,13 +328,9 @@ def test_ny_fed_desk_observations_publish_operations_and_global_dollar_pages():
 
     dashboards = {item.key: item for item in publish_official_dashboards()}
 
-    assert {"operations", "global-dollar"} <= dashboards.keys()
+    assert "global-dollar" not in dashboards
+    assert "operations" not in dashboards
     assert "rrp-tga" not in dashboards
-    operations = {item["key"]: item for item in dashboards["operations"].data["metrics"]}
-    assert operations["onrrp"]["display_value"] == "0.545 USD bn"
-    assert operations["soma-total"]["display_value"] == "6.34 USD tn"
-    global_dollar = {item["key"]: item for item in dashboards["global-dollar"].data["metrics"]}
-    assert global_dollar["fxswap-usd-outstanding"]["display_value"] == "135 USD mn"
 
 
 def test_treasury_provider_normalizes_nominal_curve_xml():
@@ -535,19 +531,26 @@ def test_public_dashboard_publisher_requires_approved_source_licence():
                 source=source,
             )
 
-    dashboards = publish_official_dashboards()
-    transmission = next(
-        item for item in dashboards if item.key == "transmission-chain"
+    approved = _publish_dashboard(
+        key="approved-source-fixture",
+        title="Approved source fixture",
+        summary="Fixture",
+        metrics=[
+            _metric("sofr", "SOFR", suffix="%"),
+            _metric("iorb", "IORB", suffix="%"),
+        ],
+        batch_id=uuid.uuid4(),
     )
 
-    assert transmission.data["demo"] is False
-    assert {item["label"] for item in transmission.data["metrics"]} >= {
+    assert approved is not None
+    assert approved.data["demo"] is False
+    assert {item["label"] for item in approved.data["metrics"]} == {
         "SOFR",
         "IORB",
     }
     assert all(
         "Approved Official Fixture" in item["source"]
-        for item in transmission.data["metrics"][:2]
+        for item in approved.data["metrics"]
     )
 
 
@@ -639,7 +642,17 @@ def test_unchanged_official_value_does_not_publish_duplicate_dashboard_snapshots
         ),
         persist=store_series_observations,
     )
-    first_publication = publish_official_dashboards()
+    first_snapshot = _publish_dashboard(
+        key="generic-dedup-fixture",
+        title="Generic dedup fixture",
+        summary="Fixture",
+        metrics=[
+            _metric("SOFR", "SOFR", suffix="%"),
+            _metric("EFFR", "EFFR", suffix="%"),
+            _metric("IORB", "IORB", suffix="%"),
+        ],
+        batch_id=uuid.uuid4(),
+    )
     snapshot_count = DashboardSnapshot.objects.count()
 
     second_run = record_provider_result(
@@ -655,13 +668,23 @@ def test_unchanged_official_value_does_not_publish_duplicate_dashboard_snapshots
         ),
         persist=store_series_observations,
     )
-    second_publication = publish_official_dashboards()
+    second_snapshot = _publish_dashboard(
+        key="generic-dedup-fixture",
+        title="Generic dedup fixture",
+        summary="Fixture",
+        metrics=[
+            _metric("SOFR", "SOFR", suffix="%"),
+            _metric("EFFR", "EFFR", suffix="%"),
+            _metric("IORB", "IORB", suffix="%"),
+        ],
+        batch_id=uuid.uuid4(),
+    )
 
     assert first_run.batch_id != second_run.batch_id
     assert first_run.status == IngestionRun.Status.SUCCESS
     assert second_run.status == IngestionRun.Status.SUCCESS
-    assert first_publication
-    assert second_publication == []
+    assert first_snapshot is not None
+    assert second_snapshot is None
     assert DashboardSnapshot.objects.count() == snapshot_count
 
 
@@ -833,7 +856,7 @@ def test_top_level_source_keys_cannot_hide_revoked_metric_source(client):
         include_historical_open=True,
     )
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="rates",
         title="Mixed-source dashboard",
         as_of=timezone.now(),
         source=allowed,
@@ -867,7 +890,7 @@ def test_chart_lineage_cannot_hide_revoked_source(client):
         include_historical_open=True,
     )
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="rates",
         title="Mixed-source chart",
         as_of=timezone.now(),
         source=allowed,
@@ -963,7 +986,7 @@ def test_fallback_source_is_in_metric_lineage_and_recursive_licence_gate(client)
 
 
 @pytest.mark.django_db
-def test_newer_revoked_chart_snapshot_falls_back_to_previous_safe_snapshot(client):
+def test_transmission_route_rejects_safe_and_revoked_legacy_snapshots(client):
     allowed = _licensed_source("safe-snapshot-source")
     revoked = _licensed_source(
         "newer-revoked-chart-source",
@@ -973,7 +996,7 @@ def test_newer_revoked_chart_snapshot_falls_back_to_previous_safe_snapshot(clien
     )
     now = timezone.now()
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="transmission-chain",
         title="Previous safe snapshot",
         as_of=now - timedelta(days=1),
         source=allowed,
@@ -992,7 +1015,7 @@ def test_newer_revoked_chart_snapshot_falls_back_to_previous_safe_snapshot(clien
         },
     )
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="transmission-chain",
         title="Newer unsafe snapshot",
         as_of=now,
         source=allowed,
@@ -1017,19 +1040,20 @@ def test_newer_revoked_chart_snapshot_falls_back_to_previous_safe_snapshot(clien
         },
     )
 
-    response = client.get("/liquidity/operations/")
+    response = client.get("/liquidity/transmission-chain/")
     body = response.content.decode()
     assert response.status_code == 200
-    assert "SAFE-SNAPSHOT-RENDERS" in body
+    assert "SAFE-SNAPSHOT-RENDERS" not in body
     assert "UNSAFE-SNAPSHOT-MUST-NOT-RENDER" not in body
+    assert "本页尚无通过来源许可与质量检查的可发布快照" in body
 
 
 @pytest.mark.django_db
-def test_latest_published_mixed_frequency_snapshot_wins_even_with_older_as_of(client):
+def test_transmission_route_never_selects_unversioned_mixed_frequency_legacy(client):
     allowed = _licensed_source("mixed-frequency-snapshot-source")
     now = timezone.now()
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="transmission-chain",
         title="Older monthly-only snapshot",
         as_of=now,
         source=allowed,
@@ -1048,7 +1072,7 @@ def test_latest_published_mixed_frequency_snapshot_wins_even_with_older_as_of(cl
         },
     )
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="transmission-chain",
         title="Latest mixed-frequency snapshot",
         as_of=now - timedelta(days=90),
         source=allowed,
@@ -1067,9 +1091,9 @@ def test_latest_published_mixed_frequency_snapshot_wins_even_with_older_as_of(cl
         },
     )
 
-    body = client.get("/liquidity/operations/").content.decode()
+    body = client.get("/liquidity/transmission-chain/").content.decode()
 
-    assert "LATEST-MIXED-FREQUENCY-SNAPSHOT" in body
+    assert "LATEST-MIXED-FREQUENCY-SNAPSHOT" not in body
     assert "OLD-MONTHLY-SNAPSHOT" not in body
 
 
@@ -1079,13 +1103,14 @@ def test_legacy_chart_data_footer_uses_chart_lineage_not_all_page_sources(client
     chart_source = _licensed_source("legacy-chart-only")
     metric_source = _licensed_source("legacy-metric-only")
     DashboardSnapshot.objects.create(
-        key="operations",
+        key="rates",
         title="Legacy chart snapshot",
         as_of=timezone.now(),
         source=shell,
         is_published=True,
         data={
             "demo": False,
+            "contract_version": 1,
             "source_keys": [chart_source.key, metric_source.key],
             "metrics": [
                 {
@@ -1104,7 +1129,7 @@ def test_legacy_chart_data_footer_uses_chart_lineage_not_all_page_sources(client
         },
     )
 
-    body = client.get("/liquidity/operations/").content.decode()
+    body = client.get("/rates/").content.decode()
     chart_footer = body.split('<footer class="source-line', 1)[1].split(
         "</footer>", 1
     )[0]
@@ -1169,3 +1194,48 @@ def test_dashboard_publisher_injects_exact_source_licence_scope():
     )
     assert metric["source_key"] == source.key
     assert normalized.license_scope == source.license_scope[:120]
+
+
+@pytest.mark.django_db
+def test_append_only_recovery_never_leaves_same_lineage_revision_stale():
+    source = ensure_source("internal")
+    metric = _dashboard_metric_contract(source_key=source.key)
+    extra_data = {
+        "contract_version": 1,
+        "formula_version": "official-evidence-chain-v1",
+        "semantic_manifest": {"fixture": "same-lineage-recovery"},
+    }
+    first = _publish_dashboard(
+        key="reserves",
+        title="Append-only fixture",
+        summary="Fixture",
+        metrics=[metric],
+        extra_data=extra_data,
+        batch_id=uuid.uuid4(),
+    )
+    assert first is not None
+    first_data = dict(first.data)
+    first_data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason_code": "fixture",
+    }
+    first.data = first_data
+    first.quality_status = Observation.Quality.STALE
+    first.save(update_fields=["data", "quality_status", "updated_at"])
+
+    recovered = _publish_dashboard(
+        key="reserves",
+        title="Append-only fixture",
+        summary="Fixture",
+        metrics=[metric],
+        extra_data=extra_data,
+        batch_id=uuid.uuid4(),
+    )
+
+    assert recovered is not None
+    assert recovered.pk != first.pk
+    assert recovered.batch_id != first.batch_id
+    assert "refresh_failure" not in recovered.data
+    first.refresh_from_db()
+    assert first.quality_status == Observation.Quality.STALE
+    assert "refresh_failure" in first.data

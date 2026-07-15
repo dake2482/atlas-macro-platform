@@ -300,6 +300,275 @@ class NYFedMarketsProvider(HTTPProvider):
             return known
         return re.sub(r"[^A-Z0-9]+", "-", counterparty.upper()).strip("-") or "UNKNOWN"
 
+    @classmethod
+    def validate_usd_fx_swap_operations(
+        cls,
+        payload: Any,
+        *,
+        strict: bool,
+        fetched_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Validate one USD-liquidity-swap response without skipping bad rows.
+
+        ``strict=False`` exists only for the historical explicit ``last/N``
+        fixture interface, whose old payload samples omit several source
+        fields. Production search coverage always uses the strict contract.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise ValueError("invalid fxSwaps payload")
+        envelope = payload.get("fxSwaps")
+        operations = envelope.get("operations") if isinstance(envelope, Mapping) else None
+        if not isinstance(operations, list) or (strict and not operations):
+            raise ValueError("invalid fxSwaps.operations payload")
+
+        acquisition_time = fetched_at or datetime.now(UTC)
+        if acquisition_time.tzinfo is None:
+            acquisition_time = acquisition_time.replace(tzinfo=UTC)
+        parsed: list[dict[str, Any]] = []
+        seen: set[tuple[str, ...]] = set()
+        for item in operations:
+            if not isinstance(item, Mapping):
+                raise ValueError("USD swap response contains a non-object row")
+            source = dict(item)
+            counterparty = str(item.get("counterparty") or "").strip()
+            raw_amount = _decimal_or_none(item.get("amount"))
+            if (
+                not counterparty
+                or raw_amount is None
+                or not raw_amount.is_finite()
+                or raw_amount < 0
+            ):
+                raise ValueError("USD swap row has invalid counterparty or amount")
+
+            def canonical_date(field: str, *, required: bool = True) -> date | None:
+                raw = item.get(field)
+                if raw in (None, "") and not required:
+                    return None
+                if not isinstance(raw, str):
+                    raise ValueError(f"USD swap {field} must be canonical text")
+                try:
+                    parsed_date = date.fromisoformat(raw)
+                except ValueError as exc:
+                    raise ValueError(f"USD swap {field} is invalid") from exc
+                if raw != parsed_date.isoformat():
+                    raise ValueError(f"USD swap {field} is not canonical")
+                return parsed_date
+
+            settlement_date = canonical_date("settlementDate")
+            maturity_date = canonical_date("maturityDate")
+            assert settlement_date is not None and maturity_date is not None
+            if settlement_date >= maturity_date:
+                raise ValueError("USD swap settlement must precede maturity")
+
+            raw_small_value = item.get("isSmallValue", "")
+            if strict and (
+                not isinstance(raw_small_value, str)
+                or raw_small_value not in {"", "Y"}
+            ):
+                raise ValueError("USD swap isSmallValue flag is unknown")
+            is_small_value = str(raw_small_value or "").strip().upper() in {
+                "1",
+                "TRUE",
+                "Y",
+                "YES",
+            }
+
+            trade_date = canonical_date("tradeDate", required=strict)
+            interest_rate = _decimal_or_none(item.get("interestRate"))
+            raw_term = item.get("termInDays")
+            if strict:
+                if item.get("operationType") != "U.S. Dollar Liquidity Swap":
+                    raise ValueError("USD swap operation type changed")
+                if item.get("currency") != "USD":
+                    raise ValueError("USD swap currency changed")
+                if trade_date is None or trade_date > settlement_date:
+                    raise ValueError("USD swap trade date exceeds settlement")
+                if (
+                    isinstance(raw_term, bool)
+                    or not isinstance(raw_term, int)
+                    or raw_term != (maturity_date - settlement_date).days
+                ):
+                    raise ValueError("USD swap term does not match date interval")
+                if (
+                    interest_rate is None
+                    or not interest_rate.is_finite()
+                    or interest_rate < 0
+                ):
+                    raise ValueError("USD swap interest rate is invalid")
+                raw_last_updated = item.get("lastUpdated")
+                if not isinstance(raw_last_updated, str) or not raw_last_updated:
+                    raise ValueError("USD swap lastUpdated is missing")
+                try:
+                    last_updated = datetime.fromisoformat(
+                        raw_last_updated.replace("Z", "+00:00")
+                    )
+                except ValueError as exc:
+                    raise ValueError("USD swap lastUpdated is invalid") from exc
+                if last_updated.tzinfo is None:
+                    last_updated = last_updated.replace(tzinfo=cls.market_timezone)
+                if (
+                    trade_date is None
+                    or trade_date
+                    > last_updated.astimezone(cls.market_timezone).date()
+                    or last_updated > acquisition_time + timedelta(minutes=5)
+                ):
+                    raise ValueError("USD swap lastUpdated is future-dated")
+
+            operation_id = str(item.get("operationId") or "").strip()
+            natural_key = (
+                ("operationId", operation_id)
+                if operation_id
+                else (
+                    "fields",
+                    trade_date.isoformat() if trade_date else "",
+                    settlement_date.isoformat(),
+                    maturity_date.isoformat(),
+                    counterparty,
+                    str(raw_small_value),
+                )
+            )
+            if natural_key in seen:
+                raise ValueError(
+                    "USD swap response contains a duplicate or conflicting business identity"
+                )
+            seen.add(natural_key)
+            parsed.append(
+                {
+                    "amount": raw_amount / Decimal("1000000"),
+                    "counterparty": counterparty,
+                    "counterparty_code": cls._counterparty_code(counterparty),
+                    "trade_date": trade_date,
+                    "settlement_date": settlement_date,
+                    "maturity_date": maturity_date,
+                    "term_in_days": raw_term,
+                    "interest_rate": interest_rate,
+                    "is_small_value": is_small_value,
+                    "source": source,
+                    "natural_key": "|".join(natural_key),
+                }
+            )
+        return parsed
+
+    @classmethod
+    def usd_fx_swap_records(
+        cls,
+        parsed: list[dict[str, Any]],
+        *,
+        as_of_date: date,
+        history_limit: int | None,
+    ) -> list[dict[str, Any]]:
+        """Build transparent daily and current aggregates from validated rows."""
+
+        records: list[dict[str, Any]] = []
+        by_settlement: dict[date, list[dict[str, Any]]] = {}
+        for item in parsed:
+            by_settlement.setdefault(item["settlement_date"], []).append(item)
+        for settlement_date, daily_operations in sorted(by_settlement.items()):
+            regular = [item for item in daily_operations if not item["is_small_value"]]
+            small = [item for item in daily_operations if item["is_small_value"]]
+            records.extend(
+                [
+                    {
+                        "series_id": "FXSWAP-USD-DRAWDOWN",
+                        "date": settlement_date.isoformat(),
+                        "value": sum(
+                            (item["amount"] for item in daily_operations), Decimal("0")
+                        ),
+                        "metadata": {
+                            "unit": "USD millions",
+                            "operations": [item["source"] for item in daily_operations],
+                        },
+                    },
+                    {
+                        "series_id": "FXSWAP-USD-DRAWDOWN-NON-SMALL-VALUE",
+                        "date": settlement_date.isoformat(),
+                        "value": sum(
+                            (item["amount"] for item in regular), Decimal("0")
+                        ),
+                        "metadata": {
+                            "unit": "USD millions",
+                            "operations": [item["source"] for item in regular],
+                            "small_value_excluded": True,
+                            "classification": "non-small-value",
+                        },
+                    },
+                    {
+                        "series_id": "FXSWAP-USD-DRAWDOWN-SMALL-VALUE",
+                        "date": settlement_date.isoformat(),
+                        "value": sum((item["amount"] for item in small), Decimal("0")),
+                        "metadata": {
+                            "unit": "USD millions",
+                            "operations": [item["source"] for item in small],
+                            "small_value_only": True,
+                            "classification": "small-value-technical-exercise",
+                        },
+                    },
+                ]
+            )
+
+        active = [
+            item
+            for item in parsed
+            if item["settlement_date"] <= as_of_date < item["maturity_date"]
+        ]
+        common_metadata = {
+            "unit": "USD millions",
+            "as_of": as_of_date.isoformat(),
+            "formula": "settlementDate <= as_of < maturityDate",
+            "history_limit": history_limit,
+            "active_operations": [item["source"] for item in active],
+        }
+        regular = [item for item in active if not item["is_small_value"]]
+        small = [item for item in active if item["is_small_value"]]
+        records.extend(
+            [
+                {
+                    "series_id": "FXSWAP-USD-OUTSTANDING",
+                    "date": as_of_date.isoformat(),
+                    "value": sum((item["amount"] for item in active), Decimal("0")),
+                    "metadata": common_metadata,
+                },
+                {
+                    "series_id": "FXSWAP-USD-OUTSTANDING-NON-SMALL-VALUE",
+                    "date": as_of_date.isoformat(),
+                    "value": sum((item["amount"] for item in regular), Decimal("0")),
+                    "metadata": {
+                        **common_metadata,
+                        "active_operations": [item["source"] for item in regular],
+                        "small_value_excluded": True,
+                    },
+                },
+                {
+                    "series_id": "FXSWAP-USD-OUTSTANDING-SMALL-VALUE",
+                    "date": as_of_date.isoformat(),
+                    "value": sum((item["amount"] for item in small), Decimal("0")),
+                    "metadata": {
+                        **common_metadata,
+                        "active_operations": [item["source"] for item in small],
+                        "small_value_only": True,
+                    },
+                },
+            ]
+        )
+        by_counterparty: dict[str, list[dict[str, Any]]] = {}
+        for item in active:
+            by_counterparty.setdefault(item["counterparty_code"], []).append(item)
+        for code, operations in sorted(by_counterparty.items()):
+            records.append(
+                {
+                    "series_id": f"FXSWAP-USD-{code}-OUTSTANDING",
+                    "date": as_of_date.isoformat(),
+                    "value": sum((item["amount"] for item in operations), Decimal("0")),
+                    "metadata": {
+                        **common_metadata,
+                        "active_operations": [item["source"] for item in operations],
+                        "counterparty": operations[0]["counterparty"],
+                    },
+                }
+            )
+        return records
+
     @staticmethod
     def _operation_metadata(item: Mapping[str, Any]) -> dict[str, Any]:
         """Keep source fields JSON-safe and make the API typo explicit."""
@@ -307,11 +576,15 @@ class NYFedMarketsProvider(HTTPProvider):
         keys = (
             "operationId",
             "auctionStatus",
+            "operationDirection",
             "operationDate",
             "settlementDate",
             "maturityDate",
+            "maturityRangeStart",
+            "maturityRangeEnd",
             "operationType",
             "operationMethod",
+            "auctionMethod",
             "settlementType",
             "termCalenderDays",
             "term",
@@ -322,6 +595,8 @@ class NYFedMarketsProvider(HTTPProvider):
             "lastUpdated",
             "totalAmtSubmitted",
             "totalAmtAccepted",
+            "totalParAmtSubmitted",
+            "totalParAmtAccepted",
             "participatingCpty",
             "acceptedCpty",
             "details",
@@ -443,6 +718,137 @@ class NYFedMarketsProvider(HTTPProvider):
     def effr(self, *, limit: int = 120) -> ProviderResult:
         return self.reference_rate("EFFR", limit=limit)
 
+    def treasury_purchases(self, *, limit: int = 100) -> ProviderResult:
+        """Normalize official Treasury outright-purchase result summaries.
+
+        The public result feed combines reserve-management and principal-
+        reinvestment purchases.  It does not expose a stable purpose or
+        small-value flag, so Atlas publishes the complete official purchase
+        set without inventing a regular/test partition.
+        """
+
+        limit = max(1, min(int(limit), 100))
+        dataset = "treasury:purchases"
+        endpoint = f"/api/tsy/purchases/results/summary/last/{limit}.json"
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
+            dataset, endpoint
+        )
+        if failure:
+            return failure
+        if not isinstance(payload, Mapping):
+            return ProviderResult.failure(
+                self.key, dataset, "invalid Treasury purchase payload"
+            )
+        treasury = payload.get("treasury")
+        auctions = treasury.get("auctions") if isinstance(treasury, Mapping) else None
+        if not isinstance(auctions, list) or not auctions:
+            return ProviderResult.failure(
+                self.key, dataset, "invalid treasury.auctions payload"
+            )
+
+        seen_operation_ids: set[str] = set()
+        by_date: dict[str, list[Mapping[str, Any]]] = {}
+        for item in auctions:
+            if not isinstance(item, Mapping):
+                return ProviderResult.failure(
+                    self.key, dataset, "invalid Treasury purchase result record"
+                )
+            operation_id = str(item.get("operationId") or "").strip()
+            operation_type = str(item.get("operationType") or "").strip()
+            operation_date = str(item.get("operationDate") or "")
+            settlement_date = str(item.get("settlementDate") or "")
+            maturity_start = str(item.get("maturityRangeStart") or "")
+            maturity_end = str(item.get("maturityRangeEnd") or "")
+            try:
+                parsed_operation_date = date.fromisoformat(operation_date)
+                parsed_settlement_date = date.fromisoformat(settlement_date)
+                parsed_maturity_start = date.fromisoformat(maturity_start)
+                parsed_maturity_end = date.fromisoformat(maturity_end)
+                submitted = Decimal(str(item.get("totalParAmtSubmitted")))
+                accepted = Decimal(str(item.get("totalParAmtAccepted")))
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    f"malformed Treasury purchase result: {exc}",
+                )
+            if (
+                not operation_id
+                or operation_id in seen_operation_ids
+                or str(item.get("auctionStatus") or "") != "Results"
+                or str(item.get("operationDirection") or "") != "P"
+                or not operation_type
+                or operation_date != parsed_operation_date.isoformat()
+                or settlement_date != parsed_settlement_date.isoformat()
+                or maturity_start != parsed_maturity_start.isoformat()
+                or maturity_end != parsed_maturity_end.isoformat()
+                or parsed_maturity_start > parsed_maturity_end
+                or not submitted.is_finite()
+                or not accepted.is_finite()
+                or submitted < 0
+                or accepted < 0
+                or accepted > submitted
+            ):
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    "Treasury purchase result failed identity, status, direction, "
+                    "date, amount, or uniqueness checks",
+                )
+            seen_operation_ids.add(operation_id)
+            by_date.setdefault(operation_date, []).append(item)
+
+        records: list[dict[str, Any]] = []
+        for operation_date, daily_auctions in sorted(by_date.items()):
+            accepted = sum(
+                (
+                    self._usd_millions(item.get("totalParAmtAccepted"))
+                    or Decimal("0")
+                )
+                for item in daily_auctions
+            )
+            submitted = sum(
+                (
+                    self._usd_millions(item.get("totalParAmtSubmitted"))
+                    or Decimal("0")
+                )
+                for item in daily_auctions
+            )
+            records.append(
+                {
+                    "series_id": "TREASURY-PURCHASES",
+                    "date": operation_date,
+                    "value": accepted,
+                    "metadata": {
+                        "unit": "USD millions",
+                        "submitted": str(submitted),
+                        "operation_count": len(daily_auctions),
+                        "operations": [
+                            self._operation_metadata(item) for item in daily_auctions
+                        ],
+                        "coverage": (
+                            "all official purchase results; includes RMP and "
+                            "principal reinvestment"
+                        ),
+                        "small_value_classification": (
+                            "unavailable in the official result summary feed"
+                        ),
+                    },
+                }
+            )
+        return self._desk_result(
+            dataset=dataset,
+            records=records,
+            endpoint=endpoint,
+            raw_bytes=raw_bytes,
+            response_metadata=response_metadata,
+            amount_unit="USD millions",
+            coverage=(
+                "all operationDirection=P and auctionStatus=Results rows; "
+                "purpose and small-value status are not inferred"
+            ),
+        )
+
     def reverse_repo_results(self, *, limit: int = 120) -> ProviderResult:
         """Normalize fixed-rate overnight reverse-repo operation results.
 
@@ -453,39 +859,93 @@ class NYFedMarketsProvider(HTTPProvider):
         limit = max(1, min(int(limit), 10000))
         dataset = "repo:reverse-repo-fixed-results"
         endpoint = f"/api/rp/reverserepo/fixed/results/last/{limit}.json"
-        payload, failure = self._get_json(dataset, endpoint)
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
+            dataset, endpoint
+        )
         if failure:
             return failure
-        operations = (payload or {}).get("repo", {}).get("operations", [])
-        if not isinstance(operations, list):
+        if not isinstance(payload, Mapping):
+            return ProviderResult.failure(self.key, dataset, "invalid repo payload")
+        repo = payload.get("repo")
+        operations = repo.get("operations") if isinstance(repo, Mapping) else None
+        if not isinstance(operations, list) or not operations:
             return ProviderResult.failure(self.key, dataset, "invalid repo.operations payload")
 
         by_date: dict[str, list[Mapping[str, Any]]] = {}
+        seen_operation_ids: set[str] = set()
         for item in operations:
-            if not isinstance(item, Mapping) or not item.get("operationDate"):
-                continue
-            by_date.setdefault(str(item["operationDate"]), []).append(item)
+            if not isinstance(item, Mapping):
+                return ProviderResult.failure(
+                    self.key, dataset, "invalid reverse-repo result record"
+                )
+            operation_id = str(item.get("operationId") or "").strip()
+            operation_date = str(item.get("operationDate") or "")
+            try:
+                parsed_date = date.fromisoformat(operation_date)
+                submitted = Decimal(str(item.get("totalAmtSubmitted")))
+                accepted = Decimal(str(item.get("totalAmtAccepted")))
+            except (ArithmeticError, TypeError, ValueError) as exc:
+                return ProviderResult.failure(
+                    self.key, dataset, f"malformed reverse-repo result: {exc}"
+                )
+            if (
+                not operation_id
+                or operation_id in seen_operation_ids
+                or operation_date != parsed_date.isoformat()
+                or str(item.get("auctionStatus") or "") != "Results"
+                or str(item.get("operationType") or "") != "Reverse Repo"
+                or str(item.get("operationMethod") or "") != "Fixed Rate"
+                or not submitted.is_finite()
+                or not accepted.is_finite()
+                or submitted < 0
+                or accepted < 0
+                or accepted > submitted
+            ):
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    "reverse-repo result failed identity, schema, amount, or "
+                    "uniqueness checks",
+                )
+            seen_operation_ids.add(operation_id)
+            by_date.setdefault(operation_date, []).append(item)
 
         records: list[dict[str, Any]] = []
-        for operation_date, daily_operations in by_date.items():
+        for operation_date, daily_operations in sorted(by_date.items()):
             accepted = sum(
                 (self._usd_millions(item.get("totalAmtAccepted")) or Decimal("0"))
                 for item in daily_operations
             )
             source_operations = [self._operation_metadata(item) for item in daily_operations]
-            note_text = " ".join(str(item.get("note") or "") for item in daily_operations)
             regular_operations = [
                 item
                 for item in daily_operations
-                if "small value exercise" not in str(item.get("note") or "").lower()
+                if not self._is_small_value_operation(item)
             ]
+            small_value_operations = [
+                item for item in daily_operations if self._is_small_value_operation(item)
+            ]
+            regular_accepted = sum(
+                (self._usd_millions(item.get("totalAmtAccepted")) or Decimal("0"))
+                for item in regular_operations
+            )
+            small_value_accepted = sum(
+                (self._usd_millions(item.get("totalAmtAccepted")) or Decimal("0"))
+                for item in small_value_operations
+            )
+            if accepted != regular_accepted + small_value_accepted:
+                return ProviderResult.failure(
+                    self.key, dataset, "reverse-repo partition reconciliation failed"
+                )
             primary = (regular_operations or daily_operations)[0]
             metadata = {
                 **self._operation_metadata(primary),
                 "unit": "USD millions",
                 "operation_count": len(daily_operations),
                 "operations": source_operations,
-                "has_small_value_exercise": "small value exercise" in note_text.lower(),
+                "has_small_value_exercise": bool(small_value_operations),
+                "non_small_value_operation_count": len(regular_operations),
+                "small_value_operation_count": len(small_value_operations),
             }
             records.append(
                 {
@@ -495,50 +955,117 @@ class NYFedMarketsProvider(HTTPProvider):
                     "metadata": metadata,
                 }
             )
+            regular_metadata = {
+                **metadata,
+                "operation_count": len(regular_operations),
+                "operations": [
+                    self._operation_metadata(item) for item in regular_operations
+                ],
+                "small_value_excluded": True,
+                "classification": "non-small-value",
+            }
+            small_metadata = {
+                **metadata,
+                "operation_count": len(small_value_operations),
+                "operations": [
+                    self._operation_metadata(item) for item in small_value_operations
+                ],
+                "small_value_only": True,
+                "classification": "small-value-technical-exercise",
+            }
+            records.extend(
+                [
+                    {
+                        "series_id": "ONRRP-NON-SMALL-VALUE-TOTAL",
+                        "date": operation_date,
+                        "value": regular_accepted,
+                        "metadata": regular_metadata,
+                    },
+                    {
+                        "series_id": "ONRRP-SMALL-VALUE-TOTAL",
+                        "date": operation_date,
+                        "value": small_value_accepted,
+                        "metadata": small_metadata,
+                    },
+                ]
+            )
 
-            details = primary.get("details") or []
-            treasury = next(
-                (
-                    detail
-                    for detail in details
-                    if isinstance(detail, Mapping) and detail.get("securityType") == "Treasury"
-                ),
-                {},
-            )
-            rate_value = (
-                treasury.get("percentAwardRate")
-                if treasury.get("percentAwardRate") is not None
-                else treasury.get("percentOfferingRate")
-            )
-            rate = _decimal_or_none(rate_value)
-            if rate is not None:
+            regular_rates: set[Decimal] = set()
+            for operation in regular_operations:
+                details = operation.get("details")
+                if not isinstance(details, list):
+                    return ProviderResult.failure(
+                        self.key, dataset, "reverse-repo details must be a list"
+                    )
+                for detail in details:
+                    if not isinstance(detail, Mapping):
+                        return ProviderResult.failure(
+                            self.key, dataset, "invalid reverse-repo detail"
+                        )
+                    raw_rate = detail.get("percentAwardRate")
+                    if raw_rate is None:
+                        raw_rate = detail.get("percentOfferingRate")
+                    if raw_rate is None:
+                        continue
+                    rate = _decimal_or_none(raw_rate)
+                    if rate is None or not rate.is_finite() or rate < 0:
+                        return ProviderResult.failure(
+                            self.key, dataset, "invalid reverse-repo regular rate"
+                        )
+                    regular_rates.add(rate)
+            if len(regular_rates) > 1:
+                return ProviderResult.failure(
+                    self.key, dataset, "ambiguous reverse-repo regular rates"
+                )
+            if regular_rates:
+                rate = next(iter(regular_rates))
                 records.append(
                     {
                         "series_id": "ONRRP-RATE",
                         "date": operation_date,
                         "value": rate,
-                        "metadata": {**metadata, "unit": "%"},
+                        "metadata": {
+                            **regular_metadata,
+                            "unit": "%",
+                            "reported_rates": [str(rate)],
+                        },
                     }
                 )
-            participants = _decimal_or_none(
-                primary.get("acceptedCpty")
-                if primary.get("acceptedCpty") is not None
-                else primary.get("participatingCpty")
-            )
-            if participants is not None:
+            participant_values: list[Decimal] = []
+            for operation in regular_operations:
+                participants = _decimal_or_none(
+                    operation.get("acceptedCpty")
+                    if operation.get("acceptedCpty") is not None
+                    else operation.get("participatingCpty")
+                )
+                if (
+                    participants is None
+                    or not participants.is_finite()
+                    or participants < 0
+                    or participants != participants.to_integral_value()
+                ):
+                    return ProviderResult.failure(
+                        self.key, dataset, "invalid reverse-repo participant count"
+                    )
+                participant_values.append(participants)
+            if participant_values:
+                participants = sum(participant_values, Decimal("0"))
                 records.append(
                     {
                         "series_id": "ONRRP-PARTICIPANTS",
                         "date": operation_date,
                         "value": participants,
-                        "metadata": {**metadata, "unit": "counterparties"},
+                        "metadata": {
+                            **regular_metadata,
+                            "unit": "counterparties",
+                        },
                     }
                 )
 
             # Counterparty-type propositions are historical-only in recent
             # releases.  Missing arrays are deliberately not converted to zero.
             proposition_totals: dict[str, Decimal] = {}
-            for item in daily_operations:
+            for item in regular_operations:
                 for proposition in item.get("propositions") or []:
                     if not isinstance(proposition, Mapping):
                         continue
@@ -562,11 +1089,16 @@ class NYFedMarketsProvider(HTTPProvider):
             dataset=dataset,
             records=records,
             endpoint=endpoint,
+            raw_bytes=raw_bytes,
+            response_metadata=response_metadata,
             amount_unit="USD millions",
             counterparty_breakdown="present only when propositions is returned",
+            partition_formula="ONRRP = non-small-value + small-value",
         )
 
-    def standing_repo_results(self, *, limit: int = 240) -> ProviderResult:
+    def standing_repo_results(
+        self, *, limit: int = 240, strict: bool = False
+    ) -> ProviderResult:
         """Normalize current full-allotment standing-repo results by day.
 
         Since December 11, 2025 the Desk normally runs morning and afternoon
@@ -582,15 +1114,111 @@ class NYFedMarketsProvider(HTTPProvider):
         )
         if failure:
             return failure
-        operations = (payload or {}).get("repo", {}).get("operations", [])
-        if not isinstance(operations, list):
+        if not isinstance(payload, Mapping):
+            return ProviderResult.failure(self.key, dataset, "invalid repo payload")
+        repo = payload.get("repo")
+        operations = repo.get("operations") if isinstance(repo, Mapping) else None
+        if not isinstance(operations, list) or not operations:
             return ProviderResult.failure(self.key, dataset, "invalid repo.operations payload")
 
         by_date: dict[str, list[Mapping[str, Any]]] = {}
+        seen_operation_ids: set[str] = set()
         for item in operations:
-            if not isinstance(item, Mapping) or not item.get("operationDate"):
+            if not isinstance(item, Mapping):
+                if strict:
+                    return ProviderResult.failure(
+                        self.key, dataset, "invalid standing-repo result record"
+                    )
                 continue
-            by_date.setdefault(str(item["operationDate"]), []).append(item)
+            operation_id = str(item.get("operationId") or "").strip()
+            operation_date = str(item.get("operationDate") or "")
+            accepted_value = _decimal_or_none(item.get("totalAmtAccepted"))
+            details = item.get("details")
+            if (
+                accepted_value is None
+                or not accepted_value.is_finite()
+                or accepted_value < 0
+                or not isinstance(details, list)
+            ):
+                return ProviderResult.failure(
+                    self.key,
+                    dataset,
+                    "standing-repo result has invalid accepted amount or details",
+                )
+            for detail in details:
+                detail_amount = (
+                    _decimal_or_none(detail.get("amtAccepted"))
+                    if isinstance(detail, Mapping)
+                    else None
+                )
+                if (
+                    detail_amount is None
+                    or not detail_amount.is_finite()
+                    or detail_amount < 0
+                ):
+                    return ProviderResult.failure(
+                        self.key, dataset, "invalid standing-repo detail amount"
+                    )
+            if strict:
+                try:
+                    parsed_date = date.fromisoformat(operation_date)
+                    submitted = Decimal(str(item.get("totalAmtSubmitted")))
+                    accepted = Decimal(str(item.get("totalAmtAccepted")))
+                except (ArithmeticError, TypeError, ValueError) as exc:
+                    return ProviderResult.failure(
+                        self.key, dataset, f"malformed standing-repo result: {exc}"
+                    )
+                if (
+                    not operation_id
+                    or operation_id in seen_operation_ids
+                    or operation_date != parsed_date.isoformat()
+                    or str(item.get("auctionStatus") or "") != "Results"
+                    or str(item.get("operationType") or "") != "Repo"
+                    or str(item.get("operationMethod") or "") != "Full Allotment"
+                    or not submitted.is_finite()
+                    or not accepted.is_finite()
+                    or submitted < 0
+                    or accepted < 0
+                    or accepted > submitted
+                    or not isinstance(details, list)
+                ):
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        "standing-repo result failed identity, schema, amount, "
+                        "or uniqueness checks",
+                    )
+                detail_total = Decimal("0")
+                for detail in details:
+                    if not isinstance(detail, Mapping):
+                        return ProviderResult.failure(
+                            self.key, dataset, "invalid standing-repo detail"
+                        )
+                    detail_amount = _decimal_or_none(detail.get("amtAccepted"))
+                    if (
+                        detail_amount is None
+                        or not detail_amount.is_finite()
+                        or detail_amount < 0
+                    ):
+                        return ProviderResult.failure(
+                            self.key, dataset, "invalid standing-repo detail amount"
+                        )
+                    detail_total += detail_amount
+                if detail_total != accepted:
+                    return ProviderResult.failure(
+                        self.key,
+                        dataset,
+                        "standing-repo collateral details do not reconcile",
+                    )
+            elif not operation_date:
+                continue
+            if operation_id:
+                if operation_id in seen_operation_ids:
+                    return ProviderResult.failure(
+                        self.key, dataset, "duplicate standing-repo operation ID"
+                    )
+                seen_operation_ids.add(operation_id)
+            by_date.setdefault(operation_date, []).append(item)
 
         security_series = {
             "Treasury": "SRP-TREASURY",
@@ -747,6 +1375,10 @@ class NYFedMarketsProvider(HTTPProvider):
                         },
                     }
                 )
+            if len(set(non_small_value_rates)) > 1:
+                return ProviderResult.failure(
+                    self.key, dataset, "ambiguous standing-repo regular rates"
+                )
             if non_small_value_rates:
                 records.append(
                     {
@@ -780,23 +1412,70 @@ class NYFedMarketsProvider(HTTPProvider):
 
         dataset = "soma:summary"
         endpoint = "/api/soma/summary.json"
-        payload, failure = self._get_json(dataset, endpoint)
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
+            dataset, endpoint
+        )
         if failure:
             return failure
-        summaries = (payload or {}).get("soma", {}).get("summary", [])
-        if not isinstance(summaries, list):
+        if not isinstance(payload, Mapping):
+            return ProviderResult.failure(self.key, dataset, "invalid soma payload")
+        soma = payload.get("soma")
+        summaries = soma.get("summary") if isinstance(soma, Mapping) else None
+        if not isinstance(summaries, list) or not summaries:
             return ProviderResult.failure(self.key, dataset, "invalid soma.summary payload")
+        dated_summaries: list[tuple[date, Mapping[str, Any]]] = []
+        seen_dates: set[str] = set()
+        for item in summaries:
+            if not isinstance(item, Mapping):
+                return ProviderResult.failure(self.key, dataset, "invalid SOMA summary row")
+            raw_date = str(item.get("asOfDate") or "")
+            try:
+                as_of_date = date.fromisoformat(raw_date)
+            except ValueError as exc:
+                return ProviderResult.failure(
+                    self.key, dataset, f"invalid SOMA asOfDate: {exc}"
+                )
+            if raw_date != as_of_date.isoformat() or raw_date in seen_dates:
+                return ProviderResult.failure(
+                    self.key, dataset, "duplicate or non-canonical SOMA asOfDate"
+                )
+            emitted_total = False
+            for source_field in self.SOMA_SERIES:
+                raw_value = item.get(source_field)
+                if raw_value in (None, "", "."):
+                    continue
+                value = self._usd_millions(raw_value)
+                if value is None or not value.is_finite() or value < 0:
+                    return ProviderResult.failure(
+                        self.key, dataset, f"invalid SOMA amount: {source_field}"
+                    )
+                if source_field == "total":
+                    emitted_total = True
+            if not emitted_total:
+                return ProviderResult.failure(
+                    self.key, dataset, "SOMA summary row lacks total"
+                )
+            seen_dates.add(raw_date)
+            dated_summaries.append((as_of_date, item))
+        dated_summaries.sort(key=lambda item: item[0])
         if limit is not None:
-            summaries = summaries[-max(1, min(int(limit), 10000)) :]
+            dated_summaries = dated_summaries[-max(1, min(int(limit), 10000)) :]
 
         records: list[dict[str, Any]] = []
-        for item in summaries:
-            if not isinstance(item, Mapping) or not item.get("asOfDate"):
-                continue
+        for as_of_date, item in dated_summaries:
+            raw_date = as_of_date.isoformat()
+            emitted_total = False
             for source_field, series_id in self.SOMA_SERIES.items():
-                value = self._usd_millions(item.get(source_field))
-                if value is None:
+                raw_value = item.get(source_field)
+                if raw_value in (None, "", "."):
                     continue
+                value = self._usd_millions(raw_value)
+                if value is None or not value.is_finite() or value < 0:
+                    return ProviderResult.failure(
+                        self.key, dataset, f"invalid SOMA amount: {source_field}"
+                    )
+                if source_field == "total":
+                    emitted_total = True
                 records.append(
                     {
                         "series_id": series_id,
@@ -809,195 +1488,10 @@ class NYFedMarketsProvider(HTTPProvider):
                         },
                     }
                 )
-        return self._desk_result(
-            dataset=dataset,
-            records=records,
-            endpoint=endpoint,
-            amount_unit="USD millions",
-        )
-
-    def usd_fx_swaps(
-        self,
-        *,
-        limit: int = 500,
-        as_of: date | str | None = None,
-    ) -> ProviderResult:
-        """Normalize U.S.-dollar central-bank liquidity swap operations.
-
-        In addition to settlement-date drawdowns, emit an outstanding balance
-        for ``as_of`` using ``settlementDate <= as_of < maturityDate``.  Small
-        value exercises remain visible in a separate outstanding series.
-        """
-
-        limit = max(1, min(int(limit), 10000))
-        dataset = "fx-swaps:usdollar"
-        endpoint = f"/api/fxs/usdollar/last/{limit}.json"
-        if as_of is None:
-            as_of_date = datetime.now(self.market_timezone).date()
-        elif isinstance(as_of, datetime):
-            as_of_date = as_of.date()
-        elif isinstance(as_of, date):
-            as_of_date = as_of
-        else:
-            try:
-                as_of_date = date.fromisoformat(str(as_of))
-            except ValueError as exc:
-                return ProviderResult.failure(self.key, dataset, f"invalid as_of date: {exc}")
-
-        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
-            dataset, endpoint
-        )
-        if failure:
-            return failure
-        operations = (payload or {}).get("fxSwaps", {}).get("operations", [])
-        if not isinstance(operations, list):
-            return ProviderResult.failure(self.key, dataset, "invalid fxSwaps.operations payload")
-
-        parsed: list[dict[str, Any]] = []
-        for item in operations:
-            if not isinstance(item, Mapping):
-                continue
-            amount = self._usd_millions(item.get("amount"))
-            settlement = item.get("settlementDate")
-            maturity = item.get("maturityDate")
-            counterparty = str(item.get("counterparty") or "")
-            if amount is None or not settlement or not maturity or not counterparty:
-                continue
-            try:
-                settlement_date = date.fromisoformat(str(settlement))
-                maturity_date = date.fromisoformat(str(maturity))
-            except ValueError:
-                continue
-            parsed.append(
-                {
-                    "amount": amount,
-                    "counterparty": counterparty,
-                    "counterparty_code": self._counterparty_code(counterparty),
-                    "settlement_date": settlement_date,
-                    "maturity_date": maturity_date,
-                    "is_small_value": self._is_small_value_operation(item),
-                    "source": dict(item),
-                }
-            )
-
-        records: list[dict[str, Any]] = []
-        by_settlement: dict[date, list[dict[str, Any]]] = {}
-        for item in parsed:
-            by_settlement.setdefault(item["settlement_date"], []).append(item)
-        for settlement_date, daily_operations in by_settlement.items():
-            non_small_value_operations = [
-                item for item in daily_operations if not item["is_small_value"]
-            ]
-            small_value_operations = [
-                item for item in daily_operations if item["is_small_value"]
-            ]
-            records.append(
-                {
-                    "series_id": "FXSWAP-USD-DRAWDOWN",
-                    "date": settlement_date.isoformat(),
-                    "value": sum((item["amount"] for item in daily_operations), Decimal("0")),
-                    "metadata": {
-                        "unit": "USD millions",
-                        "operations": [item["source"] for item in daily_operations],
-                    },
-                }
-            )
-            records.extend(
-                [
-                    {
-                        "series_id": "FXSWAP-USD-DRAWDOWN-NON-SMALL-VALUE",
-                        "date": settlement_date.isoformat(),
-                        "value": sum(
-                            (item["amount"] for item in non_small_value_operations),
-                            Decimal("0"),
-                        ),
-                        "metadata": {
-                            "unit": "USD millions",
-                            "operations": [
-                                item["source"] for item in non_small_value_operations
-                            ],
-                            "small_value_excluded": True,
-                            "classification": "non-small-value",
-                        },
-                    },
-                    {
-                        "series_id": "FXSWAP-USD-DRAWDOWN-SMALL-VALUE",
-                        "date": settlement_date.isoformat(),
-                        "value": sum(
-                            (item["amount"] for item in small_value_operations),
-                            Decimal("0"),
-                        ),
-                        "metadata": {
-                            "unit": "USD millions",
-                            "operations": [item["source"] for item in small_value_operations],
-                            "small_value_only": True,
-                            "classification": "small-value-technical-exercise",
-                        },
-                    },
-                ]
-            )
-
-        active = [
-            item for item in parsed if item["settlement_date"] <= as_of_date < item["maturity_date"]
-        ]
-        common_metadata = {
-            "unit": "USD millions",
-            "as_of": as_of_date.isoformat(),
-            "formula": "settlementDate <= as_of < maturityDate",
-            "history_limit": limit,
-            "active_operations": [item["source"] for item in active],
-        }
-        records.append(
-            {
-                "series_id": "FXSWAP-USD-OUTSTANDING",
-                "date": as_of_date.isoformat(),
-                "value": sum((item["amount"] for item in active), Decimal("0")),
-                "metadata": common_metadata,
-            }
-        )
-        small_value = [item for item in active if item["is_small_value"]]
-        non_small_value = [item for item in active if not item["is_small_value"]]
-        records.append(
-            {
-                "series_id": "FXSWAP-USD-OUTSTANDING-NON-SMALL-VALUE",
-                "date": as_of_date.isoformat(),
-                "value": sum((item["amount"] for item in non_small_value), Decimal("0")),
-                "metadata": {
-                    **common_metadata,
-                    "active_operations": [item["source"] for item in non_small_value],
-                    "small_value_excluded": True,
-                },
-            }
-        )
-        records.append(
-            {
-                "series_id": "FXSWAP-USD-OUTSTANDING-SMALL-VALUE",
-                "date": as_of_date.isoformat(),
-                "value": sum((item["amount"] for item in small_value), Decimal("0")),
-                "metadata": {
-                    **common_metadata,
-                    "active_operations": [item["source"] for item in small_value],
-                    "small_value_only": True,
-                },
-            }
-        )
-        by_counterparty: dict[str, list[dict[str, Any]]] = {}
-        for item in active:
-            by_counterparty.setdefault(item["counterparty_code"], []).append(item)
-        for code, counterparty_operations in by_counterparty.items():
-            records.append(
-                {
-                    "series_id": f"FXSWAP-USD-{code}-OUTSTANDING",
-                    "date": as_of_date.isoformat(),
-                    "value": sum(
-                        (item["amount"] for item in counterparty_operations), Decimal("0")
-                    ),
-                    "metadata": {
-                        **common_metadata,
-                        "counterparty": counterparty_operations[0]["counterparty"],
-                    },
-                }
-            )
+            if not emitted_total:
+                return ProviderResult.failure(
+                    self.key, dataset, "SOMA summary row lacks total"
+                )
         return self._desk_result(
             dataset=dataset,
             records=records,
@@ -1005,8 +1499,122 @@ class NYFedMarketsProvider(HTTPProvider):
             raw_bytes=raw_bytes,
             response_metadata=response_metadata,
             amount_unit="USD millions",
-            outstanding_as_of=as_of_date.isoformat(),
         )
+
+    def usd_fx_swaps(
+        self,
+        *,
+        limit: int | None = None,
+        as_of: date | str | None = None,
+        start_date: date | str = "2007-01-01",
+        end_date: date | str | None = None,
+        date_type: str = "trade",
+    ) -> ProviderResult:
+        """Normalize U.S.-dollar central-bank liquidity swap operations.
+
+        Production uses the explicit search window. Passing ``limit`` keeps a
+        deliberately coverage-incomplete compatibility interface for fixtures
+        and callers that do not claim historical completeness.
+        """
+
+        dataset = "fx-swaps:usdollar"
+
+        def parsed_date(raw: date | str | None, *, default: date | None = None) -> date:
+            if raw is None:
+                if default is None:
+                    raise ValueError("date is required")
+                return default
+            if isinstance(raw, datetime):
+                return raw.date()
+            if isinstance(raw, date):
+                return raw
+            try:
+                value = date.fromisoformat(str(raw))
+            except ValueError as exc:
+                raise ValueError(f"invalid date: {exc}") from exc
+            if str(raw) != value.isoformat():
+                raise ValueError("date must use canonical YYYY-MM-DD form")
+            return value
+
+        today_et = datetime.now(self.market_timezone).date()
+        try:
+            if limit is not None:
+                resolved_limit = max(1, min(int(limit), 10000))
+                as_of_date = parsed_date(as_of, default=today_et)
+                endpoint = f"/api/fxs/usdollar/last/{resolved_limit}.json"
+                params = None
+                strict = False
+                coverage_start = None
+                coverage_end = None
+            else:
+                coverage_start = parsed_date(start_date)
+                coverage_end = parsed_date(end_date, default=today_et)
+                as_of_date = parsed_date(as_of, default=coverage_end)
+                if (
+                    date_type != "trade"
+                    or coverage_start > coverage_end
+                    or coverage_end > today_et
+                    or as_of_date != coverage_end
+                ):
+                    raise ValueError("USD swap search coverage window is invalid")
+                resolved_limit = None
+                endpoint = "/api/fxs/usdollar/search.json"
+                params = {
+                    "startDate": coverage_start.isoformat(),
+                    "endDate": coverage_end.isoformat(),
+                    "dateType": date_type,
+                }
+                strict = True
+        except (TypeError, ValueError) as exc:
+            return ProviderResult.failure(self.key, dataset, str(exc))
+
+        payload, raw_bytes, response_metadata, failure = self._get_json_with_raw(
+            dataset, endpoint, params=params
+        )
+        if failure:
+            return failure
+        acquired_at = datetime.now(UTC)
+        try:
+            parsed = self.validate_usd_fx_swap_operations(
+                payload,
+                strict=strict,
+                fetched_at=acquired_at,
+            )
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            return ProviderResult.failure(self.key, dataset, str(exc))
+        if strict and any(
+            item["trade_date"] is None
+            or item["trade_date"] < coverage_start
+            or item["trade_date"] > coverage_end
+            for item in parsed
+        ):
+            return ProviderResult.failure(
+                self.key,
+                dataset,
+                "USD swap search returned a row outside requested trade-date coverage",
+            )
+        records = self.usd_fx_swap_records(
+            parsed,
+            as_of_date=as_of_date,
+            history_limit=resolved_limit,
+        )
+        result = self._desk_result(
+            dataset=dataset,
+            records=records,
+            endpoint=endpoint,
+            raw_bytes=raw_bytes,
+            response_metadata=response_metadata,
+            amount_unit="USD millions",
+            outstanding_as_of=as_of_date.isoformat(),
+            coverage_mode="explicit-search" if strict else "limited-last-fixture",
+            coverage_complete=strict,
+            coverage_start=(coverage_start.isoformat() if coverage_start else None),
+            coverage_end=(coverage_end.isoformat() if coverage_end else None),
+            date_type=(date_type if strict else None),
+            returned_count=len(parsed),
+        )
+        result.fetched_at = acquired_at
+        return result
 
 
 class TreasuryRatesProvider(HTTPProvider):

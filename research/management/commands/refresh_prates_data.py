@@ -29,4 +29,8 @@ class Command(BaseCommand):
                 "PRATES ingestion completed but the required subsurface v1 "
                 "atomic publication failed"
             )
+        if "transmission-chain" in summary.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "PRATES ingestion completed but transmission-chain v1 remained stale"
+            )
         self.stdout.write(self.style.SUCCESS("PRATES IORB refresh completed"))

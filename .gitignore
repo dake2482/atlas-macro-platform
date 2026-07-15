@@ -14,6 +14,8 @@ venv/
 # Django
 db.sqlite3
 db.sqlite3-*
+*.sqlite3
+*.sqlite3-*
 staticfiles/
 media/
 
@@ -26,6 +28,9 @@ celerybeat-schedule
 celerybeat-schedule.*
 artifacts/
 data/
+runtime/
+*.pem
+*.key
 
 # Build and packaging
 build/

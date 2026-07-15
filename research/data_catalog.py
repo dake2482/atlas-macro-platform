@@ -331,6 +331,20 @@ DATA_REQUIREMENTS = [
         "priority": 1,
     },
     {
+        "key": "fed-h10-global-dollar-reference",
+        "page_key": "global-dollar",
+        "metric_name": "广义美元指数与 EUR/USD、USD/CNY、USD/JPY 日频参考值",
+        "status": LIVE,
+        "source_name": "Federal Reserve H.10 Data Download Program",
+        "source_url": "https://www.federalreserve.gov/datadownload/Choose.aspx?rel=H10",
+        "reason": (
+            "global-dollar v1 保存并复核完整 H.10 ZIP、唯一根目录 XML member、"
+            "Prepared 发布时间、Board series 属性和四条序列最新有效日；"
+            "广义美元是官方日频参考指数，不是 ICE DXY 或可交易实时现货。"
+        ),
+        "priority": 1,
+    },
+    {
         "key": "cross-currency-basis",
         "page_key": "global-dollar",
         "metric_name": "1M/3M/1Y 跨币种基差",
@@ -355,10 +369,69 @@ DATA_REQUIREMENTS = [
         "source_name": "Federal Reserve Bank of New York FX Swaps API",
         "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
         "reason": (
-            "按 settlementDate ≤ as_of < maturityDate 计算在途余额，"
-            "small-value 技术测试单列且不进入压力解读。"
+            "生产只接受 2007-01-01 至采集日、dateType=trade 的官方"
+            "search 完整响应，并用最早交易日、历史 BOJ/ECB 记录和"
+            "保守行数下限防止 last/N 被伪装成全量。在途余额按 "
+            "settlementDate ≤ as_of < maturityDate 计算，small-value 技术测试"
+            "单列且不进入压力解读。"
         ),
         "priority": 2,
+    },
+    {
+        "key": "fed-h41-usd-swap-witness",
+        "page_key": "global-dollar",
+        "metric_name": "H.4.1 SWPT 央行流动性互换余额交叉见证",
+        "status": NEEDS_SOURCE,
+        "source_name": "Federal Reserve H.4.1 Data Download Program",
+        "source_url": "https://www.federalreserve.gov/releases/h41/",
+        "reason": (
+            "SWPT 可作为 NY Fed 操作明细派生在途余额的独立官方"
+            "总量见证；完成精确日期对齐、单位和修订政策审核前"
+            "不进入 v1 发布公式。"
+        ),
+        "priority": 2,
+    },
+    {
+        "key": "bis-global-liquidity-structural",
+        "page_key": "global-dollar",
+        "metric_name": "BIS 全球流动性指标的结构性美元信用",
+        "status": NEEDS_SOURCE,
+        "source_name": "Bank for International Settlements Global Liquidity Indicators",
+        "source_url": "https://www.bis.org/statistics/gli.htm",
+        "reason": (
+            "季度跨境美元信用适合作为中长期结构背景，需完成"
+            "SDMX 版本、修订、地区和工具口径契约；它不是实时"
+            "cross-currency basis 或交易信号。"
+        ),
+        "priority": 3,
+    },
+    {
+        "key": "imf-cofer-dollar-reserves-structural",
+        "page_key": "global-dollar",
+        "metric_name": "IMF COFER 官方外汇储备的美元份额",
+        "status": NEEDS_SOURCE,
+        "source_name": "International Monetary Fund COFER",
+        "source_url": "https://data.imf.org/COFER",
+        "reason": (
+            "季度储备币种构成是美元地位的结构性背景，需审核"
+            "SDMX 接口、币值/份额口径与修订标记；不得用来"
+            "填充缺失的离岸美元基差。"
+        ),
+        "priority": 3,
+    },
+    {
+        "key": "treasury-tic-dollar-flows-structural",
+        "page_key": "global-dollar",
+        "metric_name": "U.S. Treasury TIC 跨境证券与银行资金流",
+        "status": NEEDS_SOURCE,
+        "source_name": "U.S. Department of the Treasury TIC System",
+        "source_url": "https://home.treasury.gov/data/treasury-international-capital-tic-system",
+        "reason": (
+            "TIC 月度流量与头寸是跨境美元需求的滞后结构证据，"
+            "需完成表间净额、修订、发布日与观察期契约；它不是"
+            "跨币种掉期曲线。"
+        ),
+        "priority": 3,
     },
     {
         "key": "economy-official-component-composite",
@@ -1126,23 +1199,198 @@ DATA_REQUIREMENTS = [
         "priority": 2,
     },
     {
-        "key": "fx-market-data",
+        "key": "fx-ice-dxy",
         "page_key": "assets-fx",
-        "metric_name": "主要货币现货、远期点与美元指数",
+        "metric_name": "ICE U.S. Dollar Index (DXY)",
         "status": PURCHASE_REQUIRED,
-        "vendor": "CME EBS / Cboe FX / LSEG / ICE for DXY",
-        "product": "FX spot, forwards and branded-index display rights",
-        "reason": "FX 无统一官方 tape，DXY 与远期/基差需独立授权。",
-        "proxy_description": "Fed H.10 或央行参考汇率可作为日频现货代理并清晰标注。",
+        "vendor": "ICE Data Services",
+        "product": "ICE DXY public display and derived-data licence",
+        "reason": "H.10 Broad Dollar 不是 ICE DXY；品牌指数数值和派生展示权需单独授权。",
+        "priority": 1,
+    },
+    {
+        "key": "fx-executable-spot",
+        "page_key": "assets-fx",
+        "metric_name": "可执行机构外汇现货",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "CME EBS / Cboe FX / LSEG / Bloomberg Enterprise",
+        "product": "Executable institutional spot with public-display rights",
+        "reason": "H.10 是日频参考值，不是可成交 bid/ask 或实时现货报价。",
+        "priority": 1,
+    },
+    {
+        "key": "fx-offshore-cnh",
+        "page_key": "assets-fx",
+        "metric_name": "离岸 USD/CNH",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "CME EBS / Cboe FX / LSEG / Bloomberg Enterprise",
+        "product": "Licensed offshore CNH spot and historical storage",
+        "reason": "H.10 的 USD/CNY 不是离岸 CNH，不得用 CNY 冒充 CNH。",
+        "priority": 1,
+    },
+    {
+        "key": "fx-forwards-ndf",
+        "page_key": "assets-fx",
+        "metric_name": "外汇远期点与 NDF",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "CME EBS / Cboe FX / LSEG / Bloomberg Enterprise",
+        "product": "FX forwards and NDF curves with derived-display rights",
+        "reason": "远期与 NDF 不能从 H.10 现期参考值伪造。",
+        "priority": 1,
+    },
+    {
+        "key": "fx-cross-currency-basis",
+        "page_key": "assets-fx",
+        "metric_name": "Cross-currency basis / FX swap implied funding",
+        "status": LICENSE_REVIEW,
+        "vendor": "LSEG / Bloomberg / authorised derived-data provider",
+        "product": "Cross-currency basis with public derived-display permission",
+        "reason": "基差和隐含美元融资需独立数据与公开派生展示权。",
+        "priority": 1,
+    },
+    {
+        "key": "fx-order-book-dealer",
+        "page_key": "assets-fx",
+        "metric_name": "外汇订单簿与 dealer 微观结构",
+        "status": LICENSE_REVIEW,
+        "vendor": "CME EBS / Cboe FX / licensed dealer composite",
+        "product": "Order-book depth or dealer composite redistribution rights",
+        "reason": "深度、点差与 dealer 流量不在 H.10 合同中，需逐场所审核。",
         "priority": 2,
     },
     {
-        "key": "liquidity-transmission-inputs",
+        "key": "transmission-official-evidence-v1",
         "page_key": "transmission-chain",
-        "metric_name": "六层流动性传导链完整输入",
+        "metric_name": "六层官方证据链 v1 直接输入",
+        "status": LIVE,
+        "source_name": (
+            "Federal Reserve H.4.1, H.8, PRATES and H.10; New York Fed "
+            "Markets API; Treasury FiscalData and Treasury rates"
+        ),
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": (
+            "父页只原子组合六个已审核子合同，并对账 H.4.1、ON RRP、SOFR、"
+            "IORB、SRF 与美元互换的 exact source/dataset/run/batch；LIVE 不代表"
+            "完整金融条件指数或官方压力指标。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "transmission-transparent-proxies-v1",
+        "page_key": "transmission-chain",
+        "metric_name": "净流动性、准备金覆盖与资金市场透明派生值",
+        "status": PROXY,
+        "source_name": "Atlas Macro transparent calculations over official inputs",
+        "source_url": "https://www.federalreserve.gov/releases/h41/",
+        "reason": (
+            "净流动性、准备金覆盖、8 周变化、SOFR 利差、60 日成交量 Z-score "
+            "与 H.10 五日变化均保留公式和 exact input lineage；这些数值不是"
+            "Federal Reserve 官方指标，也不生成分数或交易信号。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "transmission-legacy-score-methodology",
+        "page_key": "transmission-chain",
+        "metric_name": "总压力分、六层分、阈值与共振方法",
         "status": NEEDS_SOURCE,
-        "source_name": "NY Fed, Federal Reserve H.4.1, Treasury plus licensed FX/volatility/credit inputs",
-        "reason": "SOFR/EFFR/IORB 已接入，但离岸基差、AOCI、中介能力与资产反应仍缺授权输入。",
+        "source_name": "Reviewed independent methodology required",
+        "reason": (
+            "没有可复算且经审核的方法、校准样本和版本合同；v1 不反推或发布"
+            " normal/tight/stress、共振结论、行动建议或伪精确分数。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "transmission-energy-official-method",
+        "page_key": "transmission-chain",
+        "metric_name": "能源层 EIA exact series 与转换方法",
+        "status": NEEDS_SOURCE,
+        "source_name": "U.S. Energy Information Administration",
+        "source_url": "https://www.eia.gov/opendata/",
+        "reason": (
+            "必须先确定 exact series、频率对齐、单位转换和可复算方法，不能用"
+            "任意油气价格拼成能源压力层。"
+        ),
+        "priority": 2,
+    },
+    {
+        "key": "transmission-energy-display-rights",
+        "page_key": "transmission-chain",
+        "metric_name": "能源官方数据再展示许可",
+        "status": LICENSE_REVIEW,
+        "source_name": "U.S. Energy Information Administration",
+        "source_url": "https://www.eia.gov/about/copyrights_reuse.php",
+        "reason": "exact series 与公开再展示边界完成审核前，不进入父页 LIVE 合同。",
+        "priority": 2,
+    },
+    {
+        "key": "transmission-cross-currency-basis",
+        "page_key": "transmission-chain",
+        "metric_name": "1M/3M/1Y cross-currency basis 与 dealer implied funding",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "LSEG / Bloomberg / CME EBS",
+        "product": "Cross-currency basis, forward points and public-derived-display rights",
+        "reason": "商业 OTC/交易场所数据不能由 H.10 参考汇率或自造数值替代。",
+        "priority": 1,
+    },
+    {
+        "key": "transmission-bank-capacity-official",
+        "page_key": "transmission-chain",
+        "metric_name": "AOCI、HTM/AFS、资本、LCR 与放贷能力解释",
+        "status": NEEDS_SOURCE,
+        "source_name": "FFIEC aggregate regulatory reports",
+        "source_url": "https://cdr.ffiec.gov/public/",
+        "reason": (
+            "需建立 FFIEC 聚合口径、修订、银行范围和可解释性合同；准备金覆盖"
+            "代理不能升级成银行放贷能力或资本充足结论。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "transmission-intermediary-candidate-evidence",
+        "page_key": "transmission-chain",
+        "metric_name": "交易商活动与结算摩擦候选代理",
+        "status": NEEDS_SOURCE,
+        "source_name": "NY Fed Primary Dealer, SCOOS and OFR repo candidates",
+        "source_url": "https://www.newyorkfed.org/markets/primarydealer_statistics",
+        "reason": (
+            "需独立 provider、suppression/null 处理、不可变 artifact、exact-set 和"
+            "失败保留合同；即使接入也只能称交易商活动与结算摩擦。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "transmission-intermediary-candidate-licence",
+        "page_key": "transmission-chain",
+        "metric_name": "交易商候选代理再展示许可",
+        "status": LICENSE_REVIEW,
+        "source_name": "NY Fed, Federal Reserve and Office of Financial Research",
+        "source_url": "https://www.financialresearch.gov/data/",
+        "reason": "来源、派生展示和历史存储边界审核完成前不并入 v1 父合同。",
+        "priority": 2,
+    },
+    {
+        "key": "transmission-market-microstructure",
+        "page_key": "transmission-chain",
+        "metric_name": "dealer books、haircuts、specials、bid/ask 与 basis inventory",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "DTCC / LSEG / Bloomberg / licensed dealer-market provider",
+        "product": "Repo and Treasury microstructure with external-display rights",
+        "reason": "官方聚合统计不提供交易商账簿、实时 haircut、specials 或市场冲击。",
+        "priority": 1,
+    },
+    {
+        "key": "transmission-complete-asset-response",
+        "page_key": "transmission-chain",
+        "metric_name": "完整信用、波动率、权益、商品与可交易 FX 资产反应",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "ICE / Cboe / LSEG / licensed multi-asset provider",
+        "product": "OAS/CDX, VIX/MOVE and cross-asset market data with display rights",
+        "reason": (
+            "Treasury 与 H.10 只覆盖部分官方参考序列；完整资产反应不能用静态"
+            "代理、无授权指数或单一官方参考值冒充。"
+        ),
         "priority": 1,
     },
     {
@@ -1164,13 +1412,76 @@ DATA_REQUIREMENTS = [
         "priority": 1,
     },
     {
-        "key": "nyfed-market-operations",
+        "key": "operations-treasury-purchases-official",
         "page_key": "operations",
-        "metric_name": "Repo/RRP 操作、SRF 与 SOMA 明细",
+        "metric_name": "国债二级市场购买结果",
         "status": LIVE,
-        "source_name": "Federal Reserve Bank of New York Markets API",
+        "source_name": "Federal Reserve Bank of New York Treasury Purchase Results",
         "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
-        "reason": "已按操作日汇总 ON RRP 与常备回购，合并早午两场；SOMA 按周保留证券分项。",
+        "reason": (
+            "保留 direction=P、Results、提交/接受额、结算日和期限范围；"
+            "feed 不披露稳定用途或 small-value 标志。"
+        ),
+        "priority": 1,
+    },
+    {
+        "key": "operations-onrrp-official",
+        "page_key": "operations",
+        "metric_name": "ON RRP 固定利率操作结果",
+        "status": LIVE,
+        "source_name": "Federal Reserve Bank of New York Reverse Repo Results",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "按官方 note/SVE 证据分离正常操作与 small-value 技术测试。",
+        "priority": 1,
+    },
+    {
+        "key": "operations-srf-official",
+        "page_key": "operations",
+        "metric_name": "Standing Repo Facility 操作结果",
+        "status": LIVE,
+        "source_name": "Federal Reserve Bank of New York Standing Repo Results",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "合并当日操作场次，保留抵押品、利率及 SVE 分区。",
+        "priority": 1,
+    },
+    {
+        "key": "operations-soma-official",
+        "page_key": "operations",
+        "metric_name": "SOMA 国内证券持仓及分项",
+        "status": LIVE,
+        "source_name": "Federal Reserve Bank of New York SOMA Holdings",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "保留周度总额、Bills、Notes/Bonds、TIPS、FRN、MBS 等官方分项。",
+        "priority": 1,
+    },
+    {
+        "key": "operations-transparent-formulas",
+        "page_key": "operations",
+        "metric_name": "30D 购买、SRF 激活日与 SOMA 周变化",
+        "status": LIVE,
+        "source_name": "Atlas Macro transparent calculations over NY Fed operations",
+        "source_url": "https://markets.newyorkfed.org/static/docs/markets-api.html",
+        "reason": "只使用完整精确批次与自然日闭区间，不填充周末、节假日或无操作日。",
+        "priority": 1,
+    },
+    {
+        "key": "operations-rmp-only-purpose",
+        "page_key": "operations",
+        "metric_name": "精确 RMP-only 购买接受额",
+        "status": NEEDS_SOURCE,
+        "source_name": "NY Fed purpose field or reviewed schedule mapping",
+        "source_url": "https://www.newyorkfed.org/markets/desk-operations/treasury-securities",
+        "reason": "结果行混合 RMP、本金再投资及可能的操作演练，当前无可靠逐场用途字段。",
+        "priority": 1,
+    },
+    {
+        "key": "operations-dealer-order-book",
+        "page_key": "operations",
+        "metric_name": "交易商报价、订单簿、相对价值与市场冲击",
+        "status": PURCHASE_REQUIRED,
+        "vendor": "Bloomberg / LSEG / Tradeweb / CME BrokerTec",
+        "product": "Licensed dealer and Treasury-market microstructure data with public-display rights",
+        "reason": "免费官方结果不包含交易商级订单簿、低延迟成交或市场冲击数据。",
         "priority": 1,
     },
     {

@@ -679,14 +679,19 @@ def test_subsurface_latest_failed_attempt_retains_stale_then_same_value_recovers
     )
 
     assert recovered_stale == set()
-    assert recovered_dashboards == []
+    assert len(recovered_dashboards) == 1
+    recovered = recovered_dashboards[0]
     first.refresh_from_db()
-    assert first.quality_status == Observation.Quality.ESTIMATED
-    assert "refresh_failure" not in first.data
-    assert set(first.data["component_batches"]) == {
+    assert first.quality_status == Observation.Quality.STALE
+    assert "refresh_failure" in first.data
+    assert recovered.pk != first.pk
+    assert recovered.batch_id != first.batch_id
+    assert recovered.data["fingerprint"] == first.data["fingerprint"]
+    assert "refresh_failure" not in recovered.data
+    assert set(recovered.data["component_batches"]) == {
         str(run.batch_id) for run in recovered_runs.values()
     }
-    assert select_public_subsurface_snapshot().pk == first.pk
+    assert select_public_subsurface_snapshot().pk == recovered.pk
 
 
 @pytest.mark.django_db

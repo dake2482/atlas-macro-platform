@@ -31,4 +31,24 @@ class Command(BaseCommand):
                 "Official ingestion completed but the required subsurface v1 "
                 "atomic publication failed"
             )
+        if "operations" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but the required operations v1 "
+                "atomic publication failed"
+            )
+        if "assets-fx" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but the required assets-fx v1 "
+                "snapshot is stale or unavailable"
+            )
+        if "global-dollar" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but the required global-dollar v1 "
+                "atomic publication failed"
+            )
+        if "transmission-chain" in result.get("stale_dashboard_keys", []):
+            raise CommandError(
+                "Official ingestion completed but transmission-chain v1 could "
+                "not publish or retain a fully audited current snapshot"
+            )
         self.stdout.write(self.style.SUCCESS("Official source refresh completed"))

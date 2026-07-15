@@ -29,6 +29,7 @@ from research.official_data import (
     _coordinate_reserves_dashboard,
     _fresh_until,
     _reserves_page_contract_is_buildable,
+    _reserves_snapshot_contract_is_valid,
     _store_h8_observations,
     _store_h41_observations,
     publish_official_dashboards,
@@ -537,19 +538,36 @@ def _record_reserves_runs(
     proportional: bool = False,
     h41_metadata: dict | None = None,
     h8_metadata: dict | None = None,
+    omit_common_periods: set[date] | None = None,
 ):
     fetched_at = datetime(2026, 7, 10, 20, tzinfo=UTC)
+    omitted = omit_common_periods or set()
+    h41_records = [
+        row
+        for row in _weekly_records(
+            "WRBWFRBL",
+            count=count,
+            end=h41_end or end,
+            proportional=proportional,
+        )
+        if date.fromisoformat(row["date"]) not in omitted
+    ]
+    h8_records = [
+        row
+        for row in _weekly_records(
+            "H8-B1151NCBA",
+            count=count,
+            end=h8_end or end,
+            proportional=proportional,
+        )
+        if date.fromisoformat(row["date"]) not in omitted
+    ]
     h41 = record_provider_result(
         ProviderResult(
             provider="federal-reserve",
             dataset="h41",
             fetched_at=fetched_at,
-            records=_weekly_records(
-                "WRBWFRBL",
-                count=count,
-                end=h41_end or end,
-                proportional=proportional,
-            ),
+            records=h41_records,
             metadata={
                 "reserves_refresh_id": "h41-fixture",
                 "prepared_at": "2026-07-10T19:00:00+00:00",
@@ -563,12 +581,7 @@ def _record_reserves_runs(
             provider="federal-reserve",
             dataset="h8",
             fetched_at=fetched_at,
-            records=_weekly_records(
-                "H8-B1151NCBA",
-                count=count,
-                end=h8_end or end,
-                proportional=proportional,
-            ),
+            records=h8_records,
             metadata={
                 "reserves_refresh_id": "h8-fixture",
                 "prepared_at": "2026-07-10T19:30:00+00:00",
@@ -578,15 +591,6 @@ def _record_reserves_runs(
         persist=_store_h8_observations,
     )
     return {"h41": h41, "h8": h8}
-
-
-def _delete_common_period(runs, period: date) -> None:
-    value_date = datetime.combine(period, datetime.min.time(), tzinfo=UTC)
-    for run in runs.values():
-        Observation.objects.filter(
-            batch_id=run.batch_id,
-            value_date=value_date,
-        ).delete()
 
 
 @pytest.fixture(autouse=True)
@@ -704,6 +708,58 @@ def test_reserves_v1_publishes_two_exact_batches_and_recomputable_statistics():
 
 
 @pytest.mark.django_db
+def test_reserves_strict_rebuild_rejects_exact_h8_tamper_even_when_expired(
+    monkeypatch,
+):
+    runs = _record_reserves_runs()
+    dashboards, stale = _coordinate_reserves_dashboard([runs["h8"]])
+    assert stale == set()
+    snapshot = dashboards[0]
+    assert _reserves_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+    )
+
+    expired_now = FIXED_NOW + timedelta(days=45)
+    monkeypatch.setattr(
+        "research.official_data.timezone.now", lambda: expired_now
+    )
+    assert not _reserves_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+    )
+    assert _reserves_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+        allow_expired=True,
+    )
+
+    h8_observation = Observation.objects.filter(
+        series__key="h8-b1151ncba",
+        batch_id=runs["h8"].batch_id,
+    ).latest("value_date", "id")
+    original_value = h8_observation.value
+    h8_observation.value = original_value + Decimal("1")
+    h8_observation.save(update_fields=["value", "updated_at"])
+    assert not _reserves_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+        allow_expired=True,
+    )
+
+    h8_observation.value = original_value
+    h8_observation.fetched_at = expired_now + timedelta(minutes=1)
+    h8_observation.save(
+        update_fields=["value", "fetched_at", "updated_at"]
+    )
+    assert not _reserves_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+        allow_expired=True,
+    )
+
+
+@pytest.mark.django_db
 def test_reserves_generic_publication_cannot_publish_legacy_single_source_snapshot():
     runs = _record_reserves_runs()
 
@@ -807,7 +863,7 @@ def test_reserves_route_renders_retained_stale_v1_lineage_and_failure(client):
 
 
 @pytest.mark.django_db
-def test_reserves_same_content_refresh_is_idempotent_and_clears_failure():
+def test_reserves_same_content_recovery_is_append_only_and_clears_failure():
     runs = _record_reserves_runs()
     _coordinate_reserves_dashboard([runs["h8"]])
     first = DashboardSnapshot.objects.get(key="reserves")
@@ -828,12 +884,17 @@ def test_reserves_same_content_refresh_is_idempotent_and_clears_failure():
     recovered = _record_reserves_runs()
     dashboards, stale = _coordinate_reserves_dashboard([recovered["h8"]])
     first.refresh_from_db()
-    assert dashboards == []
+    assert len(dashboards) == 1
     assert stale == set()
-    assert DashboardSnapshot.objects.filter(key="reserves").count() == 1
-    assert first.quality_status == Observation.Quality.ESTIMATED
-    assert "refresh_failure" not in first.data
-    assert set(first.data["component_batches"]) == {
+    assert DashboardSnapshot.objects.filter(key="reserves").count() == 2
+    replacement = dashboards[0]
+    assert replacement.pk != first.pk
+    assert replacement.batch_id != first.batch_id
+    assert first.quality_status == Observation.Quality.STALE
+    assert "refresh_failure" in first.data
+    assert replacement.quality_status == Observation.Quality.ESTIMATED
+    assert "refresh_failure" not in replacement.data
+    assert set(replacement.data["component_batches"]) == {
         str(recovered["h41"].batch_id),
         str(recovered["h8"].batch_id),
     }
@@ -975,9 +1036,11 @@ def test_reserves_rejects_insufficient_sample_and_zero_variance():
 
 @pytest.mark.django_db
 def test_reserves_8w_change_uses_exact_calendar_lag_across_a_missing_week():
-    runs = _record_reserves_runs(count=70)
     missing_period = LATEST_WEDNESDAY - timedelta(weeks=4)
-    _delete_common_period(runs, missing_period)
+    runs = _record_reserves_runs(
+        count=70,
+        omit_common_periods={missing_period},
+    )
 
     dashboards, stale = _coordinate_reserves_dashboard([runs["h8"]])
 
@@ -1023,9 +1086,11 @@ def test_reserves_fails_closed_when_current_exact_56_day_lag_is_missing():
     _coordinate_reserves_dashboard([baseline["h8"]])
     snapshot = DashboardSnapshot.objects.get(key="reserves")
 
-    candidate = _record_reserves_runs(count=70)
-    _delete_common_period(
-        candidate, LATEST_WEDNESDAY - timedelta(days=56)
+    candidate = _record_reserves_runs(
+        count=70,
+        omit_common_periods={
+            LATEST_WEDNESDAY - timedelta(days=56)
+        },
     )
     dashboards, stale = _coordinate_reserves_dashboard([candidate["h8"]])
 

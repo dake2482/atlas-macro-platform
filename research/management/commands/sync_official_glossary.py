@@ -167,8 +167,9 @@ OFFICIAL_GLOSSARY_TERMS = (
         ),
         "formula": "政策工具 → 隔夜利率 → 金融条件 → 支出与投资 → 就业与通胀",
         "interpretation": (
-            "传导具有时滞、时变性和不确定性；页面的分层评分是研究框架，"
-            "不应被解读为联储发布的官方指数。"
+            "传导具有时滞、时变性和不确定性。Atlas Macro 页面以"
+            "六个异频官方组件、透明公式、共享输入对账和缺口台账"
+            "组织证据；每项解释限于已列组件口径和语义边界。"
         ),
         "tags": ["monetary policy", "financial conditions", "transmission"],
         "source_url": "https://www.federalreserve.gov/newsevents/speech/jefferson20230327a.htm",

@@ -9,16 +9,23 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import io
 import json
 import uuid
+import zipfile
+from collections import defaultdict
 from collections.abc import Iterable
 from copy import deepcopy
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 from dateutil.relativedelta import relativedelta
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -32,7 +39,10 @@ from .fed_h8 import (
     FederalReserveH8Provider,
     validate_h8_release_time,
 )
-from .fed_h10 import FederalReserveH10Provider
+from .fed_h10 import (
+    H10_TARGET_SERIES,
+    FederalReserveH10Provider,
+)
 from .fed_h41 import (
     H41_MAX_RELEASE_LAG_DAYS,
     H41_RELEASE_FRESHNESS_DAYS,
@@ -127,13 +137,7 @@ FRESHNESS_DAYS = {
     "annual": 400,
 }
 
-CORE_PUBLICATION_KEYS = frozenset(
-    {
-        "transmission-chain",
-        "operations",
-        "global-dollar",
-    }
-)
+CORE_PUBLICATION_KEYS = frozenset()
 AUCTION_CONTRACT_VERSION = 1
 RRP_TGA_CONTRACT_VERSION = 1
 AUCTION_DATASET = (
@@ -222,8 +226,596 @@ SUBSURFACE_FORMULAS = {
         "FXSWAP-USD-OUTSTANDING - FXSWAP-USD-OUTSTANDING-SMALL-VALUE"
     ),
 }
+OPERATIONS_CONTRACT_VERSION = 1
+OPERATIONS_DATASETS = {
+    "treasury": ("ny-fed-markets", "treasury:purchases"),
+    "onrrp": ("ny-fed-markets", "repo:reverse-repo-fixed-results"),
+    "srf": (
+        "ny-fed-markets",
+        "repo:standing-repo-full-allotment-results",
+    ),
+    "soma": ("ny-fed-markets", "soma:summary"),
+}
+OPERATIONS_REQUIRED_METRIC_KEYS = frozenset(
+    {
+        "treasury-purchase-latest",
+        "treasury-purchases-30d",
+        "onrrp-non-small-value-total",
+        "onrrp-rate",
+        "onrrp-participants",
+        "srf-non-small-value-total",
+        "srf-rate",
+        "srf-active-days-30d",
+        "soma-total",
+        "soma-weekly-change",
+    }
+)
+OPERATIONS_REQUIRED_CHART_KEYS = frozenset(
+    {
+        "operations-treasury-purchases-history",
+        "operations-standing-tools-history",
+        "operations-soma-history",
+    }
+)
+OPERATIONS_REQUIRED_SECTION_KEYS = frozenset(
+    {
+        "recent-treasury-purchase-operations",
+        "recent-repo-reverse-repo-operations",
+    }
+)
+OPERATIONS_REQUIRED_SERIES = {
+    "treasury": frozenset({"treasury-purchases"}),
+    "onrrp": frozenset(
+        {
+            "onrrp",
+            "onrrp-non-small-value-total",
+            "onrrp-small-value-total",
+            "onrrp-rate",
+            "onrrp-participants",
+        }
+    ),
+    "srf": frozenset(
+        {
+            "srp",
+            "srp-non-small-value-total",
+            "srp-small-value-total",
+            "srp-non-small-value-treasury",
+            "srp-non-small-value-agency",
+            "srp-non-small-value-mbs",
+            "srp-non-small-value-rate",
+        }
+    ),
+    "soma": frozenset(
+        {
+            "soma-total",
+            "soma-bills",
+            "soma-notes-bonds",
+            "soma-tips",
+            "soma-frn",
+            "soma-tips-inflation-compensation",
+            "soma-mbs",
+            "soma-cmbs",
+            "soma-agencies",
+        }
+    ),
+}
+OPERATIONS_ALLOWED_SERIES = {
+    "treasury": OPERATIONS_REQUIRED_SERIES["treasury"],
+    "onrrp": OPERATIONS_REQUIRED_SERIES["onrrp"]
+    | frozenset({"onrrp-bank", "onrrp-gse", "onrrp-mmf", "onrrp-pd"}),
+    "srf": OPERATIONS_REQUIRED_SERIES["srf"]
+    | frozenset({"srp-treasury", "srp-agency", "srp-mbs", "srp-rate"}),
+    "soma": OPERATIONS_REQUIRED_SERIES["soma"],
+}
+OPERATIONS_FORMULAS = {
+    "treasury-purchase-latest": (
+        "sum(totalParAmtAccepted) on latest official purchase operation date"
+    ),
+    "treasury-purchases-30d": (
+        "sum(TREASURY-PURCHASES[d]) for d in [latest-29d, latest]"
+    ),
+    "onrrp-non-small-value-total": (
+        "ONRRP - ONRRP-SMALL-VALUE-TOTAL"
+    ),
+    "srf-non-small-value-total": "SRP - SRP-SMALL-VALUE-TOTAL",
+    "srf-active-days-30d": (
+        "sum(1[daily non-small-value accepted > 0]) over [latest-29d,latest]"
+    ),
+    "soma-weekly-change": "SOMA-TOTAL(t) - SOMA-TOTAL(t-1 official release)",
+}
+ASSETS_FX_CONTRACT_VERSION = 1
+ASSETS_FX_FORMULA_VERSION = "federal-reserve-h10-reference-v1"
+ASSETS_FX_TITLE = "Federal Reserve H.10 FX References"
+ASSETS_FX_SUMMARY = (
+    "Federal Reserve H.10 Nominal Broad Dollar Index and daily EUR/USD, "
+    "USD/CNY and USD/JPY reference rates, with Atlas Macro transparent "
+    "one-observation changes. These are not ICE DXY, CNH, executable spot, "
+    "forwards/NDF, cross-currency basis, order-book data or a trading signal."
+)
+ASSETS_FX_DATASET = ("federal-reserve", "h10")
+ASSETS_FX_REQUIRED_METRIC_KEYS = frozenset(
+    {
+        "h10-broad-dollar",
+        "h10-eurusd",
+        "h10-usdcny",
+        "h10-usdjpy",
+    }
+)
+ASSETS_FX_REQUIRED_CHART_KEYS = frozenset(
+    {
+        "fx-broad-dollar-history",
+        "fx-major-reference-rates-usd-strength-rebased",
+    }
+)
+ASSETS_FX_REQUIRED_SECTION_KEYS = frozenset(
+    {
+        "recent-h10-reference-observations",
+        "source-freshness-methodology",
+        "licensed-fx-market-gaps",
+    }
+)
+ASSETS_FX_CHANGE_FORMULA = "100 * (current / previous_valid - 1)"
+ASSETS_FX_FORMULAS = {
+    key: ASSETS_FX_CHANGE_FORMULA for key in sorted(ASSETS_FX_REQUIRED_METRIC_KEYS)
+}
+ASSETS_FX_RECENT_COLUMNS = (
+    "date",
+    "broad-dollar",
+    "eur-usd",
+    "usd-cny",
+    "usd-jpy",
+    "quality",
+    "batch",
+)
+ASSETS_FX_METHODOLOGY_COLUMNS = (
+    "source-dataset",
+    "run-batch",
+    "prepared",
+    "fetched",
+    "latest-dates",
+    "fresh-until",
+    "archive",
+    "member",
+    "row-count",
+    "licence",
+    "fallback",
+)
+ASSETS_FX_GAP_COLUMNS = (
+    "market-data",
+    "status",
+    "public-value",
+    "purchase-guidance",
+)
+ASSETS_FX_GAPS = (
+    (
+        "ICE DXY",
+        "PURCHASE_REQUIRED",
+        "ICE Data Services DXY display and derived-data licence",
+    ),
+    (
+        "Executable institutional spot",
+        "PURCHASE_REQUIRED",
+        "CME EBS, Cboe FX, LSEG or Bloomberg Enterprise",
+    ),
+    (
+        "Offshore USD/CNH",
+        "PURCHASE_REQUIRED",
+        "Licensed institutional CNH venue or enterprise FX feed",
+    ),
+    (
+        "FX forwards / NDF",
+        "PURCHASE_REQUIRED",
+        "CME EBS, Cboe FX, LSEG or Bloomberg Enterprise",
+    ),
+    (
+        "Cross-currency basis / FX-swap implied funding",
+        "LICENSE_REVIEW",
+        "LSEG, Bloomberg or a vendor granting public derived display",
+    ),
+    (
+        "Order-book / dealer microstructure",
+        "LICENSE_REVIEW",
+        "Venue depth or dealer composite with redistribution rights",
+    ),
+)
+ASSETS_FX_SEMANTIC_BOUNDARY = (
+    "Official H.10 daily reference levels and transparent arithmetic only; "
+    "not ICE DXY, CNH, executable spot, forwards/NDF, cross-currency basis, "
+    "dealer/order-book microstructure, offshore-dollar pressure or a trade signal."
+)
+ASSETS_FX_PAYLOAD_KEYS = frozenset(
+    {
+        "demo",
+        "metrics",
+        "charts",
+        "chart_data",
+        "sections",
+        "component_batches",
+        "source_keys",
+        "required_notices",
+        "fresh_until",
+        "publication_batch_id",
+        "contract_version",
+        "formula_version",
+        "formulas",
+        "input_run",
+        "component_run",
+        "component_value_dates",
+        "component_fetched_at",
+        "acquisition_artifact",
+        "license_decisions",
+        "required_metric_keys",
+        "required_chart_keys",
+        "required_section_keys",
+        "semantic_boundary",
+        "fingerprint",
+        "payload_integrity_hash",
+    }
+)
+ASSETS_FX_REFRESH_FAILURE_REASONS = {
+    "latest-attempt-incomplete": (
+        "The latest Federal Reserve H.10 attempt is not one non-empty SUCCESS run."
+    ),
+    "candidate-validation": (
+        "The latest H.10 run, ZIP/member, exact observations, licences or assets-fx "
+        "payload failed strict validation."
+    ),
+    "candidate-regression": (
+        "The latest valid H.10 candidate regressed behind the retained assets-fx v1."
+    ),
+    "publication-postcondition": (
+        "Assets-fx v1 publication postcondition failed; retained the prior audited revision."
+    ),
+}
+GLOBAL_DOLLAR_CONTRACT_VERSION = 1
+GLOBAL_DOLLAR_FORMULA_VERSION = "global-dollar-v1"
+GLOBAL_DOLLAR_TITLE = "Global Dollar Reference and Central-Bank Swap Backstop"
+GLOBAL_DOLLAR_SUMMARY = (
+    "Federal Reserve H.10 reference rates and NY Fed USD-liquidity-swap "
+    "operations are published from two independently timed exact batches. "
+    "This is not ICE DXY, cross-currency basis, executable FX, a complete "
+    "offshore funding gauge, or a trading signal."
+)
+GLOBAL_DOLLAR_DATASETS = {
+    "h10": ("federal-reserve", "h10"),
+    "swaps": ("ny-fed-markets", "fx-swaps:usdollar"),
+}
+GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS = frozenset(
+    {
+        "h10-broad-dollar",
+        "h10-broad-dollar-5d-change-pct",
+        "h10-eurusd",
+        "h10-usdcny",
+        "h10-usdjpy",
+        "fxswap-usd-outstanding",
+        "fxswap-usd-outstanding-non-small-value",
+        "fxswap-usd-outstanding-small-value",
+        "fxswap-active-counterparties",
+    }
+)
+GLOBAL_DOLLAR_REQUIRED_CHART_KEYS = frozenset(
+    {
+        "global-dollar-broad-dollar-history",
+        "global-dollar-major-fx-usd-strength-rebased",
+        "global-dollar-swap-drawdowns",
+    }
+)
+GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS = frozenset(
+    {
+        "active-usd-liquidity-swap-operations",
+        "source-freshness-methodology",
+        "licensed-market-data-gaps",
+    }
+)
+GLOBAL_DOLLAR_FORMULAS = {
+    "h10-broad-dollar-5d-change-pct": "100 * (V_t / V_t-5 - 1)",
+    "fxswap-usd-outstanding": "sum(amount_i / 1,000,000) where settlement_i <= as_of < maturity_i",
+    "fxswap-usd-outstanding-non-small-value": "sum(active amount_i / 1,000,000 where isSmallValue = false)",
+    "fxswap-usd-outstanding-small-value": "sum(active amount_i / 1,000,000 where isSmallValue = true)",
+    "fxswap-active-counterparties": "count(distinct active non-small-value counterparty_i)",
+}
+GLOBAL_DOLLAR_SWAP_MIN_RETURNED_COUNT = 1540
+GLOBAL_DOLLAR_SWAP_FIRST_TRADE_DATE = date(2010, 5, 18)
+GLOBAL_DOLLAR_SWAP_HISTORY_WITNESSES = frozenset(
+    {
+        (
+            "Bank of Japan",
+            date(2010, 5, 18),
+            date(2010, 5, 20),
+            date(2010, 8, 12),
+            84,
+            Decimal("1.24"),
+            Decimal("210"),
+            False,
+        ),
+        (
+            "European Central Bank",
+            date(2010, 5, 18),
+            date(2010, 5, 20),
+            date(2010, 8, 12),
+            84,
+            Decimal("1.24"),
+            Decimal("1032"),
+            False,
+        ),
+    }
+)
+GLOBAL_DOLLAR_PAYLOAD_KEYS = frozenset(
+    {
+        "demo",
+        "metrics",
+        "charts",
+        "chart_data",
+        "sections",
+        "component_batches",
+        "source_keys",
+        "required_notices",
+        "fresh_until",
+        "publication_batch_id",
+        "contract_version",
+        "formula_version",
+        "formulas",
+        "input_runs",
+        "component_runs",
+        "component_value_dates",
+        "component_fetched_at",
+        "acquisition_artifacts",
+        "required_metric_keys",
+        "required_chart_keys",
+        "required_section_keys",
+        "semantic_boundary",
+        "fingerprint",
+        "payload_integrity_hash",
+    }
+)
+GLOBAL_DOLLAR_REFRESH_FAILURE_REASONS = {
+    "latest-attempt-incomplete": (
+        "Latest H.10 and NY Fed USD-swap attempts do not form two successful "
+        "exact components."
+    ),
+    "candidate-validation": (
+        "Global-dollar exact batches, search coverage, artifacts, formulas, "
+        "tables, licences or lineage failed validation."
+    ),
+    "candidate-regression": (
+        "Global-dollar candidate data regressed; retained prior snapshot."
+    ),
+    "publication-postcondition": (
+        "Global-dollar v1 publication postcondition failed; retained the "
+        "previous fully audited snapshot."
+    ),
+}
+TRANSMISSION_CHAIN_CONTRACT_VERSION = 1
+TRANSMISSION_CHAIN_FORMULA_VERSION = "official-evidence-chain-v1"
+TRANSMISSION_CHAIN_TITLE = "六层官方证据传导链"
+TRANSMISSION_CHAIN_SUMMARY = (
+    "六个已审计官方组件按各自时点组成证据链；页面不发布压力总分、"
+    "紧松状态、共振判断、行动建议或交易信号。异频组件分别保留"
+    "有效日、抓取时间、许可、质量和缺口。"
+)
+TRANSMISSION_CHAIN_COMPONENTS = {
+    "fed-balance-sheet": {
+        "contract_version": FED_BALANCE_SHEET_CONTRACT_VERSION,
+        "claim_scope": "资产负债表供给与净流动性透明代理",
+        "metric_keys": ("net-liquidity", "walcl"),
+        "chart_key": "fed-balance-sheet-net-liquidity-history",
+        "semantic_boundary": "净流动性是 Atlas Macro 透明代理，不是 Federal Reserve 官方指标。",
+    },
+    "operations": {
+        "contract_version": OPERATIONS_CONTRACT_VERSION,
+        "claim_scope": "ON RRP、SRF 与 Desk 操作设施",
+        "metric_keys": (
+            "onrrp-non-small-value-total",
+            "srf-non-small-value-total",
+        ),
+        "chart_key": "operations-standing-tools-history",
+        "semantic_boundary": "操作结果不是广义流动性总量或政策意图评分。",
+    },
+    "reserves-rate-spreads": {
+        "contract_version": 1,
+        "claim_scope": "SOFR、IORB 与 13 周 T-bill 日频共同日利差",
+        "metric_keys": (
+            "reserves-sofr-iorb-spread",
+            "reserves-sofr-tbill-spread",
+        ),
+        "chart_key": "reserves-funding-levels",
+        "semantic_boundary": "利差为透明计算，不是资金压力状态或交易信号。",
+    },
+    "subsurface": {
+        "contract_version": SUBSURFACE_CONTRACT_VERSION,
+        "claim_scope": "SOFR 尾部分位、成交量与官方设施见证",
+        "metric_keys": ("sofr-p99-minus-iorb", "sofr-volume-z60"),
+        "chart_key": "subsurface-sofr-tail-history",
+        "semantic_boundary": "尾部与成交量只描述已发布证据，不推断市场中介能力。",
+    },
+    "reserves": {
+        "contract_version": 1,
+        "claim_scope": "准备金相对商业银行资产的覆盖代理",
+        "metric_keys": (
+            "reserve-commercial-bank-assets-ratio",
+            "reserve-ratio-8w-change",
+        ),
+        "chart_key": "reserve-ratio-history",
+        "semantic_boundary": "覆盖宇宙不同；不是资本、LCR 或放贷能力结论。",
+    },
+    "global-dollar": {
+        "contract_version": GLOBAL_DOLLAR_CONTRACT_VERSION,
+        "claim_scope": "H.10 美元参考序列与央行美元互换后盾",
+        "metric_keys": (
+            "h10-broad-dollar-5d-change-pct",
+            "fxswap-usd-outstanding-non-small-value",
+        ),
+        "chart_key": "global-dollar-swap-drawdowns",
+        "semantic_boundary": "不是 DXY、cross-currency basis、可执行 FX 或完整离岸融资指标。",
+    },
+}
+TRANSMISSION_CHAIN_METRIC_MAP = {
+    "balance-sheet-net-liquidity": ("fed-balance-sheet", "net-liquidity"),
+    "balance-sheet-total-assets": ("fed-balance-sheet", "walcl"),
+    "operations-onrrp-regular": (
+        "operations",
+        "onrrp-non-small-value-total",
+    ),
+    "operations-srf-regular": ("operations", "srf-non-small-value-total"),
+    "money-market-sofr-iorb": (
+        "reserves-rate-spreads",
+        "reserves-sofr-iorb-spread",
+    ),
+    "money-market-sofr-tbill": (
+        "reserves-rate-spreads",
+        "reserves-sofr-tbill-spread",
+    ),
+    "repo-tail-p99-iorb": ("subsurface", "sofr-p99-minus-iorb"),
+    "repo-volume-z60": ("subsurface", "sofr-volume-z60"),
+    "bank-reserve-coverage": (
+        "reserves",
+        "reserve-commercial-bank-assets-ratio",
+    ),
+    "bank-reserve-8w-change": ("reserves", "reserve-ratio-8w-change"),
+    "global-dollar-5d-change": (
+        "global-dollar",
+        "h10-broad-dollar-5d-change-pct",
+    ),
+    "global-swap-regular-outstanding": (
+        "global-dollar",
+        "fxswap-usd-outstanding-non-small-value",
+    ),
+}
+TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS = frozenset(
+    TRANSMISSION_CHAIN_METRIC_MAP
+)
+TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS = frozenset(
+    str(component["chart_key"])
+    for component in TRANSMISSION_CHAIN_COMPONENTS.values()
+)
+TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS = frozenset(
+    {
+        "layer-evidence-ledger",
+        "shared-input-reconciliation",
+        "methodology-and-licensing-gaps",
+    }
+)
+TRANSMISSION_CHAIN_SHARED_INPUTS = (
+    ("H.4.1", "fed-balance-sheet", "h41", "reserves", "h41"),
+    ("ON RRP", "fed-balance-sheet", "onrrp", "operations", "onrrp"),
+    ("SOFR", "reserves-rate-spreads", "sofr", "subsurface", "sofr"),
+    ("IORB", "reserves-rate-spreads", "iorb", "subsurface", "iorb"),
+    ("SRF", "operations", "srf", "subsurface", "srf"),
+    ("USD swaps", "subsurface", "swaps", "global-dollar", "swaps"),
+)
+TRANSMISSION_CHAIN_SHARED_INPUT_FIELDS = {
+    "H.4.1": {
+        "left": ["WRBWFRBL"],
+        "right": ["WRBWFRBL"],
+    },
+    "ON RRP": {
+        "left": ["ONRRP"],
+        "right": ["ONRRP", "ONRRP-SMALL-VALUE-TOTAL"],
+    },
+    "SOFR": {"left": ["SOFR"], "right": ["SOFR"]},
+    "IORB": {"left": ["IORB"], "right": ["IORB"]},
+    "SRF": {
+        "left": ["SRP", "SRP-SMALL-VALUE-TOTAL"],
+        "right": ["SRP", "SRP-SMALL-VALUE-TOTAL"],
+    },
+    "USD swaps": {
+        "left": ["FXSWAP-USD-OUTSTANDING"],
+        "right": ["FXSWAP-USD-OUTSTANDING"],
+    },
+}
+TRANSMISSION_CHAIN_FORMULAS = {
+    "balance-sheet-net-liquidity": FED_BALANCE_SHEET_NET_FORMULA,
+    "operations-onrrp-regular": OPERATIONS_FORMULAS[
+        "onrrp-non-small-value-total"
+    ],
+    "operations-srf-regular": OPERATIONS_FORMULAS[
+        "srf-non-small-value-total"
+    ],
+    "money-market-sofr-iorb": "100 * (SOFR - IORB)",
+    "money-market-sofr-tbill": (
+        "100 * (SOFR - 13-week T-bill Coupon Equivalent)"
+    ),
+    "repo-tail-p99-iorb": SUBSURFACE_FORMULAS["sofr-p99-minus-iorb"],
+    "repo-volume-z60": SUBSURFACE_FORMULAS["sofr-volume-z60"],
+    "bank-reserve-coverage": "100 * WRBWFRBL / H8-B1151NCBA",
+    "bank-reserve-8w-change": "ratio(t) - ratio(t-56 calendar days)",
+    "global-dollar-5d-change": GLOBAL_DOLLAR_FORMULAS[
+        "h10-broad-dollar-5d-change-pct"
+    ],
+    "global-swap-regular-outstanding": GLOBAL_DOLLAR_FORMULAS[
+        "fxswap-usd-outstanding-non-small-value"
+    ],
+}
+TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS = {
+    "latest-attempt-incomplete": (
+        "One or more required component input attempts are missing, partial, failed or still running."
+    ),
+    "component-validation": (
+        "One or more required component snapshots failed embedded strict validation."
+    ),
+    "shared-input-mismatch": (
+        "Repeated official inputs do not reference the same source, dataset, run and batch."
+    ),
+    "candidate-regression": (
+        "A component as-of date regressed behind the retained transmission-chain snapshot."
+    ),
+    "publication-postcondition": (
+        "Transmission-chain v1 publication postcondition failed; retained the previous audited snapshot."
+    ),
+}
+TRANSMISSION_CHAIN_PAYLOAD_KEYS = frozenset(
+    {
+        "demo",
+        "metrics",
+        "charts",
+        "chart_data",
+        "sections",
+        "component_batches",
+        "source_keys",
+        "required_notices",
+        "fresh_until",
+        "publication_batch_id",
+        "contract_version",
+        "formula_version",
+        "formulas",
+        "required_metric_keys",
+        "required_chart_keys",
+        "required_section_keys",
+        "component_snapshots",
+        "shared_input_reconciliation",
+        "semantic_manifest",
+        "as_of",
+        "fetched_at",
+        "generated_at",
+        "published_at",
+        "semantic_boundary",
+        "fingerprint",
+        "payload_integrity_hash",
+    }
+)
 INDEPENDENT_PUBLICATION_KEYS = frozenset(
-    {"auctions", "rrp-tga", "fed-balance-sheet", "subsurface"}
+    {
+        "auctions",
+        "rrp-tga",
+        "fed-balance-sheet",
+        "subsurface",
+        "operations",
+        "assets-fx",
+        "global-dollar",
+        "transmission-chain",
+    }
+)
+APPEND_ONLY_PUBLICATION_KEYS = frozenset(
+    {
+        "fed-balance-sheet",
+        "operations",
+        "reserves-rate-spreads",
+        "subsurface",
+        "reserves",
+        "assets-fx",
+        "global-dollar",
+        "transmission-chain",
+    }
 )
 AUCTION_REQUIRED_METRIC_KEYS = frozenset(
     {
@@ -287,10 +879,8 @@ REAL_RATES_REQUIRED_METRIC_KEYS = frozenset(
     {"tips-5y", "tips-10y", "5y-bei", "10y-bei"}
 )
 H41_PUBLICATION_KEYS = frozenset()
-PRATES_PUBLICATION_KEYS = frozenset(
-    {"transmission-chain"}
-)
-H10_PUBLICATION_KEYS = frozenset({"assets-fx"})
+PRATES_PUBLICATION_KEYS = frozenset()
+H10_PUBLICATION_KEYS = frozenset()
 CREDIT_PUBLICATION_KEYS = frozenset({"credit", "credit-spreads", "credit-stress"})
 CONSUMER_CONTRACT_VERSION = 1
 MACRO_PUBLICATION_GROUPS = {
@@ -5358,6 +5948,8 @@ def _reserves_observation_maps(
 
 def _reserves_page_data(
     selected_runs: dict[str, IngestionRun],
+    *,
+    allow_expired: bool = False,
 ) -> tuple[
     tuple[
         list[dict[str, Any]],
@@ -5393,6 +5985,20 @@ def _reserves_page_data(
                     status="future-timestamp",
                 )
             ]
+        if (
+            Observation.objects.filter(
+                source=run.source,
+                batch_id=run.batch_id,
+            ).count()
+            != run.row_count
+        ):
+            return None, [
+                _reserves_failure(
+                    identity,
+                    "stored observations do not equal the complete exact run batch",
+                    status="mixed-batch",
+                )
+            ]
     component_deadlines: dict[str, datetime] = {}
     for identity, by_date in observations.items():
         if any(
@@ -5425,7 +6031,7 @@ def _reserves_page_data(
             or str(latest.batch_id) != expected_batches[identity]
             or latest.fallback_source_id
             or latest.quality_status != Observation.Quality.FRESH
-            or deadline < now
+            or (deadline < now and not allow_expired)
         ):
             return None, [
                 _reserves_failure(
@@ -5489,7 +6095,7 @@ def _reserves_page_data(
         for identity, by_date in observations.items()
     }
     if any(
-        deadline is None or deadline < now
+        deadline is None or (deadline < now and not allow_expired)
         for deadline in common_date_deadlines.values()
     ):
         return None, [
@@ -6591,27 +7197,111 @@ def _mark_reserves_stale(
     latest.save(update_fields=["data", "quality_status", "updated_at"])
 
 
+def _normalize_rebuilt_dashboard_contract(
+    prepared: tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+] | None:
+    """Apply the generic publisher's licence normalization to rebuilt data."""
+
+    rebuilt_metrics = deepcopy(prepared[0])
+    metric_source_keys = {
+        str(item.get("source_key") or "") for item in rebuilt_metrics
+    }
+    metric_sources = {
+        item.key: item
+        for item in Source.objects.filter(key__in=metric_source_keys)
+    }
+    if set(metric_sources) != metric_source_keys or "" in metric_source_keys:
+        return None
+    metric_scopes: dict[str, str] = {}
+    for source_key, source in metric_sources.items():
+        licence = _effective_source_license(source, require_public=True)
+        if licence is None:
+            return None
+        metric_scopes[source_key] = licence.scope
+    for metric in rebuilt_metrics:
+        metric["license_scope"] = metric_scopes[str(metric["source_key"])]
+
+    rebuilt_charts = deepcopy(prepared[1])
+    for chart in rebuilt_charts:
+        chart_source_keys = set(chart.get("source_keys", [])) | _payload_source_keys(
+            chart.get("data", [])
+        )
+        chart["source_keys"] = sorted(chart_source_keys)
+        chart_sources = {
+            item.key: item
+            for item in Source.objects.filter(key__in=chart_source_keys)
+        }
+        if set(chart_sources) != chart_source_keys:
+            return None
+        chart_scopes: dict[str, str] = {}
+        for source_key, source in chart_sources.items():
+            licence = _effective_source_license(source, require_public=True)
+            if licence is None:
+                return None
+            chart_scopes[source_key] = licence.scope
+        chart["license_scopes"] = [
+            f"{chart_sources[key].name}: {chart_scopes[key]}"
+            for key in sorted(chart_sources)
+        ]
+        chart["fallback_sources"] = sorted(
+            _payload_fallback_source_keys(chart)
+        )
+    return rebuilt_metrics, rebuilt_charts, deepcopy(prepared[2]), deepcopy(prepared[3])
+
+
 def _reserves_snapshot_contract_is_valid(
     snapshot: DashboardSnapshot,
     *,
     selected_runs: dict[str, IngestionRun],
+    allow_retained_stale: bool = False,
+    allow_natural_expiry: bool = False,
+    allow_expired: bool = False,
 ) -> bool:
     data = dict(snapshot.data or {})
+    allow_expired = (
+        allow_expired or allow_natural_expiry or allow_retained_stale
+    )
     expected_batches = {
         str(selected_runs[identity].batch_id) for identity in RESERVES_DATASETS
     }
+    if allow_retained_stale:
+        valid_publication_state = bool(
+            snapshot.quality_status == Observation.Quality.STALE
+            and _fed_balance_sheet_refresh_failure_is_valid(
+                data.get("refresh_failure")
+            )
+        )
+    elif allow_natural_expiry:
+        valid_publication_state = bool(
+            snapshot.quality_status
+            in {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+            and "refresh_failure" not in data
+        )
+    else:
+        valid_publication_state = bool(
+            snapshot.quality_status == Observation.Quality.ESTIMATED
+            and "refresh_failure" not in data
+        )
     if (
         snapshot.key != "reserves"
         or snapshot.source.key != "internal"
         or not snapshot.is_published
-        or snapshot.quality_status
-        in {Observation.Quality.ERROR, Observation.Quality.STALE}
+        or not valid_publication_state
         or data.get("contract_version") != RESERVES_CONTRACT_VERSION
         or data.get("publication_batch_id") != str(snapshot.batch_id)
         or set(data.get("component_batches") or []) != expected_batches
         or set(data.get("source_keys") or [])
         != {"federal-reserve", "internal"}
-        or data.get("refresh_failure")
         or not _reserves_page_contract_is_buildable(
             list(data.get("metrics") or []),
             list(data.get("charts") or []),
@@ -6620,49 +7310,35 @@ def _reserves_snapshot_contract_is_valid(
     ):
         return False
     fresh_until = _parse_payload_datetime(data.get("fresh_until"))
-    if fresh_until is None or fresh_until < timezone.now():
+    if (
+        fresh_until is None
+        or (fresh_until < timezone.now() and not allow_expired)
+    ):
         return False
     allowed, derived = current_display_source_key_sets(
         {"federal-reserve", "internal"}
     )
     if allowed != {"federal-reserve", "internal"} or derived != allowed:
         return False
-    recent_section = next(
-        (
-            item
-            for item in data.get("sections", [])
-            if isinstance(item, dict)
-            and item.get("key") == "recent-reserve-balances"
-        ),
-        None,
+    rebuilt, _failures = _reserves_page_data(
+        selected_runs,
+        allow_expired=allow_expired,
     )
-    if recent_section is None:
+    if rebuilt is None:
         return False
-    exact_h41_tail = list(
-        reversed(
-            list(
-                Observation.objects.filter(
-                    source=selected_runs["h41"].source,
-                    series__key=RESERVES_SERIES["h41"],
-                    batch_id=selected_runs["h41"].batch_id,
-                )
-                .select_related("series")
-                .order_by("-value_date", "-id")[:20]
-            )
-        )
+    normalized_rebuild = _normalize_rebuilt_dashboard_contract(rebuilt)
+    if normalized_rebuild is None:
+        return False
+    rebuilt_metrics, rebuilt_charts, rebuilt_sections, rebuilt_extra = (
+        normalized_rebuild
     )
-    recent_rows = list(recent_section.get("rows") or [])
-    if len(exact_h41_tail) != 20 or len(recent_rows) != 20:
+    if (
+        data.get("metrics") != rebuilt_metrics
+        or data.get("charts") != rebuilt_charts
+        or data.get("sections") != rebuilt_sections
+        or any(data.get(key) != value for key, value in rebuilt_extra.items())
+    ):
         return False
-    for row, observation in zip(recent_rows, exact_h41_tail, strict=True):
-        value_usd_tn = _reserves_value_usd_tn(observation)
-        if (
-            row.get("label") != observation.value_date.date().isoformat()
-            or value_usd_tn is None
-            or abs(Decimal(str(row.get("value"))) - value_usd_tn)
-            > Decimal("0.00000001")
-        ):
-            return False
     normalized = {
         item.key: item
         for item in MetricSnapshot.objects.filter(
@@ -6681,35 +7357,13 @@ def _reserves_snapshot_contract_is_valid(
         return False
     for metric_key, metric in payload_metrics.items():
         stored = normalized.get(f"reserves-{metric_key}")
-        metadata = metric.get("metadata") or {}
-        if (
-            stored is None
-            or stored.value is None
-            or stored.value.quantize(Decimal("0.00000001"))
-            != Decimal(str(metric["value"])).quantize(Decimal("0.00000001"))
-            or stored.source.key != metric.get("source_key")
-            or stored.fallback_source_id is not None
-            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
-            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
-            or stored.quality_status != metric.get("quality_status")
-            or not stored.license_scope
-            or stored.metadata.get("input_lineage")
-            != metadata.get("input_lineage")
-            or stored.metadata.get("previous_input_lineage")
-            != metadata.get("previous_input_lineage", [])
-            or stored.metadata.get("formula") != metadata.get("formula")
-            or set(stored.metadata.get("input_batch_ids") or [])
-            != set(metadata.get("input_batch_ids") or [])
-        ):
-            return False
-        if metric_key == "reserve-ratio-8w-zscore" and (
-            stored.metadata.get("sample_count") != metadata.get("sample_count")
-            or stored.metadata.get("population_mean")
-            != metadata.get("population_mean")
-            or stored.metadata.get("population_std")
-            != metadata.get("population_std")
-            or stored.metadata.get("sample_changes")
-            != metadata.get("sample_changes")
+        if stored is None or not _dashboard_metric_snapshot_matches_payload(
+            stored,
+            metric,
+            fingerprint=str(data.get("fingerprint") or ""),
+            payload_integrity_hash=str(
+                data.get("payload_integrity_hash") or ""
+            ),
         ):
             return False
     return True
@@ -7095,6 +7749,8 @@ def _reserves_rate_spreads_metric(
 
 def _reserves_rate_spreads_page_data(
     selected_runs: dict[str, IngestionRun],
+    *,
+    allow_expired: bool = False,
 ) -> tuple[
     tuple[
         list[dict[str, Any]],
@@ -7243,7 +7899,7 @@ def _reserves_rate_spreads_page_data(
         for identity in ("sofr", "tbill", "iorb")
     ]
     deadlines = [_fresh_until(item) for item in current_inputs]
-    if any(deadline < now for deadline in deadlines):
+    if not allow_expired and any(deadline < now for deadline in deadlines):
         return None, [
             _reserves_rate_spreads_failure(
                 "freshness",
@@ -7826,6 +8482,7 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
     *,
     selected_runs: dict[str, IngestionRun] | None = None,
     allow_stale: bool = False,
+    allow_expired: bool = False,
     reconcile_metric_snapshots: bool = True,
 ) -> bool:
     data = dict(snapshot.data or {})
@@ -7888,6 +8545,31 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
         str(run.batch_id) for run in selected_runs.values()
     }:
         return False
+    fresh_until = _parse_payload_datetime(data.get("fresh_until"))
+    if fresh_until is None or (
+        fresh_until < timezone.now() and not allow_expired
+    ):
+        return False
+    if selected_runs is not None:
+        rebuilt, _failures = _reserves_rate_spreads_page_data(
+            selected_runs,
+            allow_expired=allow_expired,
+        )
+        if rebuilt is None:
+            return False
+        normalized_rebuild = _normalize_rebuilt_dashboard_contract(rebuilt)
+        if normalized_rebuild is None:
+            return False
+        rebuilt_metrics, rebuilt_charts, rebuilt_sections, rebuilt_extra = (
+            normalized_rebuild
+        )
+        if (
+            data.get("metrics") != rebuilt_metrics
+            or data.get("charts") != rebuilt_charts
+            or data.get("sections") != rebuilt_sections
+            or any(data.get(key) != value for key, value in rebuilt_extra.items())
+        ):
+            return False
     if not reconcile_metric_snapshots:
         return True
     normalized = {
@@ -7905,24 +8587,13 @@ def _reserves_rate_spreads_snapshot_contract_is_valid(
         return False
     for metric in data.get("metrics", []):
         stored = normalized.get(f"reserves-rate-spreads-{metric.get('key')}")
-        metadata = metric.get("metadata") or {}
-        if (
-            stored is None
-            or stored.value is None
-            or stored.value.quantize(Decimal("0.00000001"))
-            != Decimal(str(metric.get("value"))).quantize(Decimal("0.00000001"))
-            or stored.source.key != metric.get("source_key")
-            or stored.fallback_source_id is not None
-            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
-            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
-            or stored.quality_status != metric.get("quality_status")
-            or not stored.license_scope
-            or stored.metadata.get("formula") != metadata.get("formula")
-            or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
-            or set(stored.metadata.get("input_batch_ids") or [])
-            != set(metadata.get("input_batch_ids") or [])
-            or stored.metadata.get("quote_convention")
-            != metadata.get("quote_convention")
+        if stored is None or not _dashboard_metric_snapshot_matches_payload(
+            stored,
+            metric,
+            fingerprint=str(data.get("fingerprint") or ""),
+            payload_integrity_hash=str(
+                data.get("payload_integrity_hash") or ""
+            ),
         ):
             return False
     return True
@@ -7936,6 +8607,7 @@ def reserves_rate_spreads_snapshot_is_publicly_displayable(
     return _reserves_rate_spreads_snapshot_contract_is_valid(
         snapshot,
         allow_stale=True,
+        allow_expired=True,
         reconcile_metric_snapshots=False,
     )
 
@@ -10738,6 +11410,7 @@ def _subsurface_srf_operation_summary(
     *,
     period: date,
     expected_small_value: bool,
+    strict_contract: bool = False,
 ) -> tuple[Decimal, dict[str, Decimal], set[Decimal]] | None:
     if not isinstance(operations, list):
         return None
@@ -10748,16 +11421,21 @@ def _subsurface_srf_operation_summary(
     }
     total = Decimal("0")
     rates: set[Decimal] = set()
+    seen_operation_ids: set[str] = set()
     for operation in operations:
         if not isinstance(operation, dict):
             return None
+        operation_id = str(operation.get("operationId") or "").strip()
         try:
             operation_date = date.fromisoformat(
                 str(operation.get("operationDate"))
             )
-            accepted = Decimal(
-                str(operation.get("totalAmtAccepted") or "0")
-            ) / Decimal("1000000")
+            raw_accepted = operation.get("totalAmtAccepted")
+            if strict_contract and (
+                raw_accepted is None or not str(raw_accepted).strip()
+            ):
+                return None
+            accepted = Decimal(str(raw_accepted or "0")) / Decimal("1000000")
         except (ArithmeticError, TypeError, ValueError):
             return None
         if (
@@ -10766,8 +11444,20 @@ def _subsurface_srf_operation_summary(
             or accepted < 0
             or _subsurface_operation_is_small_value(operation)
             != expected_small_value
+            or (
+                strict_contract
+                and (
+                    not operation_id
+                    or operation_id in seen_operation_ids
+                    or operation.get("auctionStatus") != "Results"
+                    or operation.get("operationType") != "Repo"
+                    or operation.get("operationMethod") != "Full Allotment"
+                )
+            )
         ):
             return None
+        if operation_id:
+            seen_operation_ids.add(operation_id)
         details = operation.get("details")
         if not isinstance(details, list):
             return None
@@ -10778,17 +11468,23 @@ def _subsurface_srf_operation_summary(
             security_type = str(detail.get("securityType") or "")
             if security_type in collateral:
                 try:
-                    detail_amount = Decimal(
-                        str(detail.get("amtAccepted") or "0")
-                    ) / Decimal("1000000")
+                    raw_detail_amount = detail.get("amtAccepted")
+                    if strict_contract and (
+                        raw_detail_amount is None
+                        or not str(raw_detail_amount).strip()
+                    ):
+                        return None
+                    detail_amount = Decimal(str(raw_detail_amount or "0")) / Decimal(
+                        "1000000"
+                    )
                 except (ArithmeticError, TypeError, ValueError):
                     return None
                 if not detail_amount.is_finite() or detail_amount < 0:
                     return None
                 collateral[security_type] += detail_amount
-            raw_rate = detail.get(
-                "percentOfferingRate", detail.get("minimumBidRate")
-            )
+            raw_rate = detail.get("percentOfferingRate")
+            if raw_rate is None:
+                raw_rate = detail.get("minimumBidRate")
             if raw_rate is not None:
                 try:
                     rate = Decimal(str(raw_rate))
@@ -10797,6 +11493,8 @@ def _subsurface_srf_operation_summary(
                 if not rate.is_finite() or rate < 0:
                     return None
                 rates.add(rate)
+        if strict_contract and sum(collateral.values(), Decimal("0")) != total:
+            return None
     return total, collateral, rates
 
 
@@ -11276,6 +11974,7 @@ def _subsurface_page_data(
         unit: str,
         observation: Observation,
         lineage: list[dict[str, Any]],
+        freshness_lineage: list[dict[str, Any]] | None = None,
         derived: bool = False,
         formula: str | None = None,
         sample_count: int | None = None,
@@ -11300,8 +11999,11 @@ def _subsurface_page_data(
         if sample_count is not None:
             metadata["sample_count"] = sample_count
             metadata["sample_window"] = "official observation days"
+        freshness_inputs = (
+            lineage if freshness_lineage is None else freshness_lineage
+        )
         fresh_until = min(
-            str(item["fresh_until"]) for item in lineage
+            str(item["fresh_until"]) for item in freshness_inputs
         )
         return {
             "key": key,
@@ -11429,6 +12131,7 @@ def _subsurface_page_data(
             unit="z-score",
             observation=current_sofr,
             lineage=z_lineage,
+            freshness_lineage=[volume_lineage],
             derived=True,
             formula=SUBSURFACE_FORMULAS["sofr-volume-z60"],
             sample_count=60,
@@ -11459,6 +12162,7 @@ def _subsurface_page_data(
             unit="days",
             observation=current_srf,
             lineage=active_lineage,
+            freshness_lineage=[srf_lineage],
             derived=True,
             formula=SUBSURFACE_FORMULAS["srf-active-days-30d"],
             sample_count=len(active_lineage),
@@ -12585,6 +13289,8277 @@ def _coordinate_subsurface_dashboard(
             ),
         )
         return [], {"subsurface"}
+    return ([published] if published is not None else []), set()
+
+
+def _operations_run_identity(run: IngestionRun) -> str | None:
+    for identity, (source_key, dataset) in OPERATIONS_DATASETS.items():
+        if run.source.key == source_key and run.dataset == dataset:
+            return identity
+    return None
+
+
+def _latest_operations_attempt(identity: str) -> IngestionRun | None:
+    source_key, dataset = OPERATIONS_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(source__key=source_key, dataset=dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _latest_successful_operations_run(identity: str) -> IngestionRun | None:
+    source_key, dataset = OPERATIONS_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(
+            source__key=source_key,
+            dataset=dataset,
+            status=IngestionRun.Status.SUCCESS,
+            row_count__gt=0,
+        )
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _operations_run_state(
+    identity: str,
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    source_key, dataset = OPERATIONS_DATASETS[identity]
+    return {
+        "component": identity,
+        "kind": "ingestion_run",
+        "source": source_key,
+        "dataset": dataset,
+        "status": status or (run.status if run else "missing"),
+        "reason": (
+            reason
+            or (run.error if run and run.error else "component is not publishable")
+        )[:320],
+        "ingestion_run_id": run.pk if run else None,
+        "batch_id": str(run.batch_id) if run else None,
+        "row_count": run.row_count if run else 0,
+        "refresh_cycle_id": (
+            str((run.metadata or {}).get("refresh_cycle_id") or "") if run else ""
+        ),
+        "completed_at": (
+            run.completed_at.isoformat() if run and run.completed_at else None
+        ),
+    }
+
+
+def _operations_failure(
+    component: str,
+    reason: str,
+    *,
+    status: str = "invalid",
+    run: IngestionRun | None = None,
+) -> dict[str, Any]:
+    if component in OPERATIONS_DATASETS:
+        return _operations_run_state(
+            component, run, status=status, reason=reason
+        )
+    return {
+        "component": component,
+        "kind": "contract",
+        "status": status,
+        "reason": reason[:320],
+    }
+
+
+def _select_operations_runs(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
+    relevant: dict[str, list[IngestionRun]] = {
+        identity: [] for identity in OPERATIONS_DATASETS
+    }
+    for run in trigger_runs:
+        identity = _operations_run_identity(run)
+        if identity:
+            relevant[identity].append(run)
+    if not any(relevant.values()):
+        return None, [], False
+    for identity, identity_runs in relevant.items():
+        if not identity_runs:
+            continue
+        latest = _latest_operations_attempt(identity)
+        if (
+            latest is None
+            or len(identity_runs) != 1
+            or identity_runs[0].pk != latest.pk
+        ):
+            return None, [], False
+
+    optional = {
+        identity: _latest_operations_attempt(identity)
+        for identity in OPERATIONS_DATASETS
+    }
+    states = [
+        _operations_run_state(identity, optional[identity])
+        for identity in OPERATIONS_DATASETS
+    ]
+    if any(
+        run is None
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in optional.values()
+    ):
+        return None, states, True
+    selected = {
+        identity: run for identity, run in optional.items() if run is not None
+    }
+    cycles = {
+        str((run.metadata or {}).get("refresh_cycle_id") or "")
+        for run in selected.values()
+    }
+    if len(cycles) != 1 or not next(iter(cycles), ""):
+        return (
+            None,
+            [
+                _operations_run_state(
+                    identity,
+                    run,
+                    status="invalid-cycle",
+                    reason="all four operations inputs require one non-empty refresh cycle",
+                )
+                for identity, run in selected.items()
+            ],
+            True,
+        )
+    return selected, states, True
+
+
+def _operations_runs_still_latest(selected: dict[str, IngestionRun]) -> bool:
+    return all(
+        (latest := _latest_operations_attempt(identity)) is not None
+        and latest.pk == run.pk
+        for identity, run in selected.items()
+    )
+
+
+def _operations_artifact_is_valid(run: IngestionRun) -> bool:
+    artifacts = list(RawArtifact.objects.filter(run=run))
+    if len(artifacts) != 1:
+        return False
+    artifact = artifacts[0]
+    metadata = dict(run.metadata or {})
+    digest = str(metadata.get("sha256") or "").lower()
+    try:
+        size = int(metadata.get("byte_length") or 0)
+    except (TypeError, ValueError):
+        return False
+    content_type = str(metadata.get("content_type") or "application/octet-stream")
+    root = Path(
+        getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts")
+    )
+    artifact_path = root / digest[:2] / f"{digest}.bin"
+    try:
+        payload = artifact_path.read_bytes()
+    except OSError:
+        return False
+    return bool(
+        len(digest) == 64
+        and all(character in "0123456789abcdef" for character in digest)
+        and size > 0
+        and artifact.sha256.lower() == digest
+        and artifact.size_bytes == size
+        and artifact.content_type == content_type
+        and artifact.uri
+        == f"private://ny-fed-markets/{digest[:2]}/{digest}.bin"
+        and len(payload) == size
+        and hashlib.sha256(payload).hexdigest() == digest
+    )
+
+
+def _operations_direct_lineage(
+    observation: Observation,
+    *,
+    license_scope: str,
+    fresh_until: datetime,
+) -> dict[str, Any]:
+    return {
+        "series_key": observation.series.key,
+        "value": float(observation.value),
+        "raw_value": str(observation.value),
+        "unit": observation.series.unit,
+        "source_key": observation.source.key,
+        "source_name": observation.source.name,
+        "source_keys": [observation.source.key],
+        "license_scope": license_scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": str(observation.batch_id),
+        "quality_status": observation.quality_status,
+        "fallback_source": None,
+    }
+
+
+def _operations_repo_summary(
+    operations: Any,
+    *,
+    period: date,
+    expected_small_value: bool | None,
+    operation_type: str,
+    operation_method: str,
+) -> tuple[Decimal, set[Decimal], Decimal, list[str]] | None:
+    if not isinstance(operations, list):
+        return None
+    total = Decimal("0")
+    rates: set[Decimal] = set()
+    participants = Decimal("0")
+    canonical: list[str] = []
+    seen_ids: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return None
+        operation_id = str(operation.get("operationId") or "").strip()
+        raw_date = str(operation.get("operationDate") or "")
+        try:
+            operation_date = date.fromisoformat(raw_date)
+            accepted = Decimal(str(operation.get("totalAmtAccepted"))) / Decimal(
+                "1000000"
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if (
+            not operation_id
+            or operation_id in seen_ids
+            or raw_date != operation_date.isoformat()
+            or operation_date != period
+            or operation.get("auctionStatus") != "Results"
+            or operation.get("operationType") != operation_type
+            or operation.get("operationMethod") != operation_method
+            or not accepted.is_finite()
+            or accepted < 0
+            or (
+                expected_small_value is not None
+                and _subsurface_operation_is_small_value(operation)
+                != expected_small_value
+            )
+        ):
+            return None
+        seen_ids.add(operation_id)
+        total += accepted
+        raw_participants = operation.get(
+            "acceptedCpty", operation.get("participatingCpty")
+        )
+        if raw_participants is not None:
+            try:
+                participant_count = Decimal(str(raw_participants))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            if (
+                not participant_count.is_finite()
+                or participant_count < 0
+                or participant_count != participant_count.to_integral_value()
+            ):
+                return None
+            participants += participant_count
+        details = operation.get("details")
+        if not isinstance(details, list):
+            return None
+        for detail in details:
+            if not isinstance(detail, dict):
+                return None
+            raw_rate = detail.get("percentAwardRate")
+            if raw_rate is None:
+                raw_rate = detail.get("percentOfferingRate")
+            if raw_rate is None:
+                raw_rate = detail.get("minimumBidRate")
+            if raw_rate is None:
+                continue
+            try:
+                rate = Decimal(str(raw_rate))
+            except (ArithmeticError, TypeError, ValueError):
+                return None
+            if not rate.is_finite() or rate < 0:
+                return None
+            rates.add(rate)
+        canonical.append(
+            json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
+        )
+    return total, rates, participants, sorted(canonical)
+
+
+def _operations_treasury_summary(
+    operations: Any,
+    *,
+    period: date,
+) -> tuple[Decimal, Decimal, list[str]] | None:
+    if not isinstance(operations, list) or not operations:
+        return None
+    accepted_total = Decimal("0")
+    submitted_total = Decimal("0")
+    canonical: list[str] = []
+    seen_ids: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, dict):
+            return None
+        operation_id = str(operation.get("operationId") or "").strip()
+        raw_date = str(operation.get("operationDate") or "")
+        try:
+            operation_date = date.fromisoformat(raw_date)
+            accepted = Decimal(str(operation.get("totalParAmtAccepted"))) / Decimal(
+                "1000000"
+            )
+            submitted = Decimal(str(operation.get("totalParAmtSubmitted"))) / Decimal(
+                "1000000"
+            )
+            settlement = date.fromisoformat(str(operation.get("settlementDate") or ""))
+            maturity_start = date.fromisoformat(
+                str(operation.get("maturityRangeStart") or "")
+            )
+            maturity_end = date.fromisoformat(
+                str(operation.get("maturityRangeEnd") or "")
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+        if (
+            not operation_id
+            or operation_id in seen_ids
+            or raw_date != operation_date.isoformat()
+            or operation_date != period
+            or operation.get("auctionStatus") != "Results"
+            or operation.get("operationDirection") != "P"
+            or not str(operation.get("operationType") or "").strip()
+            or str(operation.get("settlementDate") or "")
+            != settlement.isoformat()
+            or str(operation.get("maturityRangeStart") or "")
+            != maturity_start.isoformat()
+            or str(operation.get("maturityRangeEnd") or "")
+            != maturity_end.isoformat()
+            or maturity_start > maturity_end
+            or not accepted.is_finite()
+            or not submitted.is_finite()
+            or accepted < 0
+            or submitted < 0
+            or accepted > submitted
+        ):
+            return None
+        seen_ids.add(operation_id)
+        accepted_total += accepted
+        submitted_total += submitted
+        canonical.append(
+            json.dumps(operation, sort_keys=True, ensure_ascii=False, default=str)
+        )
+    return accepted_total, submitted_total, sorted(canonical)
+
+
+def _operations_component_fresh_until(
+    identity: str,
+    observation: Observation,
+    *,
+    run_fetched_at: datetime | None = None,
+) -> datetime:
+    if identity == "treasury":
+        if run_fetched_at is None:
+            raise ValueError("Treasury purchase freshness requires fetched_at")
+        return run_fetched_at + timedelta(hours=25)
+    return _fresh_until(observation)
+
+
+def _operations_exact_inputs(
+    selected: dict[str, IngestionRun],
+    *,
+    now: datetime | None = None,
+    allow_expired: bool = False,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    now = now or timezone.now()
+    today_et = now.astimezone(ZoneInfo("America/New_York")).date()
+    required_sources = {"ny-fed-markets", "internal"}
+    public_keys, derived_keys = current_display_source_key_sets(required_sources)
+    if public_keys != required_sources or derived_keys != required_sources:
+        return None, [
+            _operations_failure(
+                "licence",
+                "direct and derived operations outputs require current display licences",
+                status="unlicensed",
+            )
+        ]
+    scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(
+                source, require_public=True, require_derived=True
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return None, [
+                _operations_failure(
+                    "licence",
+                    f"{source_key} lacks a current public/derived licence",
+                    status="unlicensed",
+                )
+            ]
+        scopes[source_key] = licence.scope
+
+    maps: dict[str, dict[date, Observation]] = {}
+    deadlines: dict[str, datetime] = {}
+    for identity, run in selected.items():
+        expected_source, expected_dataset = OPERATIONS_DATASETS[identity]
+        run_fetched_at = _parse_payload_datetime(
+            (run.metadata or {}).get("fetched_at")
+        )
+        if (
+            run.source.key != expected_source
+            or run.dataset != expected_dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or run_fetched_at is None
+            or run_fetched_at > now + timedelta(minutes=5)
+            or not _operations_artifact_is_valid(run)
+        ):
+            return None, [
+                _operations_failure(
+                    identity,
+                    "selected run or immutable raw artifact failed the exact contract",
+                    run=run,
+                )
+            ]
+        rows = list(
+            Observation.objects.filter(source=run.source, batch_id=run.batch_id)
+            .select_related("series", "series__source", "source", "fallback_source")
+            .order_by("series__key", "value_date", "id")
+        )
+        if (
+            len(rows) != run.row_count
+            or Observation.objects.filter(batch_id=run.batch_id).count()
+            != run.row_count
+        ):
+            return None, [
+                _operations_failure(
+                    identity,
+                    "run.row_count does not equal the complete exact batch",
+                    status="batch-pollution",
+                    run=run,
+                )
+            ]
+        observed_series = {row.series.key for row in rows if row.series_id}
+        if (
+            not OPERATIONS_REQUIRED_SERIES[identity] <= observed_series
+            or not observed_series <= OPERATIONS_ALLOWED_SERIES[identity]
+        ):
+            return None, [
+                _operations_failure(
+                    identity,
+                    "exact batch has missing or unknown series",
+                    status="invalid-series",
+                    run=run,
+                )
+            ]
+        for observation in rows:
+            if observation.series_id is None:
+                return None, [
+                    _operations_failure(identity, "non-series row in exact batch", run=run)
+                ]
+            period = observation.value_date.date()
+            series_key = observation.series.key
+            expected_unit = (
+                "%"
+                if series_key.endswith("-rate")
+                else "count"
+                if series_key == "onrrp-participants"
+                else "USD millions"
+            )
+            if (
+                observation.source.key != expected_source
+                or observation.series.source_id != run.source_id
+                or observation.batch_id != run.batch_id
+                or observation.series.unit != expected_unit
+                or observation.fallback_source_id is not None
+                or observation.quality_status != Observation.Quality.FRESH
+                or observation.fetched_at != run_fetched_at
+                or observation.fetched_at > now + timedelta(minutes=5)
+                or observation.as_of > now + timedelta(minutes=5)
+                or period > today_et
+                or not observation.value.is_finite()
+                or observation.value < 0
+            ):
+                return None, [
+                    _operations_failure(
+                        identity,
+                        f"{series_key} has wrong unit, source, batch, quality, "
+                        "fallback, timestamp, date or value",
+                        status="invalid-lineage",
+                        run=run,
+                    )
+                ]
+            series_map = maps.setdefault(series_key, {})
+            if period in series_map:
+                return None, [
+                    _operations_failure(
+                        identity,
+                        f"{series_key} contains duplicate dates",
+                        status="duplicate",
+                        run=run,
+                    )
+                ]
+            series_map[period] = observation
+        primary_series = {
+            "treasury": "treasury-purchases",
+            "onrrp": "onrrp",
+            "srf": "srp-non-small-value-total",
+            "soma": "soma-total",
+        }[identity]
+        primary_map = maps[primary_series]
+        latest = primary_map[max(primary_map)]
+        deadlines[identity] = _operations_component_fresh_until(
+            identity, latest, run_fetched_at=run_fetched_at
+        )
+
+    cycles = {
+        str((run.metadata or {}).get("refresh_cycle_id") or "")
+        for run in selected.values()
+    }
+    if len(cycles) != 1 or not next(iter(cycles), ""):
+        return None, [
+            _operations_failure(
+                "refresh-cycle", "four exact inputs do not share one refresh cycle"
+            )
+        ]
+    expired = sorted(
+        identity for identity, deadline in deadlines.items() if deadline < now
+    )
+    if expired and not allow_expired:
+        return None, [
+            _operations_failure(
+                "freshness",
+                "latest exact operations inputs are stale: " + ", ".join(expired),
+                status=Observation.Quality.STALE,
+            )
+        ]
+
+    treasury_map = maps["treasury-purchases"]
+    treasury_dates = sorted(treasury_map)
+    latest_treasury_date = treasury_dates[-1]
+    if treasury_dates[0] > latest_treasury_date - timedelta(days=29):
+        return None, [
+            _operations_failure(
+                "treasury",
+                "Treasury purchase batch does not cover the complete trailing 30-day window",
+                status="insufficient-coverage",
+                run=selected["treasury"],
+            )
+        ]
+    treasury_operation_ids: set[str] = set()
+    for period, observation in treasury_map.items():
+        summary = _operations_treasury_summary(
+            (observation.metadata or {}).get("operations"), period=period
+        )
+        if summary is None or not _fed_balance_sheet_decimal_equal(
+            summary[0], observation.value
+        ):
+            return None, [
+                _operations_failure(
+                    "treasury",
+                    "Treasury daily total does not reconcile to its operation evidence",
+                    status="formula",
+                    run=selected["treasury"],
+                )
+            ]
+        for canonical in summary[2]:
+            operation_id = str(json.loads(canonical).get("operationId") or "")
+            if operation_id in treasury_operation_ids:
+                return None, [
+                    _operations_failure(
+                        "treasury", "duplicate Treasury operation ID across dates"
+                    )
+                ]
+            treasury_operation_ids.add(operation_id)
+
+    onrrp_series = (
+        "onrrp",
+        "onrrp-non-small-value-total",
+        "onrrp-small-value-total",
+        "onrrp-rate",
+        "onrrp-participants",
+    )
+    onrrp_date_sets = [set(maps[key]) for key in onrrp_series]
+    if any(item != onrrp_date_sets[0] for item in onrrp_date_sets[1:]):
+        return None, [
+            _operations_failure("onrrp", "ON RRP required series date sets differ")
+        ]
+    for period in sorted(onrrp_date_sets[0]):
+        total = maps["onrrp"][period]
+        regular = maps["onrrp-non-small-value-total"][period]
+        small = maps["onrrp-small-value-total"][period]
+        total_summary = _operations_repo_summary(
+            (total.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=None,
+            operation_type="Reverse Repo",
+            operation_method="Fixed Rate",
+        )
+        regular_summary = _operations_repo_summary(
+            (regular.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=False,
+            operation_type="Reverse Repo",
+            operation_method="Fixed Rate",
+        )
+        small_summary = _operations_repo_summary(
+            (small.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=True,
+            operation_type="Reverse Repo",
+            operation_method="Fixed Rate",
+        )
+        rate_observation = maps["onrrp-rate"][period]
+        participant_observation = maps["onrrp-participants"][period]
+        rate_summary = _operations_repo_summary(
+            (rate_observation.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=False,
+            operation_type="Reverse Repo",
+            operation_method="Fixed Rate",
+        )
+        participant_summary = _operations_repo_summary(
+            (participant_observation.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=False,
+            operation_type="Reverse Repo",
+            operation_method="Fixed Rate",
+        )
+        if (
+            total_summary is None
+            or regular_summary is None
+            or small_summary is None
+            or rate_summary is None
+            or participant_summary is None
+            or len(regular_summary[1]) != 1
+            or total_summary[3]
+            != sorted(regular_summary[3] + small_summary[3])
+            or rate_summary[3] != regular_summary[3]
+            or participant_summary[3] != regular_summary[3]
+            or (regular.metadata or {}).get("small_value_excluded") is not True
+            or (small.metadata or {}).get("small_value_only") is not True
+            or (rate_observation.metadata or {}).get("small_value_excluded")
+            is not True
+            or (participant_observation.metadata or {}).get(
+                "small_value_excluded"
+            )
+            is not True
+            or not _fed_balance_sheet_decimal_equal(total.value, total_summary[0])
+            or not _fed_balance_sheet_decimal_equal(regular.value, regular_summary[0])
+            or not _fed_balance_sheet_decimal_equal(small.value, small_summary[0])
+            or not _fed_balance_sheet_decimal_equal(
+                total.value, regular.value + small.value
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                rate_observation.value, next(iter(regular_summary[1]))
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                participant_observation.value, regular_summary[2]
+            )
+        ):
+            return None, [
+                _operations_failure(
+                    "onrrp",
+                    "ON RRP partition, rate, participant or operation evidence failed",
+                    status="formula",
+                    run=selected["onrrp"],
+                )
+            ]
+
+    srf_series = tuple(OPERATIONS_REQUIRED_SERIES["srf"])
+    srf_date_sets = [set(maps[key]) for key in srf_series]
+    if any(item != srf_date_sets[0] for item in srf_date_sets[1:]):
+        return None, [
+            _operations_failure("srf", "SRF required series date sets differ")
+        ]
+    for period in sorted(srf_date_sets[0]):
+        total = maps["srp"][period]
+        regular = maps["srp-non-small-value-total"][period]
+        small = maps["srp-small-value-total"][period]
+        regular_summary = _subsurface_srf_operation_summary(
+            (regular.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=False,
+            strict_contract=True,
+        )
+        small_summary = _subsurface_srf_operation_summary(
+            (small.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=True,
+            strict_contract=True,
+        )
+        total_evidence = _operations_repo_summary(
+            (total.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=None,
+            operation_type="Repo",
+            operation_method="Full Allotment",
+        )
+        regular_evidence = _operations_repo_summary(
+            (regular.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=False,
+            operation_type="Repo",
+            operation_method="Full Allotment",
+        )
+        small_evidence = _operations_repo_summary(
+            (small.metadata or {}).get("operations"),
+            period=period,
+            expected_small_value=True,
+            operation_type="Repo",
+            operation_method="Full Allotment",
+        )
+        regular_series_keys = (
+            "srp-non-small-value-treasury",
+            "srp-non-small-value-agency",
+            "srp-non-small-value-mbs",
+            "srp-non-small-value-rate",
+        )
+        if (
+            regular_summary is None
+            or small_summary is None
+            or total_evidence is None
+            or regular_evidence is None
+            or small_evidence is None
+            or len(regular_summary[2]) != 1
+            or total_evidence[3]
+            != sorted(regular_evidence[3] + small_evidence[3])
+            or not _fed_balance_sheet_decimal_equal(total.value, total_evidence[0])
+            or regular_evidence[3]
+            != sorted(
+                json.dumps(
+                    operation, sort_keys=True, ensure_ascii=False, default=str
+                )
+                for operation in (regular.metadata or {}).get("operations") or []
+            )
+            or any(
+                sorted(
+                    json.dumps(
+                        operation,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    for operation in (
+                        maps[series_key][period].metadata or {}
+                    ).get("operations")
+                    or []
+                )
+                != regular_evidence[3]
+                or (maps[series_key][period].metadata or {}).get(
+                    "small_value_excluded"
+                )
+                is not True
+                for series_key in regular_series_keys
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                total.value, regular.value + small.value
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                regular.value, regular_summary[0]
+            )
+            or not _fed_balance_sheet_decimal_equal(small.value, small_summary[0])
+            or not _fed_balance_sheet_decimal_equal(
+                maps["srp-non-small-value-treasury"][period].value,
+                regular_summary[1]["Treasury"],
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                maps["srp-non-small-value-agency"][period].value,
+                regular_summary[1]["Agency"],
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                maps["srp-non-small-value-mbs"][period].value,
+                regular_summary[1]["Mortgage-Backed"],
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                maps["srp-non-small-value-rate"][period].value,
+                next(iter(regular_summary[2])),
+            )
+            or not _fed_balance_sheet_decimal_equal(
+                regular.value, sum(regular_summary[1].values(), Decimal("0"))
+            )
+        ):
+            return None, [
+                _operations_failure(
+                    "srf",
+                    "SRF partitions, collateral, rate or operation evidence failed",
+                    status="formula",
+                    run=selected["srf"],
+                )
+            ]
+
+    soma_source_fields = {
+        "soma-total": "total",
+        "soma-bills": "bills",
+        "soma-notes-bonds": "notesbonds",
+        "soma-tips": "tips",
+        "soma-frn": "frn",
+        "soma-tips-inflation-compensation": "tipsInflationCompensation",
+        "soma-mbs": "mbs",
+        "soma-cmbs": "cmbs",
+        "soma-agencies": "agencies",
+    }
+    if any(
+        (observation.metadata or {}).get("source_field") != source_field
+        for series_key, source_field in soma_source_fields.items()
+        for observation in maps[series_key].values()
+    ):
+        return None, [
+            _operations_failure(
+                "soma", "SOMA series source-field metadata failed validation"
+            )
+        ]
+    if len(maps["soma-total"]) < 2:
+        return None, [
+            _operations_failure(
+                "soma", "SOMA exact batch requires two official observations"
+            )
+        ]
+    return {
+        "maps": maps,
+        "scopes": scopes,
+        "deadlines": deadlines,
+        "page_fresh_until": min(deadlines.values()),
+        "refresh_cycle_id": next(iter(cycles)),
+        "latest_dates": {
+            "treasury": max(maps["treasury-purchases"]),
+            "onrrp": max(maps["onrrp"]),
+            "srf": max(maps["srp-non-small-value-total"]),
+            "soma": max(maps["soma-total"]),
+        },
+    }, []
+
+
+def _operations_direct_metric(
+    *,
+    key: str,
+    label: str,
+    observation: Observation,
+    scope: str,
+    fresh_until: datetime,
+    decimals: int = 2,
+    unit: str = " USD mn",
+    formula: str | None = None,
+    input_lineage: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    lineage = _operations_direct_lineage(
+        observation, license_scope=scope, fresh_until=fresh_until
+    )
+    metadata = {
+        "input_series": [observation.series.key],
+        "input_batch_ids": [str(observation.batch_id)],
+        "input_value_dates": [observation.value_date.isoformat()],
+        "input_lineage": input_lineage or [lineage],
+    }
+    if formula:
+        metadata["formula"] = formula
+    return {
+        "key": key,
+        "label": label,
+        "value": float(observation.value),
+        "display_value": f"{observation.value:,.{decimals}f}{unit}",
+        "change": None,
+        "unit": unit,
+        "quality_status": Observation.Quality.FRESH,
+        "source": observation.source.name,
+        "source_key": observation.source.key,
+        "source_keys": [observation.source.key],
+        "fallback_source": None,
+        "license_scope": scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": str(observation.batch_id),
+        "metadata": metadata,
+    }
+
+
+def _operations_derived_metric(
+    *,
+    key: str,
+    label: str,
+    value: Decimal,
+    formula: str,
+    inputs: list[dict[str, Any]],
+    internal_scope: str,
+    decimals: int = 2,
+    unit: str = " USD mn",
+) -> dict[str, Any]:
+    input_batches = sorted({str(item["batch_id"]) for item in inputs})
+    value_dates = [str(item["value_date"]) for item in inputs]
+    fetched = max(datetime.fromisoformat(str(item["fetched_at"])) for item in inputs)
+    fresh_until = min(
+        datetime.fromisoformat(str(item["fresh_until"])) for item in inputs
+    )
+    latest_date = max(datetime.fromisoformat(item) for item in value_dates)
+    return {
+        "key": key,
+        "label": label,
+        "value": float(value),
+        "display_value": f"{value:,.{decimals}f}{unit}",
+        "change": None,
+        "unit": unit,
+        "quality_status": Observation.Quality.ESTIMATED,
+        "source": "Atlas Macro transparent calculation",
+        "source_key": "internal",
+        "source_keys": ["internal", "ny-fed-markets"],
+        "fallback_source": None,
+        "license_scope": internal_scope,
+        "value_date": latest_date.isoformat(),
+        "as_of": max(
+            datetime.fromisoformat(str(item["as_of"])) for item in inputs
+        ).isoformat(),
+        "fetched_at": fetched.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": ",".join(input_batches),
+        "metadata": {
+            "formula": formula,
+            "input_series": sorted({str(item["series_key"]) for item in inputs}),
+            "input_batch_ids": input_batches,
+            "input_value_dates": value_dates,
+            "input_lineage": inputs,
+            "calculation_owner": "Atlas Macro",
+        },
+    }
+
+
+def _operations_cell(key: str, value: Any) -> dict[str, Any]:
+    return {"key": key, "cell": {"kind": "text", "value": value}}
+
+
+def _operations_chart(
+    *,
+    key: str,
+    title: str,
+    description: str,
+    data: list[dict[str, Any]],
+    source_keys: set[str],
+    batch_ids: set[str],
+    as_of: datetime,
+    fetched_at: datetime,
+    fresh_until: datetime,
+    quality_status: str,
+    scopes: dict[str, str],
+) -> dict[str, Any]:
+    sources = {
+        source.key: source for source in Source.objects.filter(key__in=source_keys)
+    }
+    return {
+        "key": key,
+        "title": title,
+        "description": description,
+        "kind": "line",
+        "time_axis": "date",
+        "data": data,
+        "lineage_mode": "per-point",
+        "source_keys": sorted(source_keys),
+        "batch_ids": sorted(batch_ids),
+        "as_of": as_of.isoformat(),
+        "fetched_at": fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "quality_status": quality_status,
+        "fallback_source": None,
+        "fallback_sources": [],
+        "license_scopes": [
+            f"{sources[source_key].name}: {scopes[source_key]}"
+            for source_key in sorted(source_keys)
+        ],
+    }
+
+
+def _operations_page_data(
+    selected: dict[str, IngestionRun],
+    *,
+    allow_expired: bool = False,
+) -> tuple[
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None,
+    list[dict[str, Any]],
+]:
+    context, failures = _operations_exact_inputs(
+        selected, allow_expired=allow_expired
+    )
+    if context is None:
+        return None, failures
+    maps = context["maps"]
+    scopes = context["scopes"]
+    deadlines = context["deadlines"]
+    ny_scope = scopes["ny-fed-markets"]
+    internal_scope = scopes["internal"]
+
+    treasury_dates = sorted(maps["treasury-purchases"])
+    latest_treasury_date = treasury_dates[-1]
+    treasury_window_dates = [
+        period
+        for period in treasury_dates
+        if period >= latest_treasury_date - timedelta(days=29)
+    ]
+    treasury_inputs = [
+        _operations_direct_lineage(
+            maps["treasury-purchases"][period],
+            license_scope=ny_scope,
+            fresh_until=deadlines["treasury"],
+        )
+        for period in treasury_window_dates
+    ]
+    latest_treasury = maps["treasury-purchases"][latest_treasury_date]
+    treasury_30d = sum(
+        (maps["treasury-purchases"][period].value for period in treasury_window_dates),
+        Decimal("0"),
+    )
+
+    latest_onrrp_date = max(maps["onrrp-non-small-value-total"])
+    latest_srf_date = max(maps["srp-non-small-value-total"])
+    srf_window_dates = [
+        period
+        for period in sorted(maps["srp-non-small-value-total"])
+        if period >= latest_srf_date - timedelta(days=29)
+    ]
+    srf_window_inputs = [
+        _operations_direct_lineage(
+            maps["srp-non-small-value-total"][period],
+            license_scope=ny_scope,
+            fresh_until=deadlines["srf"],
+        )
+        for period in srf_window_dates
+    ]
+    srf_active_days = Decimal(
+        sum(
+            1
+            for period in srf_window_dates
+            if maps["srp-non-small-value-total"][period].value > 0
+        )
+    )
+
+    soma_dates = sorted(maps["soma-total"])
+    current_soma = maps["soma-total"][soma_dates[-1]]
+    previous_soma = maps["soma-total"][soma_dates[-2]]
+    current_soma_lineage = _operations_direct_lineage(
+        current_soma, license_scope=ny_scope, fresh_until=deadlines["soma"]
+    )
+    previous_soma_lineage = _operations_direct_lineage(
+        previous_soma, license_scope=ny_scope, fresh_until=deadlines["soma"]
+    )
+
+    onrrp_total = maps["onrrp"][latest_onrrp_date]
+    onrrp_regular = maps["onrrp-non-small-value-total"][latest_onrrp_date]
+    onrrp_small = maps["onrrp-small-value-total"][latest_onrrp_date]
+    onrrp_partition_inputs = [
+        _operations_direct_lineage(
+            observation,
+            license_scope=ny_scope,
+            fresh_until=deadlines["onrrp"],
+        )
+        for observation in (onrrp_total, onrrp_small)
+    ]
+    srf_total = maps["srp"][latest_srf_date]
+    srf_regular = maps["srp-non-small-value-total"][latest_srf_date]
+    srf_small = maps["srp-small-value-total"][latest_srf_date]
+    srf_partition_inputs = [
+        _operations_direct_lineage(
+            observation,
+            license_scope=ny_scope,
+            fresh_until=deadlines["srf"],
+        )
+        for observation in (srf_total, srf_small)
+    ]
+
+    metrics = [
+        _operations_direct_metric(
+            key="treasury-purchase-latest",
+            label="最新国债二级市场购买（含 RMP、再投资及可能的演练）",
+            observation=latest_treasury,
+            scope=ny_scope,
+            fresh_until=deadlines["treasury"],
+            formula=OPERATIONS_FORMULAS["treasury-purchase-latest"],
+        ),
+        _operations_derived_metric(
+            key="treasury-purchases-30d",
+            label="国债二级市场购买 30D",
+            value=treasury_30d,
+            formula=OPERATIONS_FORMULAS["treasury-purchases-30d"],
+            inputs=treasury_inputs,
+            internal_scope=internal_scope,
+        ),
+        _operations_direct_metric(
+            key="onrrp-non-small-value-total",
+            label="ON RRP（剔除 small-value）",
+            observation=onrrp_regular,
+            scope=ny_scope,
+            fresh_until=deadlines["onrrp"],
+            formula=OPERATIONS_FORMULAS["onrrp-non-small-value-total"],
+            input_lineage=onrrp_partition_inputs,
+        ),
+        _operations_direct_metric(
+            key="onrrp-rate",
+            label="ON RRP 操作利率",
+            observation=maps["onrrp-rate"][latest_onrrp_date],
+            scope=ny_scope,
+            fresh_until=deadlines["onrrp"],
+            decimals=2,
+            unit="%",
+        ),
+        _operations_direct_metric(
+            key="onrrp-participants",
+            label="ON RRP 参与方",
+            observation=maps["onrrp-participants"][latest_onrrp_date],
+            scope=ny_scope,
+            fresh_until=deadlines["onrrp"],
+            decimals=0,
+            unit=" counterparties",
+        ),
+        _operations_direct_metric(
+            key="srf-non-small-value-total",
+            label="SRF（剔除 small-value）",
+            observation=srf_regular,
+            scope=ny_scope,
+            fresh_until=deadlines["srf"],
+            formula=OPERATIONS_FORMULAS["srf-non-small-value-total"],
+            input_lineage=srf_partition_inputs,
+        ),
+        _operations_direct_metric(
+            key="srf-rate",
+            label="SRF 操作利率",
+            observation=maps["srp-non-small-value-rate"][latest_srf_date],
+            scope=ny_scope,
+            fresh_until=deadlines["srf"],
+            decimals=2,
+            unit="%",
+        ),
+        _operations_derived_metric(
+            key="srf-active-days-30d",
+            label="SRF 激活日 30D",
+            value=srf_active_days,
+            formula=OPERATIONS_FORMULAS["srf-active-days-30d"],
+            inputs=srf_window_inputs,
+            internal_scope=internal_scope,
+            decimals=0,
+            unit=" days",
+        ),
+        _operations_direct_metric(
+            key="soma-total",
+            label="SOMA 总持仓",
+            observation=current_soma,
+            scope=ny_scope,
+            fresh_until=deadlines["soma"],
+        ),
+        _operations_derived_metric(
+            key="soma-weekly-change",
+            label="SOMA 周变化",
+            value=current_soma.value - previous_soma.value,
+            formula=OPERATIONS_FORMULAS["soma-weekly-change"],
+            inputs=[current_soma_lineage, previous_soma_lineage],
+            internal_scope=internal_scope,
+        ),
+    ]
+    metrics[-1]["metadata"]["previous_value"] = float(previous_soma.value)
+    metrics[-1]["metadata"]["previous_value_date"] = (
+        previous_soma.value_date.isoformat()
+    )
+    metrics[-1]["metadata"]["previous_input_lineage"] = [previous_soma_lineage]
+
+    treasury_chart_rows: list[dict[str, Any]] = []
+    treasury_chart_dates = [
+        period
+        for period in treasury_dates
+        if treasury_dates[0] <= period - timedelta(days=29)
+    ]
+    for period in treasury_chart_dates:
+        observation = maps["treasury-purchases"][period]
+        window_dates = [
+            candidate
+            for candidate in treasury_dates
+            if period - timedelta(days=29) <= candidate <= period
+        ]
+        lineages = [
+            _operations_direct_lineage(
+                maps["treasury-purchases"][candidate],
+                license_scope=ny_scope,
+                fresh_until=deadlines["treasury"],
+            )
+            for candidate in window_dates
+        ]
+        rolling_value = sum(
+            (maps["treasury-purchases"][candidate].value for candidate in window_dates),
+            Decimal("0"),
+        )
+        treasury_chart_rows.append(
+            {
+                "date": period.isoformat(),
+                "Purchases": float(observation.value),
+                "30D purchases": float(rolling_value),
+                "_lineage": {
+                    "Purchases": lineages[-1],
+                    "30D purchases": {
+                        "source_key": "internal",
+                        "source_keys": ["internal", "ny-fed-markets"],
+                        "license_scope": internal_scope,
+                        "batch_id": str(observation.batch_id),
+                        "value_date": observation.value_date.isoformat(),
+                        "fetched_at": observation.fetched_at.isoformat(),
+                        "quality_status": Observation.Quality.ESTIMATED,
+                        "fallback_source": None,
+                        "formula": OPERATIONS_FORMULAS["treasury-purchases-30d"],
+                        "input_lineage": lineages,
+                    },
+                },
+            }
+        )
+
+    standing_rows: list[dict[str, Any]] = []
+    standing_dates = sorted(
+        set(maps["onrrp-non-small-value-total"])
+        | set(maps["srp-non-small-value-total"])
+    )
+    for period in standing_dates:
+        row: dict[str, Any] = {"date": period.isoformat(), "_lineage": {}}
+        if period in maps["onrrp-non-small-value-total"]:
+            observation = maps["onrrp-non-small-value-total"][period]
+            row["ON RRP"] = float(observation.value)
+            row["_lineage"]["ON RRP"] = _operations_direct_lineage(
+                observation,
+                license_scope=ny_scope,
+                fresh_until=deadlines["onrrp"],
+            )
+        if period in maps["srp-non-small-value-total"]:
+            observation = maps["srp-non-small-value-total"][period]
+            row["SRF"] = float(observation.value)
+            row["_lineage"]["SRF"] = _operations_direct_lineage(
+                observation,
+                license_scope=ny_scope,
+                fresh_until=deadlines["srf"],
+            )
+        standing_rows.append(row)
+
+    soma_fields = {
+        "Total": "soma-total",
+        "Bills": "soma-bills",
+        "Notes/Bonds": "soma-notes-bonds",
+        "TIPS": "soma-tips",
+        "FRN": "soma-frn",
+        "TIPS inflation comp": "soma-tips-inflation-compensation",
+        "MBS": "soma-mbs",
+        "CMBS": "soma-cmbs",
+        "Agencies": "soma-agencies",
+    }
+    soma_rows: list[dict[str, Any]] = []
+    for period in soma_dates:
+        row = {"date": period.isoformat(), "_lineage": {}}
+        for label, series_key in soma_fields.items():
+            observation = maps.get(series_key, {}).get(period)
+            if observation is None:
+                continue
+            row[label] = float(observation.value)
+            row["_lineage"][label] = _operations_direct_lineage(
+                observation,
+                license_scope=ny_scope,
+                fresh_until=deadlines["soma"],
+            )
+        soma_rows.append(row)
+
+    charts = [
+        _operations_chart(
+            key="operations-treasury-purchases-history",
+            title="国债二级市场购买",
+            description=(
+                "官方购买结果全量；含 RMP、再投资及 feed 未分类的可能演练。"
+            ),
+            data=treasury_chart_rows,
+            source_keys={"internal", "ny-fed-markets"},
+            batch_ids={str(selected["treasury"].batch_id)},
+            as_of=latest_treasury.as_of,
+            fetched_at=latest_treasury.fetched_at,
+            fresh_until=deadlines["treasury"],
+            quality_status=Observation.Quality.ESTIMATED,
+            scopes=scopes,
+        ),
+        _operations_chart(
+            key="operations-standing-tools-history",
+            title="常备工具",
+            description="ON RRP 与 SRF 均剔除有明确 SVE 证据的 small-value 操作。",
+            data=standing_rows,
+            source_keys={"ny-fed-markets"},
+            batch_ids={
+                str(selected["onrrp"].batch_id),
+                str(selected["srf"].batch_id),
+            },
+            as_of=min(onrrp_regular.as_of, srf_regular.as_of),
+            fetched_at=max(onrrp_regular.fetched_at, srf_regular.fetched_at),
+            fresh_until=min(deadlines["onrrp"], deadlines["srf"]),
+            quality_status=Observation.Quality.FRESH,
+            scopes=scopes,
+        ),
+        _operations_chart(
+            key="operations-soma-history",
+            title="SOMA 国内证券持仓",
+            description="官方周度总额及可用证券分项；空白分项不补零。",
+            data=soma_rows,
+            source_keys={"ny-fed-markets"},
+            batch_ids={str(selected["soma"].batch_id)},
+            as_of=current_soma.as_of,
+            fetched_at=current_soma.fetched_at,
+            fresh_until=deadlines["soma"],
+            quality_status=Observation.Quality.FRESH,
+            scopes=scopes,
+        ),
+    ]
+
+    treasury_rows: list[dict[str, Any]] = []
+    for period in reversed(treasury_dates):
+        observation = maps["treasury-purchases"][period]
+        lineage = _operations_direct_lineage(
+            observation,
+            license_scope=ny_scope,
+            fresh_until=deadlines["treasury"],
+        )
+        for operation in reversed((observation.metadata or {}).get("operations") or []):
+            submitted = Decimal(str(operation["totalParAmtSubmitted"])) / Decimal(
+                "1000000"
+            )
+            accepted = Decimal(str(operation["totalParAmtAccepted"])) / Decimal(
+                "1000000"
+            )
+            maturity_range = (
+                f"{operation['maturityRangeStart']} → {operation['maturityRangeEnd']}"
+            )
+            cells = [
+                _operations_cell("operation-id", operation["operationId"]),
+                _operations_cell("date", operation["operationDate"]),
+                _operations_cell("type", operation["operationType"]),
+                _operations_cell("submitted", f"{submitted:,.0f} USD mn"),
+                _operations_cell("accepted", f"{accepted:,.0f} USD mn"),
+                _operations_cell("settlement", operation["settlementDate"]),
+                _operations_cell("maturity-range", maturity_range),
+                _operations_cell("small-value", "官方 feed 未披露"),
+            ]
+            treasury_rows.append(
+                {
+                    "operation_id": operation["operationId"],
+                    "date": operation["operationDate"],
+                    "operation_type": operation["operationType"],
+                    "submitted": f"{submitted:,.0f} USD mn",
+                    "accepted": f"{accepted:,.0f} USD mn",
+                    "settlement": operation["settlementDate"],
+                    "maturity_range": maturity_range,
+                    "small_value_status": "unavailable",
+                    "cells_list": cells,
+                    "source_key": "ny-fed-markets",
+                    "source_keys": ["ny-fed-markets"],
+                    "license_scope": ny_scope,
+                    "value_date": observation.value_date.isoformat(),
+                    "as_of": observation.as_of.isoformat(),
+                    "fetched_at": observation.fetched_at.isoformat(),
+                    "batch_id": str(observation.batch_id),
+                    "quality_status": Observation.Quality.FRESH,
+                    "fallback_source": None,
+                    "_lineage": {**lineage, "operation_id": operation["operationId"]},
+                }
+            )
+            if len(treasury_rows) == 20:
+                break
+        if len(treasury_rows) == 20:
+            break
+
+    repo_rows: list[dict[str, Any]] = []
+    repo_sources = (
+        ("ON RRP", maps["onrrp"], deadlines["onrrp"]),
+        ("SRF", maps["srp"], deadlines["srf"]),
+    )
+    for tool, series_map, deadline in repo_sources:
+        for period, observation in series_map.items():
+            lineage = _operations_direct_lineage(
+                observation, license_scope=ny_scope, fresh_until=deadline
+            )
+            for operation in (observation.metadata or {}).get("operations") or []:
+                accepted = Decimal(str(operation["totalAmtAccepted"])) / Decimal(
+                    "1000000"
+                )
+                rates: list[Decimal] = []
+                for detail in operation.get("details") or []:
+                    raw_rate = detail.get("percentAwardRate")
+                    if raw_rate is None:
+                        raw_rate = detail.get("percentOfferingRate")
+                    if raw_rate is None:
+                        raw_rate = detail.get("minimumBidRate")
+                    if raw_rate is not None:
+                        rates.append(Decimal(str(raw_rate)))
+                rates = sorted(set(rates))
+                rate_display = ", ".join(str(rate) for rate in rates) or "—"
+                participants = operation.get(
+                    "acceptedCpty", operation.get("participatingCpty")
+                )
+                collateral = ", ".join(
+                    str(detail.get("securityType"))
+                    for detail in operation.get("details") or []
+                    if detail.get("securityType")
+                )
+                context_display = (
+                    str(participants)
+                    if tool == "ON RRP" and participants is not None
+                    else collateral or "—"
+                )
+                is_small = _subsurface_operation_is_small_value(operation)
+                cells = [
+                    _operations_cell("date", operation["operationDate"]),
+                    _operations_cell("tool", tool),
+                    _operations_cell("operation-id", operation["operationId"]),
+                    _operations_cell("accepted", f"{accepted:,.2f} USD mn"),
+                    _operations_cell("rate", rate_display),
+                    _operations_cell("participants-collateral", context_display),
+                    _operations_cell("small-value", "Yes" if is_small else "No"),
+                ]
+                repo_rows.append(
+                    {
+                        "date": operation["operationDate"],
+                        "tool": tool,
+                        "operation_id": operation["operationId"],
+                        "accepted": f"{accepted:,.2f} USD mn",
+                        "rate": rate_display,
+                        "participants_or_collateral": context_display,
+                        "is_small_value": is_small,
+                        "cells_list": cells,
+                        "source_key": "ny-fed-markets",
+                        "source_keys": ["ny-fed-markets"],
+                        "license_scope": ny_scope,
+                        "value_date": observation.value_date.isoformat(),
+                        "as_of": observation.as_of.isoformat(),
+                        "fetched_at": observation.fetched_at.isoformat(),
+                        "batch_id": str(observation.batch_id),
+                        "quality_status": Observation.Quality.FRESH,
+                        "fallback_source": None,
+                        "_lineage": {
+                            **lineage,
+                            "operation_id": operation["operationId"],
+                        },
+                    }
+                )
+    repo_rows.sort(
+        key=lambda row: (row["date"], row["operation_id"], row["tool"]),
+        reverse=True,
+    )
+    repo_rows = repo_rows[:20]
+
+    sections = [
+        {
+            "key": "recent-treasury-purchase-operations",
+            "title": "最近 20 场国债二级市场购买",
+            "description": (
+                "结果 feed 不披露稳定的 RMP/再投资用途或 small-value 标志。"
+            ),
+            "columns": [
+                {"key": "operation-id", "label": "Operation ID"},
+                {"key": "date", "label": "日期"},
+                {"key": "type", "label": "类型"},
+                {"key": "submitted", "label": "提交"},
+                {"key": "accepted", "label": "接受"},
+                {"key": "settlement", "label": "结算"},
+                {"key": "maturity-range", "label": "期限范围"},
+                {"key": "small-value", "label": "技术测试"},
+            ],
+            "rows": treasury_rows,
+            "source_keys": ["ny-fed-markets"],
+            "license_scope": ny_scope,
+            "batch_ids": [str(selected["treasury"].batch_id)],
+            "as_of": latest_treasury.as_of.isoformat(),
+            "fetched_at": latest_treasury.fetched_at.isoformat(),
+            "fresh_until": deadlines["treasury"].isoformat(),
+            "quality_status": Observation.Quality.FRESH,
+            "fallback_source": None,
+        },
+        {
+            "key": "recent-repo-reverse-repo-operations",
+            "title": "最近 20 场 Repo / Reverse Repo 操作",
+            "description": "small-value 只按官方 note / SVE 证据分类。",
+            "columns": [
+                {"key": "date", "label": "日期"},
+                {"key": "tool", "label": "工具"},
+                {"key": "operation-id", "label": "Operation ID"},
+                {"key": "accepted", "label": "接受"},
+                {"key": "rate", "label": "利率"},
+                {
+                    "key": "participants-collateral",
+                    "label": "参与方 / 抵押品",
+                },
+                {"key": "small-value", "label": "SVE"},
+            ],
+            "rows": repo_rows,
+            "source_keys": ["ny-fed-markets"],
+            "license_scope": ny_scope,
+            "batch_ids": [
+                str(selected["onrrp"].batch_id),
+                str(selected["srf"].batch_id),
+            ],
+            "as_of": max(onrrp_regular.as_of, srf_regular.as_of).isoformat(),
+            "fetched_at": max(
+                onrrp_regular.fetched_at, srf_regular.fetched_at
+            ).isoformat(),
+            "fresh_until": min(
+                deadlines["onrrp"], deadlines["srf"]
+            ).isoformat(),
+            "quality_status": Observation.Quality.FRESH,
+            "fallback_source": None,
+        },
+    ]
+    extra_data = {
+        "contract_version": OPERATIONS_CONTRACT_VERSION,
+        "refresh_cycle_id": context["refresh_cycle_id"],
+        "component_runs": [
+            _operations_run_state(identity, selected[identity], status="valid")
+            for identity in OPERATIONS_DATASETS
+        ],
+        "formulas": dict(OPERATIONS_FORMULAS),
+        "component_value_dates": {
+            identity: period.isoformat()
+            for identity, period in context["latest_dates"].items()
+        },
+        "treasury_coverage": (
+            "All official purchase results; includes reserve-management and "
+            "principal-reinvestment purchases and may include unclassified "
+            "operational-readiness exercises."
+        ),
+    }
+    return (metrics, charts, sections, extra_data), []
+
+
+def _operations_page_contract_is_buildable(data: dict[str, Any]) -> bool:
+    metrics = data.get("metrics")
+    charts = data.get("charts")
+    sections = data.get("sections")
+    if (
+        data.get("contract_version") != OPERATIONS_CONTRACT_VERSION
+        or not isinstance(metrics, list)
+        or len(metrics) != len(OPERATIONS_REQUIRED_METRIC_KEYS)
+        or not all(isinstance(item, dict) for item in metrics)
+        or {str(item.get("key") or "") for item in metrics if isinstance(item, dict)}
+        != set(OPERATIONS_REQUIRED_METRIC_KEYS)
+        or not isinstance(charts, list)
+        or len(charts) != len(OPERATIONS_REQUIRED_CHART_KEYS)
+        or not all(isinstance(item, dict) for item in charts)
+        or {str(item.get("key") or "") for item in charts if isinstance(item, dict)}
+        != set(OPERATIONS_REQUIRED_CHART_KEYS)
+        or not isinstance(sections, list)
+        or len(sections) != len(OPERATIONS_REQUIRED_SECTION_KEYS)
+        or not all(isinstance(item, dict) for item in sections)
+        or {str(item.get("key") or "") for item in sections if isinstance(item, dict)}
+        != set(OPERATIONS_REQUIRED_SECTION_KEYS)
+        or data.get("formulas") != OPERATIONS_FORMULAS
+        or any(not isinstance(item.get("metadata"), dict) for item in metrics)
+        or any(item.get("fallback_source") is not None for item in metrics)
+        or any(
+            not chart.get("data")
+            or chart.get("lineage_mode") != "per-point"
+            or chart.get("fallback_source") is not None
+            or chart.get("fallback_sources")
+            for chart in charts
+        )
+    ):
+        return False
+    metric_by_key = {str(item["key"]): item for item in metrics}
+    try:
+        treasury_inputs = (
+            metric_by_key["treasury-purchases-30d"].get("metadata") or {}
+        ).get("input_lineage")
+        srf_inputs = (
+            metric_by_key["srf-active-days-30d"].get("metadata") or {}
+        ).get("input_lineage")
+        soma_inputs = (
+            metric_by_key["soma-weekly-change"].get("metadata") or {}
+        ).get("input_lineage")
+        if (
+            not isinstance(treasury_inputs, list)
+            or not treasury_inputs
+            or not isinstance(srf_inputs, list)
+            or not srf_inputs
+            or not isinstance(soma_inputs, list)
+            or len(soma_inputs) != 2
+        ):
+            return False
+        treasury_total = sum(
+            (Decimal(str(item["raw_value"])) for item in treasury_inputs),
+            Decimal("0"),
+        )
+        active_days = Decimal(
+            sum(1 for item in srf_inputs if Decimal(str(item["raw_value"])) > 0)
+        )
+        soma_change = Decimal(str(soma_inputs[0]["raw_value"])) - Decimal(
+            str(soma_inputs[1]["raw_value"])
+        )
+        onrrp_inputs = (
+            metric_by_key["onrrp-non-small-value-total"].get("metadata") or {}
+        ).get("input_lineage")
+        srf_partition_inputs = (
+            metric_by_key["srf-non-small-value-total"].get("metadata") or {}
+        ).get("input_lineage")
+        if (
+            not isinstance(onrrp_inputs, list)
+            or len(onrrp_inputs) != 2
+            or not isinstance(srf_partition_inputs, list)
+            or len(srf_partition_inputs) != 2
+        ):
+            return False
+        onrrp_regular = Decimal(str(onrrp_inputs[0]["raw_value"])) - Decimal(
+            str(onrrp_inputs[1]["raw_value"])
+        )
+        srf_regular = Decimal(str(srf_partition_inputs[0]["raw_value"])) - Decimal(
+            str(srf_partition_inputs[1]["raw_value"])
+        )
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        not _fed_balance_sheet_decimal_equal(
+            metric_by_key["treasury-purchases-30d"]["value"], treasury_total
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            metric_by_key["srf-active-days-30d"]["value"], active_days
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            metric_by_key["soma-weekly-change"]["value"], soma_change
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            metric_by_key["onrrp-non-small-value-total"]["value"], onrrp_regular
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            metric_by_key["srf-non-small-value-total"]["value"], srf_regular
+        )
+        or any(
+            (metric_by_key[key].get("metadata") or {}).get("formula") != formula
+            for key, formula in OPERATIONS_FORMULAS.items()
+        )
+    ):
+        return False
+    section_by_key = {str(item["key"]): item for item in sections}
+    treasury_rows = section_by_key["recent-treasury-purchase-operations"].get(
+        "rows"
+    )
+    repo_rows = section_by_key["recent-repo-reverse-repo-operations"].get("rows")
+    if (
+        not isinstance(treasury_rows, list)
+        or len(treasury_rows) != 20
+        or not isinstance(repo_rows, list)
+        or len(repo_rows) != 20
+    ):
+        return False
+
+    def cells_match(row: dict[str, Any], keys: tuple[str, ...]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        cells = row.get("cells_list")
+        return bool(
+            isinstance(cells, list)
+            and len(cells) == len(keys)
+            and all(isinstance(item, dict) for item in cells)
+            and tuple(str(item.get("key") or "") for item in cells) == keys
+            and all(
+                isinstance(item.get("cell"), dict)
+                and item["cell"].get("kind") == "text"
+                for item in cells
+            )
+            and row.get("source_key") == "ny-fed-markets"
+            and row.get("fallback_source") is None
+            and isinstance(row.get("_lineage"), dict)
+        )
+
+    return all(
+        cells_match(
+            row,
+            (
+                "operation-id",
+                "date",
+                "type",
+                "submitted",
+                "accepted",
+                "settlement",
+                "maturity-range",
+                "small-value",
+            ),
+        )
+        for row in treasury_rows
+    ) and all(
+        cells_match(
+            row,
+            (
+                "date",
+                "tool",
+                "operation-id",
+                "accepted",
+                "rate",
+                "participants-collateral",
+                "small-value",
+            ),
+        )
+        for row in repo_rows
+    )
+
+
+def _operations_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
+    data = dict(snapshot.data or {})
+    all_normalized = list(
+        MetricSnapshot.objects.filter(batch_id=snapshot.batch_id).select_related(
+            "source", "fallback_source"
+        )
+    )
+    normalized = {
+        item.key: item
+        for item in all_normalized
+        if item.key.startswith("operations-")
+    }
+    expected = {f"operations-{key}" for key in OPERATIONS_REQUIRED_METRIC_KEYS}
+    if len(all_normalized) != len(expected) or set(normalized) != expected:
+        return False
+    for metric in data.get("metrics", []):
+        stored = normalized.get(f"operations-{metric['key']}")
+        metadata = metric.get("metadata") or {}
+        if (
+            stored is None
+            or stored.value is None
+            or not _fed_balance_sheet_decimal_equal(stored.value, metric.get("value"))
+            or stored.label != str(metric.get("label") or "")
+            or stored.display_value != str(metric.get("display_value") or "")
+            or stored.unit != str(metric.get("unit") or "")
+            or (stored.change is None) != (metric.get("change") is None)
+            or (
+                stored.change is not None
+                and not _fed_balance_sheet_decimal_equal(
+                    stored.change, metric.get("change")
+                )
+            )
+            or stored.source.key != metric.get("source_key")
+            or stored.fallback_source_id is not None
+            or stored.value_date != _parse_payload_datetime(metric.get("value_date"))
+            or stored.as_of != _parse_payload_datetime(metric.get("as_of"))
+            or stored.fetched_at != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.quality_status != metric.get("quality_status")
+            or stored.license_scope != str(metric.get("license_scope") or "")[:120]
+            or stored.metadata.get("component_batch_id") != metric.get("batch_id")
+            or stored.metadata.get("formula") != metadata.get("formula")
+            or stored.metadata.get("input_lineage") != metadata.get("input_lineage")
+            or stored.metadata.get("input_series")
+            != metadata.get("input_series", [])
+            or stored.metadata.get("input_value_dates")
+            != metadata.get("input_value_dates", [])
+            or stored.metadata.get("calculation_owner")
+            != metadata.get("calculation_owner")
+            or stored.metadata.get("previous_value")
+            != metadata.get("previous_value")
+            or stored.metadata.get("previous_value_date")
+            != metadata.get("previous_value_date")
+            or stored.metadata.get("previous_input_lineage")
+            != metadata.get("previous_input_lineage", [])
+            or stored.metadata.get("publication_fingerprint")
+            != data.get("fingerprint")
+            or stored.metadata.get("payload_integrity_hash")
+            != data.get("payload_integrity_hash")
+            or set(stored.metadata.get("input_batch_ids") or [])
+            != set(metadata.get("input_batch_ids") or [])
+        ):
+            return False
+    return True
+
+
+def _operations_component_runs_from_snapshot(
+    snapshot: DashboardSnapshot,
+) -> dict[str, IngestionRun] | None:
+    references = (snapshot.data or {}).get("component_runs")
+    if (
+        not isinstance(references, list)
+        or len(references) != len(OPERATIONS_DATASETS)
+        or not all(isinstance(item, dict) for item in references)
+    ):
+        return None
+    by_identity = {
+        str(item.get("component") or ""): item
+        for item in references
+        if isinstance(item, dict)
+    }
+    if set(by_identity) != set(OPERATIONS_DATASETS):
+        return None
+    selected: dict[str, IngestionRun] = {}
+    for identity, (source_key, dataset) in OPERATIONS_DATASETS.items():
+        reference = by_identity[identity]
+        run = (
+            IngestionRun.objects.select_related("source")
+            .filter(pk=reference.get("ingestion_run_id"))
+            .first()
+        )
+        if (
+            run is None
+            or run.source.key != source_key
+            or run.dataset != dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or reference.get("kind") != "ingestion_run"
+            or reference.get("source") != source_key
+            or reference.get("dataset") != dataset
+            or reference.get("status") != "valid"
+            or reference.get("batch_id") != str(run.batch_id)
+            or reference.get("row_count") != run.row_count
+            or str(reference.get("refresh_cycle_id") or "")
+            != str((run.metadata or {}).get("refresh_cycle_id") or "")
+            or not _operations_artifact_is_valid(run)
+            or reference
+            != _operations_run_state(identity, run, status="valid")
+        ):
+            return None
+        selected[identity] = run
+    cycles = {
+        str((run.metadata or {}).get("refresh_cycle_id") or "")
+        for run in selected.values()
+    }
+    if (
+        len(cycles) != 1
+        or not next(iter(cycles), "")
+        or (snapshot.data or {}).get("refresh_cycle_id") != next(iter(cycles))
+    ):
+        return None
+    return selected
+
+
+def _operations_snapshot_contract_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    selected_runs: dict[str, IngestionRun],
+    allow_natural_expiry: bool = False,
+) -> bool:
+    data = dict(snapshot.data or {})
+    required_sources = {"ny-fed-markets", "internal"}
+    valid_quality = (
+        {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+        if allow_natural_expiry
+        else {Observation.Quality.ESTIMATED}
+    )
+    if (
+        snapshot.key != "operations"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or snapshot.quality_status not in valid_quality
+        or data.get("demo") is not False
+        or data.get("required_notices")
+        != public_source_notices(required_sources)
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or "refresh_failure" in data
+        or set(data.get("component_batches") or [])
+        != {str(run.batch_id) for run in selected_runs.values()}
+        or str(data.get("fingerprint") or "")
+        != _dashboard_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or str(data.get("payload_integrity_hash") or "")
+        != _dashboard_payload_integrity_hash(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _operations_page_contract_is_buildable(data)
+    ):
+        return False
+    prepared, _failures = _operations_page_data(
+        selected_runs, allow_expired=allow_natural_expiry
+    )
+    if prepared is None:
+        return False
+    metrics, charts, sections, extra = prepared
+    return bool(
+        data.get("metrics") == metrics
+        and data.get("charts") == charts
+        and data.get("sections") == sections
+        and data.get("chart_data") == charts[0]["data"]
+        and all(data.get(key) == value for key, value in extra.items())
+        and _operations_normalized_metrics_match(snapshot)
+    )
+
+
+def _operations_embedded_snapshot_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    require_persisted_failure: bool,
+) -> bool:
+    data = dict(snapshot.data or {})
+    required_sources = {"ny-fed-markets", "internal"}
+    public_keys, derived_keys = current_display_source_key_sets(required_sources)
+    if public_keys != required_sources or derived_keys != required_sources:
+        return False
+    scopes: dict[str, str] = {}
+    for source_key in required_sources:
+        source = Source.objects.filter(key=source_key).first()
+        licence = (
+            _effective_source_license(
+                source, require_public=True, require_derived=True
+            )
+            if source is not None
+            else None
+        )
+        if licence is None:
+            return False
+        scopes[source_key] = licence.scope
+    valid_state = (
+        snapshot.quality_status == Observation.Quality.STALE
+        and _fed_balance_sheet_refresh_failure_is_valid(data.get("refresh_failure"))
+        if require_persisted_failure
+        else snapshot.quality_status == Observation.Quality.ESTIMATED
+        and "refresh_failure" not in data
+    )
+    selected = _operations_component_runs_from_snapshot(snapshot)
+    if (
+        not valid_state
+        or selected is None
+        or snapshot.key != "operations"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or data.get("demo") is not False
+        or data.get("required_notices")
+        != public_source_notices(required_sources)
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or set(data.get("component_batches") or [])
+        != {str(run.batch_id) for run in selected.values()}
+        or str(data.get("fingerprint") or "")
+        != _dashboard_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or str(data.get("payload_integrity_hash") or "")
+        != _dashboard_payload_integrity_hash(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _operations_page_contract_is_buildable(data)
+        or _payload_fallback_source_keys(data)
+        or not _operations_normalized_metrics_match(snapshot)
+    ):
+        return False
+    charts = data.get("charts")
+    if not isinstance(charts, list) or not charts or data.get("chart_data") != charts[0].get(
+        "data"
+    ):
+        return False
+    expected_batches = {str(run.batch_id) for run in selected.values()}
+    audited_payload = {
+        key: value for key, value in data.items() if key != "refresh_failure"
+    }
+
+    if (
+        set(data.get("source_keys") or []) != required_sources
+        or set(data.get("component_batches") or []) != expected_batches
+        or not _payload_batch_ids(audited_payload) <= expected_batches
+        or not _payload_source_keys(audited_payload) <= required_sources
+    ):
+        return False
+
+    def lineage_is_valid(value: Any) -> bool:
+        if isinstance(value, list):
+            return all(lineage_is_valid(item) for item in value)
+        if not isinstance(value, dict):
+            return True
+        declared_source_keys = value.get("source_keys")
+        if declared_source_keys is not None:
+            if (
+                not isinstance(declared_source_keys, list)
+                or not set(str(item) for item in declared_source_keys)
+                <= required_sources
+            ):
+                return False
+        declared_batch_ids = value.get("batch_ids")
+        if declared_batch_ids is not None:
+            if (
+                not isinstance(declared_batch_ids, list)
+                or not set(str(item) for item in declared_batch_ids)
+                <= expected_batches
+            ):
+                return False
+        source_key = value.get("source_key")
+        if source_key is not None:
+            if source_key not in required_sources:
+                return False
+            required_lineage_fields = {
+                "batch_id",
+                "license_scope",
+                "quality_status",
+                "fallback_source",
+            }
+            if not required_lineage_fields <= set(value):
+                return False
+        batch_id = value.get("batch_id")
+        if source_key == "ny-fed-markets":
+            if (
+                not batch_id
+                or str(batch_id) not in expected_batches
+                or value.get("license_scope") != scopes["ny-fed-markets"]
+                or value.get("fallback_source") is not None
+                or value.get("quality_status") != Observation.Quality.FRESH
+            ):
+                return False
+        if source_key == "internal":
+            internal_batches = {
+                item.strip()
+                for item in str(batch_id or "").split(",")
+                if item.strip()
+            }
+            if (
+                not internal_batches
+                or not internal_batches <= expected_batches
+                or value.get("license_scope") != scopes["internal"]
+                or value.get("fallback_source") is not None
+                or value.get("quality_status") != Observation.Quality.ESTIMATED
+            ):
+                return False
+        return all(lineage_is_valid(item) for item in value.values())
+
+    return lineage_is_valid(audited_payload)
+
+
+def _operations_has_component_transition(
+    snapshot: DashboardSnapshot,
+    latest_attempts: dict[str, IngestionRun | None] | None = None,
+) -> bool:
+    selected = _operations_component_runs_from_snapshot(snapshot)
+    if selected is None:
+        return False
+    attempts = latest_attempts or {
+        identity: _latest_operations_attempt(identity)
+        for identity in OPERATIONS_DATASETS
+    }
+    return bool(
+        set(attempts) == set(OPERATIONS_DATASETS)
+        and all(attempt is not None for attempt in attempts.values())
+        and any(
+            attempts[identity] is not None
+            and attempts[identity].pk != selected[identity].pk
+            for identity in OPERATIONS_DATASETS
+        )
+    )
+
+
+def _operations_snapshot_is_publicly_displayable_unchecked(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    attempts = {
+        identity: _latest_operations_attempt(identity)
+        for identity in OPERATIONS_DATASETS
+    }
+    successful = {
+        identity: _latest_successful_operations_run(identity)
+        for identity in OPERATIONS_DATASETS
+    }
+    if any(run is None for run in attempts.values()) or any(
+        run is None for run in successful.values()
+    ):
+        return False
+    selected = {
+        identity: run for identity, run in successful.items() if run is not None
+    }
+    if all(
+        attempts[identity].status == IngestionRun.Status.SUCCESS
+        and attempts[identity].row_count > 0
+        and attempts[identity].pk == selected[identity].pk
+        for identity in OPERATIONS_DATASETS
+    ):
+        deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+        expired = deadline is not None and deadline < timezone.now()
+        if _operations_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_natural_expiry=expired,
+        ):
+            return True
+    if _operations_embedded_snapshot_is_valid(
+        snapshot, require_persisted_failure=True
+    ):
+        return True
+    return _operations_has_component_transition(
+        snapshot, latest_attempts=attempts
+    ) and _operations_embedded_snapshot_is_valid(
+        snapshot, require_persisted_failure=False
+    )
+
+
+def operations_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    """Return False, rather than 500, for malformed or forged JSON contracts."""
+
+    try:
+        return _operations_snapshot_is_publicly_displayable_unchecked(snapshot)
+    except (ArithmeticError, AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def select_public_operations_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="operations",
+                is_published=True,
+                data__contract_version=OPERATIONS_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if operations_snapshot_is_publicly_displayable(candidate)
+        ),
+        None,
+    )
+    if selected is not None:
+        deadline = _parse_payload_datetime((selected.data or {}).get("fresh_until"))
+        if (
+            deadline is not None
+            and deadline < timezone.now()
+            or _operations_has_component_transition(selected)
+        ):
+            selected.quality_status = Observation.Quality.STALE
+    return selected
+
+
+def _mark_operations_stale(
+    components: list[dict[str, Any]], *, reason: str
+) -> None:
+    latest = (
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="operations",
+            is_published=True,
+            data__contract_version=OPERATIONS_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return
+    data = dict(latest.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason": reason,
+        "components": components,
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+@transaction.atomic
+def _coordinate_operations_dashboard(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    source_keys = {"internal", "ny-fed-markets"}
+    for source_key in source_keys:
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in=source_keys)
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(source__key__in=source_keys, is_current=True)
+        .order_by("source__key")
+        .values_list("pk", flat=True)
+    )
+    selected, states, triggered = _select_operations_runs(trigger_runs)
+    if not triggered:
+        return [], set()
+    if selected is None:
+        _mark_operations_stale(
+            states,
+            reason=(
+                "Latest Treasury purchases, ON RRP, SRF and SOMA attempts do not "
+                "form one successful same-cycle exact component set."
+            ),
+        )
+        return [], {"operations"}
+    list(
+        IngestionRun.objects.select_for_update()
+        .filter(pk__in=[run.pk for run in selected.values()])
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    previous = (
+        DashboardSnapshot.objects.filter(
+            key="operations",
+            is_published=True,
+            data__contract_version=OPERATIONS_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    expected_batches = {str(run.batch_id) for run in selected.values()}
+    if (
+        previous is not None
+        and set((previous.data or {}).get("component_batches") or [])
+        == expected_batches
+        and "refresh_failure" not in (previous.data or {})
+        and _operations_snapshot_contract_is_valid(
+            previous, selected_runs=selected
+        )
+    ):
+        return [], set()
+    prepared, failures = _operations_page_data(selected)
+    if prepared is None:
+        _mark_operations_stale(
+            failures,
+            reason=(
+                "Operations exact batches, coverage, partitions, formulas, raw "
+                "artifacts, licences or lineage failed validation."
+            ),
+        )
+        return [], {"operations"}
+    metrics, charts, sections, extra_data = prepared
+    if previous is not None:
+        previous_dates = (previous.data or {}).get("component_value_dates") or {}
+        candidate_dates = extra_data["component_value_dates"]
+        if any(
+            identity in previous_dates
+            and candidate_dates[identity] < str(previous_dates[identity])
+            for identity in OPERATIONS_DATASETS
+        ):
+            _mark_operations_stale(
+                [
+                    _operations_failure(
+                        "regression", "candidate component value date regressed"
+                    )
+                ],
+                reason="Candidate operations v1 data regressed; retained prior snapshot.",
+            )
+            return [], {"operations"}
+    try:
+        with transaction.atomic():
+            published = _publish_dashboard(
+                key="operations",
+                title="公开市场操作",
+                summary=(
+                    "美债二级市场购买、ON RRP、SRF 与 SOMA 只在四个 New York "
+                    "Fed 最新成功 exact batches 同刷新周期时原子发布。"
+                    "购买 feed 混合 RMP、再投资与可能的演练；因官方未披露"
+                    "稳定用途或 small-value 字段，不伪造 RMP-only 或测试分区。"
+                ),
+                metrics=metrics,
+                charts=charts,
+                sections=sections,
+                extra_data=extra_data,
+                required_metric_keys=OPERATIONS_REQUIRED_METRIC_KEYS,
+                batch_id=uuid.uuid4(),
+            )
+            latest = (
+                DashboardSnapshot.objects.filter(
+                    key="operations",
+                    is_published=True,
+                    data__contract_version=OPERATIONS_CONTRACT_VERSION,
+                )
+                .exclude(source__key="demo-market")
+                .order_by("-created_at", "-id")
+                .first()
+            )
+            if (
+                latest is None
+                or not _operations_runs_still_latest(selected)
+                or not _operations_snapshot_contract_is_valid(
+                    latest, selected_runs=selected
+                )
+            ):
+                raise ValueError("operations v1 publication postcondition failed")
+    except (ArithmeticError, IndexError, KeyError, StopIteration, TypeError, ValueError):
+        _mark_operations_stale(
+            [
+                _operations_failure(
+                    "publication",
+                    "publication postcondition or latest-attempt check failed",
+                )
+            ],
+            reason=(
+                "Operations v1 publication postcondition failed; retained the "
+                "previous fully audited snapshot."
+            ),
+        )
+        return [], {"operations"}
+    return ([published] if published is not None else []), set()
+
+
+def _latest_h10_attempt(*, lock: bool = False) -> IngestionRun | None:
+    queryset = IngestionRun.objects.filter(
+        source__key=ASSETS_FX_DATASET[0],
+        dataset=ASSETS_FX_DATASET[1],
+    ).select_related("source")
+    if lock:
+        queryset = queryset.select_for_update()
+    return queryset.order_by("-started_at", "-id").first()
+
+
+def _h10_run_state(
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    metadata = dict(run.metadata or {}) if run is not None else {}
+    return {
+        "component": "h10",
+        "kind": "ingestion_run",
+        "source": ASSETS_FX_DATASET[0],
+        "dataset": ASSETS_FX_DATASET[1],
+        "status": status or (run.status if run is not None else "missing"),
+        "reason": (
+            reason
+            or (run.error if run is not None else "required H.10 run missing")
+        )[:320],
+        "ingestion_run_id": run.pk if run is not None else None,
+        "batch_id": str(run.batch_id) if run is not None else None,
+        "row_count": run.row_count if run is not None else 0,
+        "completed_at": (
+            run.completed_at.isoformat()
+            if run is not None and run.completed_at is not None
+            else None
+        ),
+        "fetched_at": metadata.get("fetched_at"),
+        "prepared_at": metadata.get("source_prepared_at"),
+        "latest_valid_dates": metadata.get("latest_valid_dates"),
+    }
+
+
+def _validated_h10_artifact_bytes(
+    run: IngestionRun,
+) -> tuple[bytes, RawArtifact, dict[str, Any]]:
+    """Return exact private H.10 ZIP bytes after neutral acquisition checks."""
+
+    if (
+        run.source.key != ASSETS_FX_DATASET[0]
+        or run.dataset != ASSETS_FX_DATASET[1]
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+    ):
+        raise ValueError("H.10 run identity, status or row count is invalid")
+    metadata = dict(run.metadata or {})
+    archive_sha = str(metadata.get("archive_sha256") or "").lower()
+    generic_sha = str(metadata.get("sha256") or "").lower()
+    try:
+        archive_size = int(metadata.get("archive_size") or 0)
+        byte_length = int(metadata.get("byte_length") or 0)
+        member_size = int(metadata.get("archive_member_size") or -1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("H.10 archive/member size metadata is invalid") from exc
+    if (
+        len(archive_sha) != 64
+        or any(character not in "0123456789abcdef" for character in archive_sha)
+        or generic_sha != archive_sha
+        or archive_size <= 0
+        or archive_size != byte_length
+        or archive_size > 16 * 1024 * 1024
+        or metadata.get("content_type") != "application/zip"
+        or metadata.get("archive_member") != "H10_data.xml"
+        or member_size <= 0
+        or member_size > 64 * 1024 * 1024
+    ):
+        raise ValueError("H.10 archive metadata is not an exact ZIP contract")
+    artifacts = list(RawArtifact.objects.filter(run=run).order_by("pk"))
+    if len(artifacts) != 1:
+        raise ValueError("H.10 requires exactly one private acquisition artifact")
+    artifact = artifacts[0]
+    expected_uri = (
+        f"private://federal-reserve/{archive_sha[:2]}/{archive_sha}.bin"
+    )
+    if (
+        artifact.sha256.lower() != archive_sha
+        or artifact.size_bytes != archive_size
+        or artifact.content_type != "application/zip"
+        or artifact.uri != expected_uri
+    ):
+        raise ValueError("H.10 private artifact row does not match run metadata")
+    root = Path(
+        getattr(
+            settings,
+            "RAW_ARTIFACT_ROOT",
+            settings.BASE_DIR / "data" / "artifacts",
+        )
+    )
+    path = root / archive_sha[:2] / f"{archive_sha}.bin"
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(archive_size + 1)
+    except OSError as exc:
+        raise ValueError("H.10 private artifact is unavailable") from exc
+    if (
+        len(payload) != archive_size
+        or hashlib.sha256(payload).hexdigest() != archive_sha
+    ):
+        raise ValueError("H.10 private artifact bytes failed integrity check")
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            member = FederalReserveH10Provider._data_member(archive)
+            if (
+                member.flag_bits & 0x1
+                or member.compress_type
+                not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                or member.file_size != member_size
+                or (
+                    member.file_size > 1024 * 1024
+                    and member.file_size / (member.compress_size or 1) > 200
+                )
+            ):
+                raise ValueError("H.10 private member failed ZIP safety checks")
+            with archive.open(member) as member_stream:
+                member_bytes = member_stream.read(64 * 1024 * 1024 + 1)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ValueError("H.10 private artifact is not a valid ZIP") from exc
+    member_sha = str(metadata.get("archive_member_sha256") or "").lower()
+    if (
+        len(member_sha) != 64
+        or any(character not in "0123456789abcdef" for character in member_sha)
+        or member.filename != "H10_data.xml"
+        or len(member_bytes) != member.file_size
+        or hashlib.sha256(member_bytes).hexdigest() != member_sha
+    ):
+        raise ValueError("H.10 private member hash, name or size changed")
+    return payload, artifact, {
+        "archive_sha256": archive_sha,
+        "archive_size": archive_size,
+        "member_sha256": member_sha,
+        "member_size": member_size,
+        "member_name": member.filename,
+    }
+
+
+def _validated_h10_component(
+    run: IngestionRun,
+    *,
+    allow_expired: bool,
+    require_observations: bool,
+) -> tuple[dict[str, list[Observation]], dict[str, Any]]:
+    """Reparse and reconcile one exact H.10 acquisition without page coupling."""
+
+    payload, artifact, artifact_meta = _validated_h10_artifact_bytes(run)
+    run_metadata = dict(run.metadata or {})
+    fetched_at = _parse_payload_datetime(run_metadata.get("fetched_at"))
+    if (
+        fetched_at is None
+        or fetched_at > timezone.now() + timedelta(minutes=5)
+    ):
+        raise ValueError("H.10 run lacks a valid nonfuture fetched_at")
+    validator = FederalReserveH10Provider()
+    try:
+        records, reparsed_metadata = validator._parse_archive(
+            io.BytesIO(payload),
+            tuple(H10_TARGET_SERIES),
+            fetched_at=fetched_at,
+            archive_size=len(payload),
+        )
+    finally:
+        validator.close()
+    required_metadata = (
+        "archive_member",
+        "archive_member_size",
+        "archive_member_sha256",
+        "source_prepared_at",
+        "latest_valid_dates",
+        "requested_series",
+        "found_series",
+        "missing_series",
+        "status_counts",
+        "missing_observation_count",
+        "quality_status",
+    )
+    if any(
+        run_metadata.get(key) != reparsed_metadata.get(key)
+        for key in required_metadata
+    ):
+        raise ValueError("H.10 stored release metadata changed")
+    prepared = _parse_payload_datetime(reparsed_metadata.get("source_prepared_at"))
+    if (
+        prepared is None
+        or prepared > fetched_at + timedelta(minutes=5)
+        or prepared > timezone.now() + timedelta(minutes=5)
+    ):
+        raise ValueError("H.10 Prepared timestamp is invalid or future-dated")
+    expected = {
+        (str(item["series_id"]).lower(), str(item["date"])): item
+        for item in records
+        if item.get("value") is not None
+    }
+    required_series = {
+        str(item["series_id"]).lower() for item in H10_TARGET_SERIES.values()
+    }
+    if (
+        len(expected) != run.row_count
+        or {identity[0] for identity in expected} != required_series
+    ):
+        raise ValueError("H.10 reparsed numeric rows do not match the run")
+    units = {
+        "h10-broad-dollar": "index",
+        "h10-eurusd": "USD/EUR",
+        "h10-usdcny": "CNY/USD",
+        "h10-usdjpy": "JPY/USD",
+    }
+    definitions = {
+        item.key: item
+        for item in SeriesDefinition.objects.filter(key__in=required_series)
+    }
+    if (
+        set(definitions) != required_series
+        or any(
+            definition.source_id != run.source_id
+            or definition.frequency != "daily"
+            or definition.unit != units[key]
+            for key, definition in definitions.items()
+        )
+    ):
+        raise ValueError("H.10 normalized series definitions changed")
+
+    observations: list[Observation] = []
+    if require_observations:
+        observations = list(
+            Observation.objects.filter(source=run.source, batch_id=run.batch_id)
+            .select_related("series", "source", "fallback_source")
+            .order_by("series__key", "value_date", "id")
+        )
+        actual: dict[tuple[str, str], Observation] = {}
+        for observation in observations:
+            identity = (
+                observation.series.key if observation.series_id else "",
+                observation.value_date.date().isoformat(),
+            )
+            if identity in actual:
+                raise ValueError("H.10 exact observation identity is duplicated")
+            actual[identity] = observation
+        if len(observations) != len(expected) or set(actual) != set(expected):
+            raise ValueError("H.10 exact observations do not match private ZIP")
+        for identity, expected_row in expected.items():
+            stored = actual[identity]
+            if (
+                stored.instrument_id is not None
+                or stored.series_id != definitions[identity[0]].pk
+                or stored.source_id != run.source_id
+                or stored.batch_id != run.batch_id
+                or stored.value != Decimal(str(expected_row["value"]))
+                or stored.as_of != stored.value_date
+                or stored.fetched_at != fetched_at
+                or stored.quality_status != Observation.Quality.FRESH
+                or stored.fallback_source_id is not None
+                or stored.metadata != expected_row.get("metadata")
+                or stored.value_date > fetched_at
+            ):
+                raise ValueError("H.10 normalized observation was tampered")
+    else:
+        for (series_key, raw_date), expected_row in sorted(expected.items()):
+            value_date = datetime.combine(
+                date.fromisoformat(raw_date), time.min, tzinfo=UTC
+            )
+            observations.append(
+                SimpleNamespace(
+                    series=definitions[series_key],
+                    source=run.source,
+                    value=Decimal(str(expected_row["value"])),
+                    value_date=value_date,
+                    as_of=value_date,
+                    fetched_at=fetched_at,
+                    batch_id=run.batch_id,
+                    quality_status=Observation.Quality.FRESH,
+                    fallback_source_id=None,
+                    metadata=dict(expected_row.get("metadata") or {}),
+                )
+            )
+    by_series: dict[str, list[Observation]] = defaultdict(list)
+    for observation in observations:
+        by_series[observation.series.key].append(observation)
+    for rows in by_series.values():
+        rows.sort(key=lambda item: (item.value_date, getattr(item, "pk", 0) or 0))
+    if set(by_series) != required_series or any(not rows for rows in by_series.values()):
+        raise ValueError("H.10 normalized series set is incomplete")
+    latest_dates = {key: rows[-1].value_date for key, rows in by_series.items()}
+    declared_latest = {
+        H10_TARGET_SERIES[board_id]["series_id"].lower(): raw_date
+        for board_id, raw_date in reparsed_metadata["latest_valid_dates"].items()
+    }
+    if {
+        key: value.date().isoformat() for key, value in latest_dates.items()
+    } != declared_latest:
+        raise ValueError("H.10 latest observation dates changed")
+    component_deadline = min(
+        fetched_at + timedelta(days=8),
+        prepared + timedelta(days=8),
+        *(value + timedelta(days=12) for value in latest_dates.values()),
+    )
+    if not allow_expired and component_deadline < timezone.now():
+        raise ValueError("H.10 exact component is stale")
+    return by_series, {
+        "artifact": artifact,
+        "artifact_sha256": artifact_meta["archive_sha256"],
+        "artifact_size": artifact_meta["archive_size"],
+        "member_name": artifact_meta["member_name"],
+        "member_sha256": artifact_meta["member_sha256"],
+        "member_size": artifact_meta["member_size"],
+        "fetched_at": fetched_at,
+        "prepared_at": prepared,
+        "latest_dates": latest_dates,
+        "fresh_until": component_deadline,
+        "row_count": len(observations),
+    }
+
+
+def _h10_direct_lineage(
+    observation: Observation,
+    *,
+    run: IngestionRun,
+    scope: str,
+    fresh_until: datetime,
+    acquisition_sha256: str,
+    member_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "series_key": observation.series.key,
+        "board_series_id": observation.metadata.get("board_series_id"),
+        "raw_value": f"{Decimal(str(observation.value)):.8f}",
+        "value": float(observation.value),
+        "unit": observation.series.unit,
+        "quote_convention": observation.metadata.get("quote_convention"),
+        "source_key": observation.source.key,
+        "source_keys": [observation.source.key],
+        "license_scope": scope,
+        "value_date": observation.value_date.isoformat(),
+        "as_of": observation.as_of.isoformat(),
+        "fetched_at": observation.fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": str(observation.batch_id),
+        "run_id": run.pk,
+        "quality_status": observation.quality_status,
+        "fallback_source": None,
+        "acquisition_sha256": acquisition_sha256,
+        "archive_member_sha256": member_sha256,
+    }
+
+
+def _assets_fx_cell(key: str, value: Any) -> dict[str, Any]:
+    return {"key": key, "cell": {"kind": "text", "value": str(value)}}
+
+
+def _assets_fx_page_data(
+    run: IngestionRun,
+    *,
+    allow_expired: bool = False,
+    require_observations: bool = True,
+) -> tuple[
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None,
+    list[dict[str, Any]],
+]:
+    """Build the exact assets-fx v1 payload from one H.10 run."""
+
+    try:
+        if (
+            run.source.key != ASSETS_FX_DATASET[0]
+            or run.dataset != ASSETS_FX_DATASET[1]
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+        ):
+            raise ValueError("assets-fx requires one successful non-empty H.10 run")
+        sources = {
+            item.key: item
+            for item in Source.objects.filter(
+                key__in={"federal-reserve", "internal"}
+            )
+        }
+        if set(sources) != {"federal-reserve", "internal"}:
+            raise ValueError("assets-fx required sources are missing")
+        scopes: dict[str, str] = {}
+        for source_key, source in sources.items():
+            licence = _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+                require_storage=True,
+            )
+            if licence is None:
+                raise ValueError(
+                    f"assets-fx source lacks current display/storage rights: {source_key}"
+                )
+            scopes[source_key] = licence.scope
+        by_series, component = _validated_h10_component(
+            run,
+            allow_expired=allow_expired,
+            require_observations=require_observations,
+        )
+        if any(len(by_series[key]) < 2 for key in ASSETS_FX_REQUIRED_METRIC_KEYS):
+            raise ValueError("assets-fx metrics require a previous valid observation")
+        if len(by_series["h10-broad-dollar"]) < 260:
+            raise ValueError("assets-fx broad-dollar history requires exactly 260 points")
+
+        fresh_until = component["fresh_until"]
+        archive_sha = component["artifact_sha256"]
+        member_sha = component["member_sha256"]
+
+        def lineage(observation: Observation) -> dict[str, Any]:
+            return _h10_direct_lineage(
+                observation,
+                run=run,
+                scope=scopes["federal-reserve"],
+                fresh_until=fresh_until,
+                acquisition_sha256=archive_sha,
+                member_sha256=member_sha,
+            )
+
+        metric_specs = (
+            (
+                "h10-broad-dollar",
+                "H.10 Nominal Broad Dollar Index",
+                2,
+                "Jan 2006 = 100",
+            ),
+            ("h10-eurusd", "H.10 EUR/USD Reference", 4, "USD per EUR"),
+            ("h10-usdcny", "H.10 USD/CNY Reference", 4, "CNY per USD"),
+            ("h10-usdjpy", "H.10 USD/JPY Reference", 4, "JPY per USD"),
+        )
+        metrics: list[dict[str, Any]] = []
+        for key, label, decimals, unit in metric_specs:
+            previous, current = by_series[key][-2:]
+            change = Decimal("100") * (
+                current.value / previous.value - Decimal("1")
+            )
+            current_lineage = lineage(current)
+            previous_lineage = lineage(previous)
+            metrics.append(
+                {
+                    "key": key,
+                    "label": label,
+                    "value": float(current.value),
+                    "display_value": f"{current.value:,.{decimals}f}",
+                    "change": float(change),
+                    "unit": unit,
+                    "quality_status": Observation.Quality.FRESH,
+                    "source": "Federal Reserve H.10",
+                    "source_key": "federal-reserve",
+                    "source_keys": ["federal-reserve", "internal"],
+                    "license_scope": scopes["federal-reserve"],
+                    "value_date": current.value_date.isoformat(),
+                    "as_of": current.as_of.isoformat(),
+                    "fetched_at": current.fetched_at.isoformat(),
+                    "fresh_until": fresh_until.isoformat(),
+                    "batch_id": str(run.batch_id),
+                    "fallback_source": None,
+                    "metadata": {
+                        "formula": ASSETS_FX_CHANGE_FORMULA,
+                        "change_formula": ASSETS_FX_CHANGE_FORMULA,
+                        "change_quality_status": Observation.Quality.ESTIMATED,
+                        "change_calculation_owner": "Atlas Macro",
+                        "calculation_owner": "Federal Reserve Board",
+                        "quote_convention": current.metadata.get(
+                            "quote_convention"
+                        ),
+                        "input_series": [key],
+                        "input_batch_ids": [str(run.batch_id)],
+                        "input_value_dates": [
+                            previous.value_date.isoformat(),
+                            current.value_date.isoformat(),
+                        ],
+                        "input_lineage": [previous_lineage, current_lineage],
+                        "current_value": f"{Decimal(str(current.value)):.8f}",
+                        "current_value_date": current.value_date.isoformat(),
+                        "current_input_lineage": current_lineage,
+                        "previous_value": f"{Decimal(str(previous.value)):.8f}",
+                        "previous_value_date": previous.value_date.isoformat(),
+                        "previous_input_lineage": [previous_lineage],
+                        "acquisition_sha256": archive_sha,
+                        "archive_member_sha256": member_sha,
+                        "component": "h10",
+                        "input_run_id": run.pk,
+                    },
+                }
+            )
+
+        broad_history: list[dict[str, Any]] = []
+        for observation in by_series["h10-broad-dollar"][-260:]:
+            broad_history.append(
+                {
+                    "date": observation.value_date.date().isoformat(),
+                    "Nominal Broad Dollar Index": float(observation.value),
+                    "source_keys": ["federal-reserve"],
+                    "batch_id": str(run.batch_id),
+                    "quality_status": Observation.Quality.FRESH,
+                    "fallback_source": None,
+                    "lineage": lineage(observation),
+                    "_source_keys": ["federal-reserve"],
+                    "_lineage": {
+                        "Nominal Broad Dollar Index": lineage(observation)
+                    },
+                }
+            )
+
+        fx_series_keys = ("h10-eurusd", "h10-usdcny", "h10-usdjpy")
+        fx_maps = {
+            key: {item.value_date.date(): item for item in by_series[key]}
+            for key in fx_series_keys
+        }
+        common_fx_dates = sorted(
+            set.intersection(*(set(rows) for rows in fx_maps.values()))
+        )[-120:]
+        if len(common_fx_dates) != 120:
+            raise ValueError("assets-fx major rates require exactly 120 common dates")
+        base_inputs = {
+            key: fx_maps[key][common_fx_dates[0]] for key in fx_series_keys
+        }
+        rebased_rows: list[dict[str, Any]] = []
+        labels = {
+            "h10-eurusd": "EUR reciprocal USD strength",
+            "h10-usdcny": "CNY per USD",
+            "h10-usdjpy": "JPY per USD",
+        }
+        for period in common_fx_dates:
+            row: dict[str, Any] = {
+                "date": period.isoformat(),
+                "source_keys": ["federal-reserve", "internal"],
+                "batch_id": str(run.batch_id),
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+                "lineage": {},
+                "_source_keys": ["federal-reserve", "internal"],
+                "_lineage": {},
+            }
+            for key in fx_series_keys:
+                current = fx_maps[key][period]
+                base = base_inputs[key]
+                if key == "h10-eurusd":
+                    rebased = Decimal("100") * base.value / current.value
+                    formula = "100 * (1 / EURUSD_t) / (1 / EURUSD_0)"
+                else:
+                    rebased = Decimal("100") * current.value / base.value
+                    formula = "100 * USD_quote_t / USD_quote_0"
+                label = labels[key]
+                derived_lineage = {
+                    "series_key": key,
+                    "source_key": "internal",
+                    "source_keys": ["federal-reserve", "internal"],
+                    "license_scope": scopes["internal"],
+                    "value_date": period.isoformat(),
+                    "as_of": current.as_of.isoformat(),
+                    "fetched_at": current.fetched_at.isoformat(),
+                    "fresh_until": fresh_until.isoformat(),
+                    "batch_id": str(run.batch_id),
+                    "run_id": run.pk,
+                    "quality_status": Observation.Quality.ESTIMATED,
+                    "fallback_source": None,
+                    "formula": formula,
+                    "calculation_owner": "Atlas Macro",
+                    "input_lineage": [lineage(base), lineage(current)],
+                    "acquisition_sha256": archive_sha,
+                    "archive_member_sha256": member_sha,
+                }
+                row[label] = float(rebased)
+                row["lineage"][label] = derived_lineage
+                row["_lineage"][label] = derived_lineage
+            rebased_rows.append(row)
+
+        charts = [
+            {
+                "key": "fx-broad-dollar-history",
+                "title": "H.10 Nominal Broad Dollar Index",
+                "description": (
+                    "Latest 260 valid H.10 observations. GET period is a display "
+                    "upper bound; the v1 available window is capped by this payload."
+                ),
+                "kind": "line",
+                "data": broad_history,
+                "source_keys": ["federal-reserve"],
+                "license_scopes": [
+                    f"{sources['federal-reserve'].name}: {scopes['federal-reserve']}"
+                ],
+                "batch_ids": [str(run.batch_id)],
+                "as_of": by_series["h10-broad-dollar"][-1].as_of.isoformat(),
+                "fetched_at": component["fetched_at"].isoformat(),
+                "fresh_until": fresh_until.isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+                "fallback_sources": [],
+                "lineage_mode": "per-point",
+                "time_axis": "date",
+            },
+            {
+                "key": "fx-major-reference-rates-usd-strength-rebased",
+                "title": "H.10 Major Reference Rates, USD Strength Rebased",
+                "description": (
+                    "Latest 120 common valid dates, rebased to 100; EUR/USD is "
+                    "inverted. GET period is a display upper bound and v1 is capped "
+                    "by the published 120-point available window."
+                ),
+                "kind": "line",
+                "data": rebased_rows,
+                "source_keys": ["federal-reserve", "internal"],
+                "license_scopes": [
+                    f"{sources[key].name}: {scopes[key]}"
+                    for key in ("federal-reserve", "internal")
+                ],
+                "batch_ids": [str(run.batch_id)],
+                "as_of": datetime.combine(
+                    common_fx_dates[-1], time.min, tzinfo=UTC
+                ).isoformat(),
+                "fetched_at": component["fetched_at"].isoformat(),
+                "fresh_until": fresh_until.isoformat(),
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+                "fallback_sources": [],
+                "lineage_mode": "per-point",
+                "time_axis": "date",
+            },
+        ]
+
+        all_maps = {
+            key: {item.value_date.date(): item for item in by_series[key]}
+            for key in ASSETS_FX_REQUIRED_METRIC_KEYS
+        }
+        recent_dates = sorted(
+            set.intersection(*(set(rows) for rows in all_maps.values()))
+        )[-20:]
+        if len(recent_dates) != 20:
+            raise ValueError("assets-fx recent table requires exactly 20 common dates")
+        recent_rows: list[dict[str, Any]] = []
+        for period in recent_dates:
+            observations = {
+                key: all_maps[key][period]
+                for key in ASSETS_FX_REQUIRED_METRIC_KEYS
+            }
+            row_lineage = {key: lineage(item) for key, item in observations.items()}
+            row = {
+                "date": period.isoformat(),
+                "broad-dollar": f"{observations['h10-broad-dollar'].value:.2f}",
+                "eur-usd": f"{observations['h10-eurusd'].value:.4f}",
+                "usd-cny": f"{observations['h10-usdcny'].value:.4f}",
+                "usd-jpy": f"{observations['h10-usdjpy'].value:.4f}",
+                "quality": Observation.Quality.FRESH,
+                "batch": str(run.batch_id),
+                "source_key": "federal-reserve",
+                "source_keys": ["federal-reserve"],
+                "batch_id": str(run.batch_id),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+                "lineage": row_lineage,
+            }
+            row["cells_list"] = [
+                _assets_fx_cell(key, row[key]) for key in ASSETS_FX_RECENT_COLUMNS
+            ]
+            recent_rows.append(row)
+
+        latest_date_labels = {
+            "h10-broad-dollar": "Broad Dollar",
+            "h10-eurusd": "EUR/USD",
+            "h10-usdcny": "USD/CNY",
+            "h10-usdjpy": "USD/JPY",
+        }
+        latest_dates_text = "; ".join(
+            f"{latest_date_labels[key]}={value.date().isoformat()}"
+            for key, value in sorted(component["latest_dates"].items())
+        )
+        run_state = _h10_run_state(run, status="valid")
+        methodology_lineage = {
+            "source_key": "federal-reserve",
+            "source_keys": ["federal-reserve"],
+            "license_scope": scopes["federal-reserve"],
+            "run_id": run.pk,
+            "batch_id": str(run.batch_id),
+            "fetched_at": component["fetched_at"].isoformat(),
+            "fresh_until": fresh_until.isoformat(),
+            "quality_status": Observation.Quality.FRESH,
+            "fallback_source": None,
+            "private_uri": component["artifact"].uri,
+            "acquisition_sha256": archive_sha,
+            "archive_member": component["member_name"],
+            "archive_member_sha256": member_sha,
+        }
+        methodology_row = {
+            "source-dataset": "Federal Reserve / H.10",
+            "run-batch": f"run {run.pk} / {run.batch_id}",
+            "prepared": component["prepared_at"].isoformat(),
+            "fetched": component["fetched_at"].isoformat(),
+            "latest-dates": latest_dates_text,
+            "fresh-until": fresh_until.isoformat(),
+            "archive": f"{archive_sha} ({component['artifact_size']} bytes)",
+            "member": (
+                f"{component['member_name']} / {member_sha} "
+                f"({component['member_size']} bytes)"
+            ),
+            "row-count": str(component["row_count"]),
+            "licence": scopes["federal-reserve"],
+            "fallback": "None",
+            "source_key": "federal-reserve",
+            "source_keys": ["federal-reserve"],
+            "batch_id": str(run.batch_id),
+            "quality_status": Observation.Quality.FRESH,
+            "fallback_source": None,
+            "lineage": methodology_lineage,
+        }
+        methodology_row["cells_list"] = [
+            _assets_fx_cell(key, methodology_row[key])
+            for key in ASSETS_FX_METHODOLOGY_COLUMNS
+        ]
+
+        gap_rows: list[dict[str, Any]] = []
+        for market_data, status, guidance in ASSETS_FX_GAPS:
+            gap_row = {
+                "market-data": market_data,
+                "status": status,
+                "public-value": "Not published",
+                "purchase-guidance": guidance,
+                "value": None,
+                "source_key": "internal",
+                "source_keys": ["internal"],
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+                "lineage": {
+                    "source_key": "internal",
+                    "source_keys": ["internal"],
+                    "license_scope": scopes["internal"],
+                    "policy_status": status,
+                    "purchase_guidance": guidance,
+                    "quality_status": Observation.Quality.ESTIMATED,
+                    "fallback_source": None,
+                    "numeric_value": None,
+                },
+            }
+            gap_row["cells_list"] = [
+                _assets_fx_cell(key, gap_row[key])
+                for key in ASSETS_FX_GAP_COLUMNS
+            ]
+            gap_rows.append(gap_row)
+
+        metric_as_of = min(
+            _parse_payload_datetime(item["value_date"])
+            for item in metrics
+            if _parse_payload_datetime(item["value_date"]) is not None
+        )
+        sections = [
+            {
+                "key": "recent-h10-reference-observations",
+                "title": "Recent H.10 Reference Observations",
+                "description": "Latest 20 dates common to all four official reference series.",
+                "columns": [
+                    {"key": key, "label": label}
+                    for key, label in zip(
+                        ASSETS_FX_RECENT_COLUMNS,
+                        (
+                            "Date",
+                            "Broad Dollar",
+                            "EUR/USD",
+                            "USD/CNY",
+                            "USD/JPY",
+                            "Quality",
+                            "Batch",
+                        ),
+                        strict=True,
+                    )
+                ],
+                "rows": recent_rows,
+                "source_keys": ["federal-reserve"],
+                "batch_ids": [str(run.batch_id)],
+                "as_of": metric_as_of.isoformat(),
+                "fetched_at": component["fetched_at"].isoformat(),
+                "fresh_until": fresh_until.isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+            },
+            {
+                "key": "source-freshness-methodology",
+                "title": "Source Freshness and Methodology",
+                "description": "One exact H.10 run, private ZIP and normalized batch.",
+                "columns": [
+                    {"key": key, "label": label}
+                    for key, label in zip(
+                        ASSETS_FX_METHODOLOGY_COLUMNS,
+                        (
+                            "Source / dataset",
+                            "Run / batch",
+                            "Prepared",
+                            "Fetched",
+                            "Latest value dates",
+                            "Fresh until",
+                            "ZIP SHA-256",
+                            "Member SHA-256",
+                            "Rows",
+                            "Licence",
+                            "Fallback",
+                        ),
+                        strict=True,
+                    )
+                ],
+                "rows": [methodology_row],
+                "source_keys": ["federal-reserve"],
+                "batch_ids": [str(run.batch_id)],
+                "as_of": metric_as_of.isoformat(),
+                "fetched_at": component["fetched_at"].isoformat(),
+                "fresh_until": fresh_until.isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+            },
+            {
+                "key": "licensed-fx-market-gaps",
+                "title": "Licensed FX Market Gaps",
+                "description": (
+                    "Commercial FX and derivatives remain explicit purchase or "
+                    "licence-review gaps; no fake numeric value is shown."
+                ),
+                "columns": [
+                    {"key": key, "label": label}
+                    for key, label in zip(
+                        ASSETS_FX_GAP_COLUMNS,
+                        ("Market data", "Status", "Public value", "Provider guidance"),
+                        strict=True,
+                    )
+                ],
+                "rows": gap_rows,
+                "source_keys": ["internal"],
+                "batch_ids": [],
+                "as_of": metric_as_of.isoformat(),
+                "fetched_at": component["fetched_at"].isoformat(),
+                "fresh_until": fresh_until.isoformat(),
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+            },
+        ]
+        extra_data = {
+            "contract_version": ASSETS_FX_CONTRACT_VERSION,
+            "formula_version": ASSETS_FX_FORMULA_VERSION,
+            "formulas": ASSETS_FX_FORMULAS,
+            "input_run": run_state,
+            "component_run": run_state,
+            "component_value_dates": {
+                key: value.date().isoformat()
+                for key, value in sorted(component["latest_dates"].items())
+            },
+            "component_fetched_at": component["fetched_at"].isoformat(),
+            "acquisition_artifact": {
+                "artifact_id": component["artifact"].pk,
+                "private_uri": component["artifact"].uri,
+                "sha256": archive_sha,
+                "size_bytes": component["artifact_size"],
+                "content_type": "application/zip",
+                "member_name": component["member_name"],
+                "member_sha256": member_sha,
+                "member_size_bytes": component["member_size"],
+            },
+            "license_decisions": [
+                {
+                    "source_key": key,
+                    "scope": scopes[key],
+                    "public_display_allowed": True,
+                    "derived_display_allowed": True,
+                    "historical_storage_allowed": True,
+                }
+                for key in ("federal-reserve", "internal")
+            ],
+            "required_metric_keys": sorted(ASSETS_FX_REQUIRED_METRIC_KEYS),
+            "required_chart_keys": sorted(ASSETS_FX_REQUIRED_CHART_KEYS),
+            "required_section_keys": sorted(ASSETS_FX_REQUIRED_SECTION_KEYS),
+            "semantic_boundary": ASSETS_FX_SEMANTIC_BOUNDARY,
+        }
+        return (metrics, charts, sections, extra_data), []
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ) as exc:
+        return None, [
+            {
+                "component": "assets-fx",
+                "kind": "contract",
+                "status": "invalid",
+                "reason": str(exc)[:320],
+            }
+        ]
+
+
+def _assets_fx_cells_are_exact(
+    row: dict[str, Any],
+    keys: tuple[str, ...],
+) -> bool:
+    cells = row.get("cells_list") if isinstance(row, dict) else None
+    return bool(
+        isinstance(cells, list)
+        and len(cells) == len(keys)
+        and tuple(
+            str(item.get("key") or "")
+            for item in cells
+            if isinstance(item, dict)
+        )
+        == keys
+        and all(
+            isinstance(item.get("cell"), dict)
+            and item["cell"].get("kind") == "text"
+            and item["cell"].get("value") == str(row[item["key"]])
+            for item in cells
+            if isinstance(item, dict) and item.get("key") in row
+        )
+        and len([item for item in cells if isinstance(item, dict)]) == len(keys)
+        and isinstance(row.get("lineage"), dict)
+        and row.get("fallback_source") is None
+    )
+
+
+def _assets_fx_page_contract_is_buildable(data: dict[str, Any]) -> bool:
+    metrics = data.get("metrics")
+    charts = data.get("charts")
+    sections = data.get("sections")
+    expected_payload_keys = set(ASSETS_FX_PAYLOAD_KEYS)
+    if "refresh_failure" in data:
+        expected_payload_keys.add("refresh_failure")
+    if (
+        set(data) != expected_payload_keys
+        or data.get("contract_version") != ASSETS_FX_CONTRACT_VERSION
+        or data.get("formula_version") != ASSETS_FX_FORMULA_VERSION
+        or data.get("formulas") != ASSETS_FX_FORMULAS
+        or data.get("semantic_boundary") != ASSETS_FX_SEMANTIC_BOUNDARY
+        or data.get("required_metric_keys")
+        != sorted(ASSETS_FX_REQUIRED_METRIC_KEYS)
+        or data.get("required_chart_keys")
+        != sorted(ASSETS_FX_REQUIRED_CHART_KEYS)
+        or data.get("required_section_keys")
+        != sorted(ASSETS_FX_REQUIRED_SECTION_KEYS)
+        or not isinstance(metrics, list)
+        or len(metrics) != 4
+        or any(not isinstance(item, dict) for item in metrics)
+        or {str(item.get("key") or "") for item in metrics}
+        != set(ASSETS_FX_REQUIRED_METRIC_KEYS)
+        or not isinstance(charts, list)
+        or len(charts) != 2
+        or any(not isinstance(item, dict) for item in charts)
+        or {str(item.get("key") or "") for item in charts}
+        != set(ASSETS_FX_REQUIRED_CHART_KEYS)
+        or not isinstance(sections, list)
+        or len(sections) != 3
+        or any(not isinstance(item, dict) for item in sections)
+        or {str(item.get("key") or "") for item in sections}
+        != set(ASSETS_FX_REQUIRED_SECTION_KEYS)
+        or data.get("chart_data")
+        != next(
+            (
+                item.get("data")
+                for item in charts
+                if item.get("key") == "fx-broad-dollar-history"
+            ),
+            None,
+        )
+        or data.get("demo") is not False
+        or set(data.get("source_keys") or [])
+        != {"federal-reserve", "internal"}
+        or _payload_fallback_source_keys(data)
+    ):
+        return False
+    metric_map = {str(item["key"]): item for item in metrics}
+    for key, metric in metric_map.items():
+        metadata = metric.get("metadata")
+        if (
+            metric.get("source_key") != "federal-reserve"
+            or set(metric.get("source_keys") or [])
+            != {"federal-reserve", "internal"}
+            or metric.get("quality_status") != Observation.Quality.FRESH
+            or metric.get("fallback_source") is not None
+            or not isinstance(metadata, dict)
+            or metadata.get("formula") != ASSETS_FX_CHANGE_FORMULA
+            or metadata.get("change_formula") != ASSETS_FX_CHANGE_FORMULA
+            or metadata.get("change_quality_status")
+            != Observation.Quality.ESTIMATED
+            or metadata.get("change_calculation_owner") != "Atlas Macro"
+            or metadata.get("current_value_date") != metric.get("value_date")
+            or not isinstance(metadata.get("input_lineage"), list)
+            or len(metadata["input_lineage"]) != 2
+            or metadata.get("current_input_lineage")
+            != metadata["input_lineage"][1]
+            or metadata.get("previous_input_lineage")
+            != [metadata["input_lineage"][0]]
+            or metadata["input_lineage"][0].get("series_key") != key
+            or metadata["input_lineage"][1].get("series_key") != key
+        ):
+            return False
+        try:
+            expected_change = Decimal("100") * (
+                Decimal(str(metadata["current_value"]))
+                / Decimal(str(metadata["previous_value"]))
+                - Decimal("1")
+            )
+        except (ArithmeticError, TypeError, ValueError):
+            return False
+        if not _fed_balance_sheet_decimal_equal(
+            metric.get("change"), expected_change
+        ):
+            return False
+    chart_map = {str(item["key"]): item for item in charts}
+    broad = chart_map["fx-broad-dollar-history"]
+    major = chart_map["fx-major-reference-rates-usd-strength-rebased"]
+    if (
+        len(broad.get("data") or []) != 260
+        or len(major.get("data") or []) != 120
+        or broad.get("time_axis") != "date"
+        or major.get("time_axis") != "date"
+        or broad.get("lineage_mode") != "per-point"
+        or major.get("lineage_mode") != "per-point"
+        or "display upper bound" not in str(broad.get("description") or "")
+        or "display upper bound" not in str(major.get("description") or "")
+        or any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("lineage"), dict)
+            or row.get("fallback_source") is not None
+            for row in [*(broad.get("data") or []), *(major.get("data") or [])]
+        )
+    ):
+        return False
+    try:
+        first_major = major["data"][0]
+        if any(
+            not _fed_balance_sheet_decimal_equal(first_major[label], 100)
+            for label in (
+                "EUR reciprocal USD strength",
+                "CNY per USD",
+                "JPY per USD",
+            )
+        ):
+            return False
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return False
+    section_map = {str(item["key"]): item for item in sections}
+    recent_rows = section_map["recent-h10-reference-observations"].get("rows")
+    methodology_rows = section_map["source-freshness-methodology"].get("rows")
+    gap_rows = section_map["licensed-fx-market-gaps"].get("rows")
+    if (
+        not isinstance(recent_rows, list)
+        or len(recent_rows) != 20
+        or not isinstance(methodology_rows, list)
+        or len(methodology_rows) != 1
+        or not isinstance(gap_rows, list)
+        or len(gap_rows) != 6
+        or not all(
+            _assets_fx_cells_are_exact(row, ASSETS_FX_RECENT_COLUMNS)
+            for row in recent_rows
+        )
+        or not all(
+            _assets_fx_cells_are_exact(row, ASSETS_FX_METHODOLOGY_COLUMNS)
+            for row in methodology_rows
+        )
+        or not all(
+            _assets_fx_cells_are_exact(row, ASSETS_FX_GAP_COLUMNS)
+            for row in gap_rows
+        )
+        or {
+            (
+                str(row.get("market-data") or ""),
+                str(row.get("status") or ""),
+                str(row.get("purchase-guidance") or ""),
+            )
+            for row in gap_rows
+        }
+        != set(ASSETS_FX_GAPS)
+        or any(
+            row.get("status") not in {"PURCHASE_REQUIRED", "LICENSE_REVIEW"}
+            or row.get("value") is not None
+            or row.get("public-value") != "Not published"
+            for row in gap_rows
+        )
+    ):
+        return False
+    return True
+
+
+def _assets_fx_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
+    data = dict(snapshot.data or {})
+    stored_rows = list(
+        MetricSnapshot.objects.filter(batch_id=snapshot.batch_id).select_related(
+            "source", "fallback_source"
+        )
+    )
+    expected_keys = {
+        f"assets-fx-{key}" for key in ASSETS_FX_REQUIRED_METRIC_KEYS
+    }
+    stored = {item.key: item for item in stored_rows}
+    if len(stored_rows) != 4 or set(stored) != expected_keys:
+        return False
+    return all(
+        _dashboard_metric_snapshot_matches_payload(
+            stored[f"assets-fx-{metric['key']}"],
+            metric,
+            fingerprint=str(data.get("fingerprint") or ""),
+            payload_integrity_hash=str(data.get("payload_integrity_hash") or ""),
+        )
+        for metric in data.get("metrics", [])
+        if isinstance(metric, dict)
+    )
+
+
+def _assets_fx_run_from_snapshot(
+    snapshot: DashboardSnapshot,
+) -> IngestionRun | None:
+    data = dict(snapshot.data or {})
+    references = [data.get("input_run"), data.get("component_run")]
+    if any(not isinstance(reference, dict) for reference in references):
+        return None
+    if references[0] != references[1]:
+        return None
+    reference = references[0]
+    run = (
+        IngestionRun.objects.select_related("source")
+        .filter(pk=reference.get("ingestion_run_id"))
+        .first()
+    )
+    if (
+        run is None
+        or reference != _h10_run_state(run, status="valid")
+        or set(data.get("component_batches") or []) != {str(run.batch_id)}
+    ):
+        return None
+    try:
+        _validated_h10_artifact_bytes(run)
+    except (OSError, TypeError, ValueError, zipfile.BadZipFile):
+        return None
+    return run
+
+
+def _assets_fx_refresh_failure_is_valid(
+    snapshot: DashboardSnapshot,
+    value: Any,
+    *,
+    require_active: bool = True,
+) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "checked_at",
+        "reason_code",
+        "reason",
+        "attempt",
+    }:
+        return False
+    reason_code = value.get("reason_code")
+    if (
+        reason_code not in ASSETS_FX_REFRESH_FAILURE_REASONS
+        or value.get("reason") != ASSETS_FX_REFRESH_FAILURE_REASONS[reason_code]
+    ):
+        return False
+    checked_at_raw = value.get("checked_at")
+    checked_at = _parse_payload_datetime(checked_at_raw)
+    if (
+        not isinstance(checked_at_raw, str)
+        or checked_at is None
+        or checked_at.isoformat() != checked_at_raw
+        or checked_at > timezone.now() + timedelta(minutes=5)
+    ):
+        return False
+    attempt = value.get("attempt")
+    if not isinstance(attempt, dict):
+        return False
+    run = (
+        IngestionRun.objects.select_related("source")
+        .filter(pk=attempt.get("ingestion_run_id"))
+        .first()
+    )
+    latest_at_check = (
+        IngestionRun.objects.filter(
+            source__key=ASSETS_FX_DATASET[0],
+            dataset=ASSETS_FX_DATASET[1],
+            started_at__lte=checked_at,
+            created_at__lte=checked_at,
+        )
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    embedded = _assets_fx_run_from_snapshot(snapshot)
+    if (
+        run is None
+        or run.source.key != ASSETS_FX_DATASET[0]
+        or run.dataset != ASSETS_FX_DATASET[1]
+        or run.status == IngestionRun.Status.RUNNING
+        or latest_at_check is None
+        or latest_at_check.pk != run.pk
+        or attempt != _h10_run_state(run)
+        or embedded is None
+        or embedded.pk == run.pk
+        or (run.started_at, run.pk) <= (embedded.started_at, embedded.pk)
+        or checked_at < snapshot.created_at
+        or checked_at < (run.completed_at or run.started_at)
+    ):
+        return False
+    latest = _latest_h10_attempt() if require_active else None
+    if require_active and (latest is None or latest.pk != run.pk):
+        return False
+    incomplete = (
+        run.status != IngestionRun.Status.SUCCESS or run.row_count <= 0
+    )
+    if incomplete:
+        return reason_code == "latest-attempt-incomplete"
+    return reason_code in {
+        "candidate-validation",
+        "candidate-regression",
+        "publication-postcondition",
+    }
+
+
+def _assets_fx_snapshot_matches_run(
+    snapshot: DashboardSnapshot,
+    *,
+    run: IngestionRun,
+    allow_expired: bool,
+    allow_refresh_failure: bool,
+    require_active_refresh_failure: bool = True,
+) -> bool:
+    data = dict(snapshot.data or {})
+    required_sources = {"federal-reserve", "internal"}
+    sources = {
+        item.key: item for item in Source.objects.filter(key__in=required_sources)
+    }
+    if set(sources) != required_sources:
+        return False
+    if any(
+        _effective_source_license(
+            source,
+            require_public=True,
+            require_derived=True,
+            require_storage=True,
+        )
+        is None
+        for source in sources.values()
+    ):
+        return False
+    refresh_failure = data.get("refresh_failure")
+    if allow_refresh_failure:
+        if (
+            snapshot.quality_status != Observation.Quality.STALE
+            or not _assets_fx_refresh_failure_is_valid(
+                snapshot,
+                refresh_failure,
+                require_active=require_active_refresh_failure,
+            )
+        ):
+            return False
+    elif refresh_failure is not None:
+        return False
+    valid_quality = (
+        {Observation.Quality.STALE}
+        if allow_refresh_failure
+        else {Observation.Quality.ESTIMATED}
+    )
+    if (
+        snapshot.key != "assets-fx"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or snapshot.title != ASSETS_FX_TITLE
+        or snapshot.summary != ASSETS_FX_SUMMARY
+        or snapshot.quality_status not in valid_quality
+        or _assets_fx_run_from_snapshot(snapshot) != run
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or data.get("required_notices") != public_source_notices(required_sources)
+        or str(data.get("fingerprint") or "")
+        != _assets_fx_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or str(data.get("payload_integrity_hash") or "")
+        != _assets_fx_payload_integrity_hash(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _assets_fx_page_contract_is_buildable(data)
+    ):
+        return False
+    audited_payload = {
+        key: value for key, value in data.items() if key != "refresh_failure"
+    }
+    if (
+        _payload_batch_ids(audited_payload) != {str(run.batch_id)}
+        or not _payload_source_keys(audited_payload) <= required_sources
+    ):
+        return False
+    prepared, _failures = _assets_fx_page_data(
+        run,
+        allow_expired=allow_expired or allow_refresh_failure,
+        require_observations=True,
+    )
+    if prepared is None:
+        return False
+    metrics, charts, sections, extra = prepared
+    metric_dates = [
+        _parse_payload_datetime(item.get("value_date")) for item in metrics
+    ]
+    if any(value is None for value in metric_dates):
+        return False
+    expected_as_of = min(value for value in metric_dates if value is not None)
+    return bool(
+        snapshot.as_of == expected_as_of
+        and data.get("metrics") == metrics
+        and data.get("charts") == charts
+        and data.get("sections") == sections
+        and data.get("chart_data") == charts[0]["data"]
+        and all(data.get(key) == value for key, value in extra.items())
+        and _assets_fx_normalized_metrics_match(snapshot)
+    )
+
+
+def _assets_fx_base_snapshot_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    run: IngestionRun,
+) -> bool:
+    marker = (snapshot.data or {}).get("refresh_failure")
+    if marker is None:
+        if snapshot.quality_status != Observation.Quality.ESTIMATED:
+            return False
+        return _assets_fx_snapshot_matches_run(
+            snapshot,
+            run=run,
+            allow_expired=True,
+            allow_refresh_failure=False,
+        )
+    if snapshot.quality_status != Observation.Quality.STALE:
+        return False
+    return _assets_fx_snapshot_matches_run(
+        snapshot,
+        run=run,
+        allow_expired=True,
+        allow_refresh_failure=True,
+        require_active_refresh_failure=False,
+    )
+
+
+def _assets_fx_snapshot_public_state(
+    snapshot: DashboardSnapshot,
+    *,
+    latest: IngestionRun | None,
+) -> str | None:
+    embedded = _assets_fx_run_from_snapshot(snapshot)
+    if embedded is None or latest is None:
+        return None
+    deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+    expired = deadline is not None and deadline < timezone.now()
+    if (
+        latest.pk == embedded.pk
+        and latest.status == IngestionRun.Status.SUCCESS
+        and latest.row_count > 0
+        and _assets_fx_snapshot_matches_run(
+            snapshot,
+            run=latest,
+            allow_expired=expired,
+            allow_refresh_failure=False,
+        )
+    ):
+        return "natural_expiry" if expired else "current_candidate"
+    marker = (snapshot.data or {}).get("refresh_failure")
+    if (
+        latest.pk != embedded.pk
+        and isinstance(marker, dict)
+        and marker.get("attempt", {}).get("ingestion_run_id") == latest.pk
+        and _assets_fx_snapshot_matches_run(
+            snapshot,
+            run=embedded,
+            allow_expired=True,
+            allow_refresh_failure=True,
+        )
+    ):
+        return "retained_failure"
+    if (
+        latest.pk != embedded.pk
+        and latest.status
+        in {IngestionRun.Status.RUNNING, IngestionRun.Status.SUCCESS}
+        and (latest.status != IngestionRun.Status.SUCCESS or latest.row_count > 0)
+        and _assets_fx_base_snapshot_is_valid(snapshot, run=embedded)
+    ):
+        return "transition_pending"
+    return None
+
+
+def assets_fx_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    try:
+        return _assets_fx_snapshot_public_state(
+            snapshot,
+            latest=_latest_h10_attempt(),
+        ) is not None
+    except (
+        ArithmeticError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        return False
+
+
+def select_public_assets_fx_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="assets-fx",
+                is_published=True,
+                data__contract_version=ASSETS_FX_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    latest = _latest_h10_attempt()
+    selected = None
+    selected_state = None
+    for candidate in candidates:
+        try:
+            state = _assets_fx_snapshot_public_state(candidate, latest=latest)
+        except (
+            ArithmeticError,
+            AttributeError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            zipfile.BadZipFile,
+        ):
+            state = None
+        if state is not None:
+            selected = candidate
+            selected_state = state
+            break
+    if selected is not None and selected_state is not None:
+        selected.assets_fx_state = selected_state
+        presented = deepcopy(selected)
+        presented.data = deepcopy(presented.data or {})
+        if selected_state != "retained_failure":
+            presented.data.pop("refresh_failure", None)
+        if selected_state != "current_candidate":
+            presented.quality_status = Observation.Quality.STALE
+        return presented
+    return None
+
+
+def _mark_assets_fx_stale(*, reason_code: str) -> None:
+    reason = ASSETS_FX_REFRESH_FAILURE_REASONS.get(reason_code)
+    if reason is None:
+        raise ValueError("unknown assets-fx refresh failure reason")
+    latest_attempt = _latest_h10_attempt(lock=True)
+    if latest_attempt is None or latest_attempt.status == IngestionRun.Status.RUNNING:
+        return
+    candidates = list(
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="assets-fx",
+            is_published=True,
+            data__contract_version=ASSETS_FX_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")[:50]
+    )
+    list(
+        MetricSnapshot.objects.select_for_update()
+        .filter(batch_id__in=[candidate.batch_id for candidate in candidates])
+        .order_by("batch_id", "key")
+        .values_list("pk", flat=True)
+    )
+    retained = None
+    for candidate in candidates:
+        embedded = _assets_fx_run_from_snapshot(candidate)
+        if (
+            embedded is not None
+            and embedded.pk != latest_attempt.pk
+            and _assets_fx_base_snapshot_is_valid(candidate, run=embedded)
+        ):
+            retained = candidate
+            break
+    if retained is None:
+        return
+    data = dict(retained.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason_code": reason_code,
+        "reason": reason,
+        "attempt": _h10_run_state(latest_attempt),
+    }
+    retained.data = data
+    retained.quality_status = Observation.Quality.STALE
+    retained.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+@transaction.atomic
+def _coordinate_assets_fx_dashboard(
+    trigger_runs: Iterable[IngestionRun] = (),
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    for source_key in ("federal-reserve", "internal"):
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in={"federal-reserve", "internal"})
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(
+            source__key__in={"federal-reserve", "internal"},
+            is_current=True,
+        )
+        .order_by("source__key")
+        .values_list("pk", flat=True)
+    )
+    relevant = [
+        run
+        for run in trigger_runs
+        if run.source.key == ASSETS_FX_DATASET[0]
+        and run.dataset == ASSETS_FX_DATASET[1]
+    ]
+    latest = _latest_h10_attempt(lock=True)
+    if relevant and (latest is None or any(run.pk != latest.pk for run in relevant)):
+        return [], set()
+    if latest is None:
+        return [], {"assets-fx"}
+    IngestionRun.objects.select_for_update().get(pk=latest.pk)
+    if latest.status == IngestionRun.Status.RUNNING:
+        return [], {"assets-fx"}
+    if latest.status != IngestionRun.Status.SUCCESS or latest.row_count <= 0:
+        _mark_assets_fx_stale(reason_code="latest-attempt-incomplete")
+        return [], {"assets-fx"}
+
+    candidates = list(
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="assets-fx",
+            is_published=True,
+            data__contract_version=ASSETS_FX_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")[:50]
+    )
+    list(
+        MetricSnapshot.objects.select_for_update()
+        .filter(batch_id__in=[candidate.batch_id for candidate in candidates])
+        .order_by("batch_id", "key")
+        .values_list("pk", flat=True)
+    )
+    existing = next(
+        (
+            candidate
+            for candidate in candidates
+            if _assets_fx_run_from_snapshot(candidate) == latest
+            and _assets_fx_snapshot_matches_run(
+                candidate,
+                run=latest,
+                allow_expired=False,
+                allow_refresh_failure=False,
+            )
+        ),
+        None,
+    )
+    if existing is not None:
+        return [], set()
+    previous = next(
+        (
+            candidate
+            for candidate in candidates
+            if (
+                (embedded := _assets_fx_run_from_snapshot(candidate)) is not None
+                and embedded.pk != latest.pk
+                and _assets_fx_base_snapshot_is_valid(candidate, run=embedded)
+            )
+        ),
+        None,
+    )
+    prepared, _failures = _assets_fx_page_data(latest)
+    if prepared is None:
+        _mark_assets_fx_stale(reason_code="candidate-validation")
+        return [], {"assets-fx"}
+    metrics, _charts, _sections, extra_data = prepared
+    if previous is not None:
+        previous_dates = (previous.data or {}).get("component_value_dates") or {}
+        candidate_dates = extra_data["component_value_dates"]
+        if not isinstance(previous_dates, dict) or any(
+            key in previous_dates
+            and str(candidate_dates[key]) < str(previous_dates[key])
+            for key in candidate_dates
+        ):
+            _mark_assets_fx_stale(reason_code="candidate-regression")
+            return [], {"assets-fx"}
+    metric_dates = [
+        _parse_payload_datetime(item.get("value_date")) for item in metrics
+    ]
+    if any(value is None for value in metric_dates):
+        _mark_assets_fx_stale(reason_code="candidate-validation")
+        return [], {"assets-fx"}
+    try:
+        with transaction.atomic():
+            published = _publish_assets_fx_revision(
+                run=latest,
+                batch_id=uuid.uuid4(),
+            )
+            if not (
+                current := _latest_h10_attempt(lock=True)
+            ) or current.pk != latest.pk:
+                raise ValueError("assets-fx H.10 run was superseded before commit")
+            selected = select_public_assets_fx_snapshot()
+            if (
+                selected is None
+                or getattr(selected, "assets_fx_state", None)
+                != "current_candidate"
+                or _assets_fx_run_from_snapshot(selected) != latest
+                or not _assets_fx_snapshot_matches_run(
+                    selected,
+                    run=latest,
+                    allow_expired=False,
+                    allow_refresh_failure=False,
+                )
+            ):
+                raise ValueError("assets-fx v1 publication postcondition failed")
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        _mark_assets_fx_stale(reason_code="publication-postcondition")
+        return [], {"assets-fx"}
+    return ([published] if published is not None else []), set()
+
+
+def _global_dollar_run_identity(run: IngestionRun) -> str | None:
+    return next(
+        (
+            identity
+            for identity, (source_key, dataset) in GLOBAL_DOLLAR_DATASETS.items()
+            if run.source.key == source_key and run.dataset == dataset
+        ),
+        None,
+    )
+
+
+def _latest_global_dollar_attempt(identity: str) -> IngestionRun | None:
+    if identity == "h10":
+        return _latest_h10_attempt()
+    source_key, dataset = GLOBAL_DOLLAR_DATASETS[identity]
+    return (
+        IngestionRun.objects.filter(source__key=source_key, dataset=dataset)
+        .select_related("source")
+        .order_by("-started_at", "-id")
+        .first()
+    )
+
+
+def _global_dollar_run_state(
+    identity: str,
+    run: IngestionRun | None,
+    *,
+    status: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    if identity == "h10":
+        state = _h10_run_state(run, status=status, reason=reason)
+        state.pop("latest_valid_dates", None)
+        state.update(
+            {
+                "coverage_start": None,
+                "coverage_end": None,
+                "date_type": None,
+                "returned_count": None,
+            }
+        )
+        return state
+    source_key, dataset = GLOBAL_DOLLAR_DATASETS[identity]
+    metadata = dict(run.metadata or {}) if run else {}
+    return {
+        "component": identity,
+        "kind": "ingestion_run",
+        "source": source_key,
+        "dataset": dataset,
+        "status": status or (run.status if run else "missing"),
+        "reason": (reason or (run.error if run else "required dataset run missing"))[
+            :320
+        ],
+        "ingestion_run_id": run.pk if run else None,
+        "batch_id": str(run.batch_id) if run else None,
+        "row_count": run.row_count if run else 0,
+        "completed_at": (
+            run.completed_at.isoformat() if run and run.completed_at else None
+        ),
+        "fetched_at": metadata.get("fetched_at") if run else None,
+        "prepared_at": metadata.get("source_prepared_at") if run else None,
+        "coverage_start": metadata.get("coverage_start") if run else None,
+        "coverage_end": metadata.get("coverage_end") if run else None,
+        "date_type": metadata.get("date_type") if run else None,
+        "returned_count": metadata.get("returned_count") if run else None,
+    }
+
+
+def _select_global_dollar_runs(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[dict[str, IngestionRun] | None, list[dict[str, Any]], bool]:
+    relevant = [run for run in trigger_runs if _global_dollar_run_identity(run)]
+    if not relevant:
+        return None, [], False
+    for run in relevant:
+        identity = _global_dollar_run_identity(run)
+        latest = _latest_global_dollar_attempt(str(identity))
+        if latest is None or latest.pk != run.pk:
+            return None, [], False
+    attempts = {
+        identity: _latest_global_dollar_attempt(identity)
+        for identity in GLOBAL_DOLLAR_DATASETS
+    }
+    states = [
+        _global_dollar_run_state(identity, attempts[identity])
+        for identity in GLOBAL_DOLLAR_DATASETS
+    ]
+    if any(
+        run is None
+        or run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in attempts.values()
+    ):
+        return None, states, True
+    return (
+        {identity: run for identity, run in attempts.items() if run is not None},
+        states,
+        True,
+    )
+
+
+def _global_dollar_runs_still_latest(selected: dict[str, IngestionRun]) -> bool:
+    return all(
+        (latest := _latest_global_dollar_attempt(identity)) is not None
+        and latest.pk == run.pk
+        for identity, run in selected.items()
+    )
+
+
+def _global_dollar_artifact_bytes(
+    run: IngestionRun,
+    *,
+    identity: str,
+) -> tuple[bytes, RawArtifact]:
+    if identity == "h10":
+        payload, artifact, _metadata = _validated_h10_artifact_bytes(run)
+        return payload, artifact
+    artifacts = list(RawArtifact.objects.filter(run=run))
+    if len(artifacts) != 1:
+        raise ValueError(f"{identity} requires exactly one acquisition artifact")
+    artifact = artifacts[0]
+    metadata = dict(run.metadata or {})
+    digest = str(
+        metadata.get("archive_sha256" if identity == "h10" else "sha256") or ""
+    ).lower()
+    try:
+        size = int(
+            metadata.get("archive_size" if identity == "h10" else "byte_length")
+            or 0
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{identity} artifact size metadata is invalid") from exc
+    content_type = str(metadata.get("content_type") or "")
+    namespace = "federal-reserve" if identity == "h10" else "ny-fed-markets"
+    if (
+        len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or size <= 0
+        or artifact.sha256.lower() != digest
+        or artifact.size_bytes != size
+        or artifact.content_type != content_type
+        or artifact.uri != f"private://{namespace}/{digest[:2]}/{digest}.bin"
+        or size > 16 * 1024 * 1024
+    ):
+        raise ValueError(f"{identity} artifact row does not match run metadata")
+    root = Path(
+        getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts")
+    )
+    path = root / digest[:2] / f"{digest}.bin"
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(size + 1)
+    except OSError as exc:
+        raise ValueError(f"{identity} private artifact is unavailable") from exc
+    if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+        raise ValueError(f"{identity} private artifact bytes failed integrity check")
+    return payload, artifact
+
+
+def _global_dollar_h10_component(
+    run: IngestionRun,
+    *,
+    allow_expired: bool,
+    require_observations: bool,
+) -> tuple[dict[str, list[Observation]], dict[str, Any]]:
+    return _validated_h10_component(
+        run,
+        allow_expired=allow_expired,
+        require_observations=require_observations,
+    )
+
+
+def _global_dollar_swap_component(
+    run: IngestionRun,
+    *,
+    allow_expired: bool,
+    require_observations: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Observation], dict[str, Any]]:
+    payload_bytes, artifact = _global_dollar_artifact_bytes(run, identity="swaps")
+    metadata = dict(run.metadata or {})
+    fetched_at = _parse_payload_datetime(metadata.get("fetched_at"))
+    if fetched_at is None:
+        raise ValueError("USD swap run lacks valid fetched_at")
+    operations, coverage_start, coverage_end = (
+        _validated_global_dollar_swap_coverage_contract(
+            metadata=metadata,
+            fetched_at=fetched_at,
+            raw_bytes=payload_bytes,
+        )
+    )
+    expected_rows = NYFedMarketsProvider.usd_fx_swap_records(
+        operations,
+        as_of_date=coverage_end,
+        history_limit=None,
+    )
+    expected = {
+        (str(item["series_id"]).lower(), str(item["date"])): item
+        for item in expected_rows
+    }
+    observations: list[Observation] = []
+    if require_observations:
+        observations = list(
+            Observation.objects.filter(source=run.source, batch_id=run.batch_id)
+            .select_related("series", "source", "fallback_source")
+            .order_by("series__key", "value_date", "id")
+        )
+        actual = {
+            (item.series.key, item.value_date.date().isoformat()): item
+            for item in observations
+        }
+        if (
+            run.row_count != len(expected)
+            or len(observations) != len(expected)
+            or set(actual) != set(expected)
+        ):
+            raise ValueError("USD swap observations do not match exact JSON")
+        for identity, expected_row in expected.items():
+            stored = actual[identity]
+            if (
+                stored.value != Decimal(str(expected_row["value"]))
+                or stored.as_of != stored.value_date
+                or stored.fetched_at != fetched_at
+                or stored.quality_status != Observation.Quality.FRESH
+                or stored.fallback_source_id is not None
+                or stored.metadata != expected_row.get("metadata")
+            ):
+                raise ValueError("USD swap normalized observation was tampered")
+    fresh_until = fetched_at + timedelta(hours=30)
+    if not allow_expired and fresh_until < timezone.now():
+        raise ValueError("USD swap exact component is stale")
+    by_series = {item.series.key: item for item in observations}
+    return operations, by_series, {
+        "artifact": artifact,
+        "artifact_sha256": artifact.sha256,
+        "fetched_at": fetched_at,
+        "as_of_date": coverage_end,
+        "fresh_until": fresh_until,
+        "row_count": len(observations),
+        "coverage_start": coverage_start,
+        "returned_count": len(operations),
+    }
+
+
+def _global_dollar_cell(key: str, value: Any) -> dict[str, Any]:
+    return {"key": key, "cell": {"kind": "text", "value": str(value)}}
+
+
+def _global_dollar_direct_lineage(
+    observation: Observation,
+    *,
+    run: IngestionRun,
+    scope: str,
+    fresh_until: datetime,
+    acquisition_sha256: str,
+) -> dict[str, Any]:
+    lineage = _h10_direct_lineage(
+        observation,
+        run=run,
+        scope=scope,
+        fresh_until=fresh_until,
+        acquisition_sha256=acquisition_sha256,
+        member_sha256=str((run.metadata or {}).get("archive_member_sha256") or ""),
+    )
+    for field in (
+        "board_series_id",
+        "quote_convention",
+        "run_id",
+        "archive_member_sha256",
+    ):
+        lineage.pop(field, None)
+    return lineage
+
+
+def _global_dollar_operation_lineage(
+    operation: dict[str, Any],
+    *,
+    run: IngestionRun,
+    scope: str,
+    fetched_at: datetime,
+    fresh_until: datetime,
+    acquisition_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "natural_key": operation["natural_key"],
+        "counterparty": operation["counterparty"],
+        "trade_date": (
+            operation["trade_date"].isoformat() if operation["trade_date"] else None
+        ),
+        "settlement_date": operation["settlement_date"].isoformat(),
+        "maturity_date": operation["maturity_date"].isoformat(),
+        "term_in_days": operation["term_in_days"],
+        "interest_rate": str(operation["interest_rate"]),
+        "amount_usd_millions": str(operation["amount"]),
+        "is_small_value": operation["is_small_value"],
+        "source_key": run.source.key,
+        "source_keys": [run.source.key],
+        "license_scope": scope,
+        "value_date": operation["settlement_date"].isoformat(),
+        "as_of": operation["settlement_date"].isoformat(),
+        "fetched_at": fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "batch_id": str(run.batch_id),
+        "quality_status": Observation.Quality.FRESH,
+        "fallback_source": None,
+        "acquisition_sha256": acquisition_sha256,
+    }
+
+
+def _global_dollar_page_data(
+    selected: dict[str, IngestionRun],
+    *,
+    allow_expired: bool = False,
+    require_observations: bool = True,
+) -> tuple[
+    tuple[
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]
+    | None,
+    list[dict[str, Any]],
+]:
+    try:
+        if set(selected) != set(GLOBAL_DOLLAR_DATASETS):
+            raise ValueError("global-dollar requires exactly two input runs")
+        sources = {
+            item.key: item
+            for item in Source.objects.filter(
+                key__in={"federal-reserve", "ny-fed-markets", "internal"}
+            )
+        }
+        if set(sources) != {"federal-reserve", "ny-fed-markets", "internal"}:
+            raise ValueError("global-dollar required sources are missing")
+        scopes: dict[str, str] = {}
+        for source_key, source in sources.items():
+            licence = _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+                require_storage=True,
+            )
+            if licence is None:
+                raise ValueError(f"{source_key} lacks current display/storage rights")
+            scopes[source_key] = licence.scope
+
+        h10, h10_meta = _global_dollar_h10_component(
+            selected["h10"],
+            allow_expired=allow_expired,
+            require_observations=require_observations,
+        )
+        operations, _swap_observations, swap_meta = _global_dollar_swap_component(
+            selected["swaps"],
+            allow_expired=allow_expired,
+            require_observations=require_observations,
+        )
+        h10_run = selected["h10"]
+        swap_run = selected["swaps"]
+        h10_deadline = h10_meta["fresh_until"]
+        swap_deadline = swap_meta["fresh_until"]
+        h10_hash = h10_meta["artifact_sha256"]
+        swap_hash = swap_meta["artifact_sha256"]
+
+        broad_rows = h10["h10-broad-dollar"]
+        if len(broad_rows) < 6:
+            raise ValueError("H.10 broad dollar lacks six valid observations")
+        current_broad = broad_rows[-1]
+        prior_broad = broad_rows[-6]
+        broad_change = Decimal("100") * (
+            current_broad.value / prior_broad.value - Decimal("1")
+        )
+        latest_by_key = {key: rows[-1] for key, rows in h10.items()}
+
+        def direct_metric(
+            key: str,
+            label: str,
+            series_key: str,
+            *,
+            decimals: int,
+            unit: str,
+        ) -> dict[str, Any]:
+            observation = latest_by_key[series_key]
+            lineage = _global_dollar_direct_lineage(
+                observation,
+                run=h10_run,
+                scope=scopes["federal-reserve"],
+                fresh_until=h10_deadline,
+                acquisition_sha256=h10_hash,
+            )
+            return {
+                "key": key,
+                "label": label,
+                "value": float(observation.value),
+                "display_value": f"{observation.value:,.{decimals}f}",
+                "change": None,
+                "unit": unit,
+                "quality_status": Observation.Quality.FRESH,
+                "source": "Federal Reserve H.10",
+                "source_key": "federal-reserve",
+                "source_keys": ["federal-reserve"],
+                "license_scope": scopes["federal-reserve"],
+                "value_date": observation.value_date.isoformat(),
+                "as_of": observation.as_of.isoformat(),
+                "fetched_at": observation.fetched_at.isoformat(),
+                "fresh_until": h10_deadline.isoformat(),
+                "batch_id": str(h10_run.batch_id),
+                "fallback_source": None,
+                "metadata": {
+                    "calculation_owner": "Federal Reserve Board",
+                    "quote_convention": observation.metadata.get(
+                        "quote_convention"
+                    ),
+                    "input_series": [series_key],
+                    "input_batch_ids": [str(h10_run.batch_id)],
+                    "input_value_dates": [observation.value_date.isoformat()],
+                    "input_lineage": [lineage],
+                    "acquisition_sha256": h10_hash,
+                    "archive_member_sha256": (h10_run.metadata or {}).get(
+                        "archive_member_sha256"
+                    ),
+                    "component": "h10",
+                    "input_run_id": h10_run.pk,
+                },
+            }
+
+        broad_lineage = [
+            _global_dollar_direct_lineage(
+                observation,
+                run=h10_run,
+                scope=scopes["federal-reserve"],
+                fresh_until=h10_deadline,
+                acquisition_sha256=h10_hash,
+            )
+            for observation in broad_rows[-6:]
+        ]
+        metrics = [
+            direct_metric(
+                "h10-broad-dollar",
+                "Nominal Broad Dollar Index",
+                "h10-broad-dollar",
+                decimals=2,
+                unit="Jan 2006 = 100",
+            ),
+            {
+                "key": "h10-broad-dollar-5d-change-pct",
+                "label": "Broad Dollar 5D Change",
+                "value": float(broad_change),
+                "display_value": f"{broad_change:+.2f}%",
+                "change": None,
+                "unit": "%",
+                "quality_status": Observation.Quality.ESTIMATED,
+                "source": "Atlas Macro transparent calculation from H.10",
+                "source_key": "internal",
+                "source_keys": ["federal-reserve", "internal"],
+                "license_scope": scopes["internal"],
+                "value_date": current_broad.value_date.isoformat(),
+                "as_of": current_broad.as_of.isoformat(),
+                "fetched_at": current_broad.fetched_at.isoformat(),
+                "fresh_until": h10_deadline.isoformat(),
+                "batch_id": str(h10_run.batch_id),
+                "fallback_source": None,
+                "metadata": {
+                    "formula": GLOBAL_DOLLAR_FORMULAS[
+                        "h10-broad-dollar-5d-change-pct"
+                    ],
+                    "calculation_owner": "Atlas Macro",
+                    "input_series": ["h10-broad-dollar"],
+                    "input_batch_ids": [str(h10_run.batch_id)],
+                    "input_value_dates": [
+                        item.value_date.isoformat() for item in broad_rows[-6:]
+                    ],
+                    "input_lineage": broad_lineage,
+                    "previous_value": f"{Decimal(str(prior_broad.value)):.8f}",
+                    "previous_value_date": prior_broad.value_date.isoformat(),
+                    "acquisition_sha256": h10_hash,
+                    "archive_member_sha256": (h10_run.metadata or {}).get(
+                        "archive_member_sha256"
+                    ),
+                    "component": "h10",
+                    "input_run_id": h10_run.pk,
+                },
+            },
+            direct_metric(
+                "h10-eurusd",
+                "EUR/USD H.10 Reference",
+                "h10-eurusd",
+                decimals=4,
+                unit="USD per EUR",
+            ),
+            direct_metric(
+                "h10-usdcny",
+                "USD/CNY H.10 Reference",
+                "h10-usdcny",
+                decimals=4,
+                unit="CNY per USD",
+            ),
+            direct_metric(
+                "h10-usdjpy",
+                "USD/JPY H.10 Reference",
+                "h10-usdjpy",
+                decimals=4,
+                unit="JPY per USD",
+            ),
+        ]
+
+        as_of_date = swap_meta["as_of_date"]
+        active = [
+            item
+            for item in operations
+            if item["settlement_date"] <= as_of_date < item["maturity_date"]
+        ]
+        active_regular = [item for item in active if not item["is_small_value"]]
+        active_small = [item for item in active if item["is_small_value"]]
+        total = sum((item["amount"] for item in active), Decimal("0"))
+        regular_total = sum(
+            (item["amount"] for item in active_regular), Decimal("0")
+        )
+        small_total = sum((item["amount"] for item in active_small), Decimal("0"))
+        if total != regular_total + small_total:
+            raise ValueError("USD swap active partition failed exact reconciliation")
+        counterparty_count = len(
+            {item["counterparty"] for item in active_regular}
+        )
+        swap_as_of = datetime.combine(as_of_date, time.min, tzinfo=UTC)
+
+        def swap_metric(
+            key: str,
+            label: str,
+            value: Decimal,
+            operations_input: list[dict[str, Any]],
+            *,
+            decimals: int,
+            unit: str,
+        ) -> dict[str, Any]:
+            lineage = [
+                _global_dollar_operation_lineage(
+                    operation,
+                    run=swap_run,
+                    scope=scopes["ny-fed-markets"],
+                    fetched_at=swap_meta["fetched_at"],
+                    fresh_until=swap_deadline,
+                    acquisition_sha256=swap_hash,
+                )
+                for operation in operations_input
+            ]
+            return {
+                "key": key,
+                "label": label,
+                "value": float(value),
+                "display_value": f"{value:,.{decimals}f}",
+                "change": None,
+                "unit": unit,
+                "quality_status": Observation.Quality.ESTIMATED,
+                "source": "Atlas Macro transparent calculation from NY Fed operations",
+                "source_key": "internal",
+                "source_keys": ["internal", "ny-fed-markets"],
+                "license_scope": scopes["internal"],
+                "value_date": swap_as_of.isoformat(),
+                "as_of": swap_as_of.isoformat(),
+                "fetched_at": swap_meta["fetched_at"].isoformat(),
+                "fresh_until": swap_deadline.isoformat(),
+                "batch_id": str(swap_run.batch_id),
+                "fallback_source": None,
+                "metadata": {
+                    "formula": GLOBAL_DOLLAR_FORMULAS[key],
+                    "calculation_owner": "Atlas Macro",
+                    "input_series": ["ny-fed-usd-liquidity-swap-operation"],
+                    "input_batch_ids": [str(swap_run.batch_id)],
+                    "input_value_dates": sorted(
+                        {
+                            item["settlement_date"].isoformat()
+                            for item in operations_input
+                        }
+                    ),
+                    "input_lineage": lineage,
+                    "active_operations": [
+                        item["natural_key"] for item in operations_input
+                    ],
+                    "swap_as_of": as_of_date.isoformat(),
+                    "acquisition_sha256": swap_hash,
+                    "component": "swaps",
+                    "input_run_id": swap_run.pk,
+                },
+            }
+
+        metrics.extend(
+            [
+                swap_metric(
+                    "fxswap-usd-outstanding",
+                    "USD Liquidity Swaps Outstanding",
+                    total,
+                    active,
+                    decimals=2,
+                    unit="USD mn",
+                ),
+                swap_metric(
+                    "fxswap-usd-outstanding-non-small-value",
+                    "Regular USD Swaps Outstanding",
+                    regular_total,
+                    active_regular,
+                    decimals=2,
+                    unit="USD mn",
+                ),
+                swap_metric(
+                    "fxswap-usd-outstanding-small-value",
+                    "Technical-Test USD Swaps Outstanding",
+                    small_total,
+                    active_small,
+                    decimals=2,
+                    unit="USD mn",
+                ),
+                swap_metric(
+                    "fxswap-active-counterparties",
+                    "Active Regular Counterparties",
+                    Decimal(counterparty_count),
+                    active_regular,
+                    decimals=0,
+                    unit="central banks",
+                ),
+            ]
+        )
+
+        broad_history = []
+        for observation in broad_rows[-260:]:
+            broad_history.append(
+                {
+                    "date": observation.value_date.date().isoformat(),
+                    "Nominal Broad Dollar": float(observation.value),
+                    "_source_keys": ["federal-reserve"],
+                    "_lineage": {
+                        "Nominal Broad Dollar": _global_dollar_direct_lineage(
+                            observation,
+                            run=h10_run,
+                            scope=scopes["federal-reserve"],
+                            fresh_until=h10_deadline,
+                            acquisition_sha256=h10_hash,
+                        )
+                    },
+                }
+            )
+
+        fx_maps = {
+            key: {item.value_date.date(): item for item in h10[key]}
+            for key in ("h10-eurusd", "h10-usdcny", "h10-usdjpy")
+        }
+        common_dates = sorted(set.intersection(*(set(value) for value in fx_maps.values())))[
+            -120:
+        ]
+        if len(common_dates) < 2:
+            raise ValueError("H.10 major FX series lack a common rebasing window")
+        transformed: dict[str, dict[date, Decimal]] = {
+            "EUR reciprocal USD strength": {
+                period: Decimal("1") / fx_maps["h10-eurusd"][period].value
+                for period in common_dates
+            },
+            "CNY per USD": {
+                period: fx_maps["h10-usdcny"][period].value
+                for period in common_dates
+            },
+            "JPY per USD": {
+                period: fx_maps["h10-usdjpy"][period].value
+                for period in common_dates
+            },
+        }
+        rebased_rows = []
+        for period in common_dates:
+            row: dict[str, Any] = {
+                "date": period.isoformat(),
+                "_source_keys": ["federal-reserve", "internal"],
+                "_lineage": {},
+            }
+            for label, values in transformed.items():
+                row[label] = float(Decimal("100") * values[period] / values[common_dates[0]])
+                series_key = {
+                    "EUR reciprocal USD strength": "h10-eurusd",
+                    "CNY per USD": "h10-usdcny",
+                    "JPY per USD": "h10-usdjpy",
+                }[label]
+                row["_lineage"][label] = {
+                    "source_key": "internal",
+                    "source_keys": ["federal-reserve", "internal"],
+                    "license_scope": scopes["internal"],
+                    "batch_id": str(h10_run.batch_id),
+                    "value_date": period.isoformat(),
+                    "fetched_at": h10_meta["fetched_at"].isoformat(),
+                    "quality_status": Observation.Quality.ESTIMATED,
+                    "fallback_source": None,
+                    "formula": (
+                        "100 * (1 / EURUSD_t) / (1 / EURUSD_0)"
+                        if series_key == "h10-eurusd"
+                        else "100 * USD_quote_t / USD_quote_0"
+                    ),
+                    "input_lineage": [
+                        _global_dollar_direct_lineage(
+                            fx_maps[series_key][period],
+                            run=h10_run,
+                            scope=scopes["federal-reserve"],
+                            fresh_until=h10_deadline,
+                            acquisition_sha256=h10_hash,
+                        )
+                    ],
+                    "acquisition_sha256": h10_hash,
+                }
+            rebased_rows.append(row)
+
+        drawdowns: dict[date, dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: {"regular": [], "small": []}
+        )
+        for operation in operations:
+            bucket = "small" if operation["is_small_value"] else "regular"
+            drawdowns[operation["settlement_date"]][bucket].append(operation)
+        swap_chart_rows = []
+        for period in sorted(drawdowns)[-260:]:
+            regular_items = drawdowns[period]["regular"]
+            small_items = drawdowns[period]["small"]
+            swap_chart_rows.append(
+                {
+                    "date": period.isoformat(),
+                    "Regular drawdown": float(
+                        sum((item["amount"] for item in regular_items), Decimal("0"))
+                    ),
+                    "Technical-test drawdown": float(
+                        sum((item["amount"] for item in small_items), Decimal("0"))
+                    ),
+                    "_source_keys": ["internal", "ny-fed-markets"],
+                    "_lineage": {
+                        "Regular drawdown": {
+                            "source_key": "internal",
+                            "source_keys": ["internal", "ny-fed-markets"],
+                            "license_scope": scopes["internal"],
+                            "batch_id": str(swap_run.batch_id),
+                            "value_date": period.isoformat(),
+                            "fetched_at": swap_meta["fetched_at"].isoformat(),
+                            "quality_status": Observation.Quality.ESTIMATED,
+                            "fallback_source": None,
+                            "input_lineage": [
+                                _global_dollar_operation_lineage(
+                                    item,
+                                    run=swap_run,
+                                    scope=scopes["ny-fed-markets"],
+                                    fetched_at=swap_meta["fetched_at"],
+                                    fresh_until=swap_deadline,
+                                    acquisition_sha256=swap_hash,
+                                )
+                                for item in regular_items
+                            ],
+                            "acquisition_sha256": swap_hash,
+                        },
+                        "Technical-test drawdown": {
+                            "source_key": "internal",
+                            "source_keys": ["internal", "ny-fed-markets"],
+                            "license_scope": scopes["internal"],
+                            "batch_id": str(swap_run.batch_id),
+                            "value_date": period.isoformat(),
+                            "fetched_at": swap_meta["fetched_at"].isoformat(),
+                            "quality_status": Observation.Quality.ESTIMATED,
+                            "fallback_source": None,
+                            "input_lineage": [
+                                _global_dollar_operation_lineage(
+                                    item,
+                                    run=swap_run,
+                                    scope=scopes["ny-fed-markets"],
+                                    fetched_at=swap_meta["fetched_at"],
+                                    fresh_until=swap_deadline,
+                                    acquisition_sha256=swap_hash,
+                                )
+                                for item in small_items
+                            ],
+                            "acquisition_sha256": swap_hash,
+                        },
+                    },
+                }
+            )
+        if not swap_chart_rows:
+            raise ValueError("USD swap search response has no settlement history")
+
+        charts = [
+            {
+                "key": "global-dollar-broad-dollar-history",
+                "title": "Nominal Broad Dollar Index",
+                "description": "Federal Reserve H.10 daily reference index; not ICE DXY.",
+                "kind": "line",
+                "data": broad_history,
+                "lineage_mode": "per-point",
+                "source_keys": ["federal-reserve"],
+                "batch_ids": [str(h10_run.batch_id)],
+                "as_of": current_broad.as_of.isoformat(),
+                "fetched_at": h10_meta["fetched_at"].isoformat(),
+                "fresh_until": h10_deadline.isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+                "fallback_sources": [],
+                "license_scopes": [
+                    f"{sources['federal-reserve'].name}: {scopes['federal-reserve']}"
+                ],
+            },
+            {
+                "key": "global-dollar-major-fx-usd-strength-rebased",
+                "title": "Major FX USD-Direction Comparison (Rebased)",
+                "description": (
+                    "H.10 reference series only: EUR is inverted, CNY and JPY use "
+                    "direct USD quotes; base date = 100. Not executable spot or forwards."
+                ),
+                "kind": "line",
+                "data": rebased_rows,
+                "lineage_mode": "per-point",
+                "source_keys": ["federal-reserve", "internal"],
+                "batch_ids": [str(h10_run.batch_id)],
+                "as_of": datetime.combine(common_dates[-1], time.min, tzinfo=UTC).isoformat(),
+                "fetched_at": h10_meta["fetched_at"].isoformat(),
+                "fresh_until": h10_deadline.isoformat(),
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+                "fallback_sources": [],
+                "license_scopes": [
+                    f"{sources[key].name}: {scopes[key]}"
+                    for key in ("federal-reserve", "internal")
+                ],
+            },
+            {
+                "key": "global-dollar-swap-drawdowns",
+                "title": "USD Liquidity Swap Drawdowns by Settlement Date",
+                "description": (
+                    "Regular and small-value technical operations from the exact NY Fed "
+                    "search response; current outstanding is not backfilled as history."
+                ),
+                "kind": "bar",
+                "data": swap_chart_rows,
+                "lineage_mode": "per-point",
+                "source_keys": ["internal", "ny-fed-markets"],
+                "batch_ids": [str(swap_run.batch_id)],
+                "as_of": swap_as_of.isoformat(),
+                "fetched_at": swap_meta["fetched_at"].isoformat(),
+                "fresh_until": swap_deadline.isoformat(),
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+                "fallback_sources": [],
+                "license_scopes": [
+                    f"{sources[key].name}: {scopes[key]}"
+                    for key in ("internal", "ny-fed-markets")
+                ],
+            },
+        ]
+
+        active_rows = []
+        for operation in sorted(
+            active,
+            key=lambda item: (
+                item["is_small_value"],
+                item["counterparty"],
+                item["maturity_date"],
+                item["natural_key"],
+            ),
+        ):
+            rate = operation["interest_rate"]
+            row = {
+                "counterparty": operation["counterparty"],
+                "trade": operation["trade_date"].isoformat(),
+                "settlement": operation["settlement_date"].isoformat(),
+                "maturity": operation["maturity_date"].isoformat(),
+                "term": str(operation["term_in_days"]),
+                "rate": f"{rate}%",
+                "amount": f"{operation['amount']:,.2f}",
+                "technical_test": "Yes" if operation["is_small_value"] else "No",
+                "cells_list": [
+                    _global_dollar_cell("counterparty", operation["counterparty"]),
+                    _global_dollar_cell("trade", operation["trade_date"].isoformat()),
+                    _global_dollar_cell(
+                        "settlement", operation["settlement_date"].isoformat()
+                    ),
+                    _global_dollar_cell(
+                        "maturity", operation["maturity_date"].isoformat()
+                    ),
+                    _global_dollar_cell("term", operation["term_in_days"]),
+                    _global_dollar_cell("rate", f"{rate}%"),
+                    _global_dollar_cell("amount", f"{operation['amount']:,.2f}"),
+                    _global_dollar_cell(
+                        "technical-test",
+                        "Yes" if operation["is_small_value"] else "No",
+                    ),
+                ],
+                "source_key": "ny-fed-markets",
+                "source_keys": ["ny-fed-markets"],
+                "license_scope": scopes["ny-fed-markets"],
+                "batch_id": str(swap_run.batch_id),
+                "value_date": swap_as_of.isoformat(),
+                "as_of": swap_as_of.isoformat(),
+                "fetched_at": swap_meta["fetched_at"].isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+                "_lineage": _global_dollar_operation_lineage(
+                    operation,
+                    run=swap_run,
+                    scope=scopes["ny-fed-markets"],
+                    fetched_at=swap_meta["fetched_at"],
+                    fresh_until=swap_deadline,
+                    acquisition_sha256=swap_hash,
+                ),
+            }
+            active_rows.append(row)
+
+        methodology_rows = []
+        component_rows = (
+            (
+                "Federal Reserve H.10",
+                max(h10_meta["latest_dates"].values()).isoformat(),
+                h10_meta["prepared_at"].isoformat(),
+                h10_meta["fetched_at"].isoformat(),
+                h10_deadline.isoformat(),
+                h10_run,
+                h10_hash,
+                scopes["federal-reserve"],
+                "fresh/direct",
+            ),
+            (
+                "NY Fed USD Liquidity Swaps",
+                as_of_date.isoformat(),
+                "—",
+                swap_meta["fetched_at"].isoformat(),
+                swap_deadline.isoformat(),
+                swap_run,
+                swap_hash,
+                scopes["ny-fed-markets"],
+                "fresh/direct fields; Atlas derived aggregates",
+            ),
+        )
+        for component, observation_date, prepared_at, fetched, fresh, run, digest, scope, quality in component_rows:
+            values = (
+                component,
+                observation_date,
+                prepared_at,
+                fetched,
+                fresh,
+                str(run.batch_id),
+                digest,
+                quality,
+                scope,
+                "None",
+            )
+            keys = (
+                "component",
+                "observation",
+                "prepared-as-of",
+                "fetched",
+                "fresh-until",
+                "batch",
+                "artifact",
+                "quality",
+                "license",
+                "fallback",
+            )
+            methodology_rows.append(
+                {
+                    **dict(zip(keys, values, strict=True)),
+                    "cells_list": [
+                        _global_dollar_cell(key, value)
+                        for key, value in zip(keys, values, strict=True)
+                    ],
+                    "source_key": run.source.key,
+                    "source_keys": [run.source.key],
+                    "license_scope": scope,
+                    "batch_id": str(run.batch_id),
+                    "quality_status": Observation.Quality.FRESH,
+                    "fallback_source": None,
+                }
+            )
+
+        gap_rows = []
+        for pair in ("EUR/USD", "USD/JPY", "USD/CNH"):
+            for tenor in ("1M", "3M", "1Y"):
+                values = (
+                    pair,
+                    tenor,
+                    "PURCHASE_REQUIRED",
+                    "No public value",
+                    "LSEG/Bloomberg Enterprise or licensed dealer curve",
+                )
+                keys = ("pair", "tenor", "status", "value", "candidate-source")
+                gap_rows.append(
+                    {
+                        **dict(zip(keys, values, strict=True)),
+                        "cells_list": [
+                            _global_dollar_cell(key, value)
+                            for key, value in zip(keys, values, strict=True)
+                        ],
+                        "source_key": "internal",
+                        "source_keys": ["internal"],
+                        "license_scope": scopes["internal"],
+                        "quality_status": Observation.Quality.ESTIMATED,
+                        "fallback_source": None,
+                    }
+                )
+
+        sections = [
+            {
+                "key": "active-usd-liquidity-swap-operations",
+                "title": "Active USD Liquidity Swap Operations",
+                "description": (
+                    "Regular operations are listed before small-value technical tests. "
+                    "Active means settlementDate ≤ as_of < maturityDate."
+                ),
+                "columns": [
+                    {"key": "counterparty", "label": "Counterparty"},
+                    {"key": "trade", "label": "Trade"},
+                    {"key": "settlement", "label": "Settlement"},
+                    {"key": "maturity", "label": "Maturity"},
+                    {"key": "term", "label": "Days"},
+                    {"key": "rate", "label": "Rate"},
+                    {"key": "amount", "label": "USD mn"},
+                    {"key": "technical-test", "label": "Technical test"},
+                ],
+                "rows": active_rows,
+                "source_keys": ["ny-fed-markets"],
+                "batch_ids": [str(swap_run.batch_id)],
+                "as_of": swap_as_of.isoformat(),
+                "fetched_at": swap_meta["fetched_at"].isoformat(),
+                "fresh_until": swap_deadline.isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+            },
+            {
+                "key": "source-freshness-methodology",
+                "title": "Source Freshness and Methodology",
+                "description": "Each asynchronous component retains its own clock and artifact.",
+                "columns": [
+                    {"key": "component", "label": "Component"},
+                    {"key": "observation", "label": "Observation / as-of"},
+                    {"key": "prepared-as-of", "label": "Prepared"},
+                    {"key": "fetched", "label": "Fetched"},
+                    {"key": "fresh-until", "label": "Fresh until"},
+                    {"key": "batch", "label": "Batch"},
+                    {"key": "artifact", "label": "Artifact SHA-256"},
+                    {"key": "quality", "label": "Quality"},
+                    {"key": "license", "label": "Licence"},
+                    {"key": "fallback", "label": "Fallback"},
+                ],
+                "rows": methodology_rows,
+                "source_keys": ["federal-reserve", "ny-fed-markets"],
+                "batch_ids": [str(h10_run.batch_id), str(swap_run.batch_id)],
+                "as_of": min(current_broad.as_of, swap_as_of).isoformat(),
+                "fetched_at": max(
+                    h10_meta["fetched_at"], swap_meta["fetched_at"]
+                ).isoformat(),
+                "fresh_until": min(h10_deadline, swap_deadline).isoformat(),
+                "quality_status": Observation.Quality.FRESH,
+                "fallback_source": None,
+            },
+            {
+                "key": "licensed-market-data-gaps",
+                "title": "Licensed Market-Data Gaps",
+                "description": (
+                    "Cross-currency basis, executable dealer quotes, forward points, "
+                    "implied USD funding, ICE DXY and order-book depth require separate "
+                    "public/derived display rights. No proxy value is shown."
+                ),
+                "columns": [
+                    {"key": "pair", "label": "Pair"},
+                    {"key": "tenor", "label": "Tenor"},
+                    {"key": "status", "label": "Status"},
+                    {"key": "value", "label": "Value"},
+                    {"key": "candidate-source", "label": "Candidate source"},
+                ],
+                "rows": gap_rows,
+                "source_keys": ["internal"],
+                "batch_ids": [],
+                "as_of": min(current_broad.as_of, swap_as_of).isoformat(),
+                "fetched_at": max(
+                    h10_meta["fetched_at"], swap_meta["fetched_at"]
+                ).isoformat(),
+                "fresh_until": min(h10_deadline, swap_deadline).isoformat(),
+                "quality_status": Observation.Quality.ESTIMATED,
+                "fallback_source": None,
+            },
+        ]
+
+        component_runs = [
+            _global_dollar_run_state(identity, selected[identity], status="valid")
+            for identity in GLOBAL_DOLLAR_DATASETS
+        ]
+        extra_data = {
+            "contract_version": GLOBAL_DOLLAR_CONTRACT_VERSION,
+            "formula_version": GLOBAL_DOLLAR_FORMULA_VERSION,
+            "formulas": GLOBAL_DOLLAR_FORMULAS,
+            "input_runs": component_runs,
+            "component_runs": component_runs,
+            "component_value_dates": {
+                "h10": {
+                    key: value.date().isoformat()
+                    for key, value in sorted(h10_meta["latest_dates"].items())
+                },
+                "swaps": as_of_date.isoformat(),
+            },
+            "component_fetched_at": {
+                "h10": h10_meta["fetched_at"].isoformat(),
+                "swaps": swap_meta["fetched_at"].isoformat(),
+            },
+            "acquisition_artifacts": {
+                "h10": {
+                    "sha256": h10_hash,
+                    "member_sha256": (h10_run.metadata or {}).get(
+                        "archive_member_sha256"
+                    ),
+                    "private_uri": h10_meta["artifact"].uri,
+                },
+                "swaps": {
+                    "sha256": swap_hash,
+                    "private_uri": swap_meta["artifact"].uri,
+                    "coverage_start": swap_meta["coverage_start"].isoformat(),
+                    "coverage_end": as_of_date.isoformat(),
+                    "date_type": "trade",
+                    "returned_count": swap_meta["returned_count"],
+                },
+            },
+            "required_metric_keys": sorted(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS),
+            "required_chart_keys": sorted(GLOBAL_DOLLAR_REQUIRED_CHART_KEYS),
+            "required_section_keys": sorted(GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS),
+            "semantic_boundary": (
+                "Federal Reserve H.10 reference data and central-bank USD liquidity "
+                "swap backstop usage; not ICE DXY, cross-currency basis, executable "
+                "spot/forwards, a complete offshore-dollar stress gauge, or a trade signal."
+            ),
+        }
+        return (metrics, charts, sections, extra_data), []
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ) as exc:
+        return None, [
+            {
+                "component": "global-dollar",
+                "kind": "contract",
+                "status": "invalid",
+                "reason": str(exc)[:320],
+            }
+        ]
+
+
+def _global_dollar_page_contract_is_buildable(data: dict[str, Any]) -> bool:
+    metrics = data.get("metrics")
+    charts = data.get("charts")
+    sections = data.get("sections")
+    expected_payload_keys = set(GLOBAL_DOLLAR_PAYLOAD_KEYS)
+    if "refresh_failure" in data:
+        expected_payload_keys.add("refresh_failure")
+    if (
+        set(data) != expected_payload_keys
+        or data.get("contract_version") != GLOBAL_DOLLAR_CONTRACT_VERSION
+        or data.get("formula_version") != GLOBAL_DOLLAR_FORMULA_VERSION
+        or data.get("formulas") != GLOBAL_DOLLAR_FORMULAS
+        or data.get("required_metric_keys")
+        != sorted(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS)
+        or data.get("required_chart_keys")
+        != sorted(GLOBAL_DOLLAR_REQUIRED_CHART_KEYS)
+        or data.get("required_section_keys")
+        != sorted(GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS)
+        or not isinstance(metrics, list)
+        or len(metrics) != len(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS)
+        or {str(item.get("key") or "") for item in metrics if isinstance(item, dict)}
+        != set(GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS)
+        or not isinstance(charts, list)
+        or len(charts) != len(GLOBAL_DOLLAR_REQUIRED_CHART_KEYS)
+        or {str(item.get("key") or "") for item in charts if isinstance(item, dict)}
+        != set(GLOBAL_DOLLAR_REQUIRED_CHART_KEYS)
+        or not isinstance(sections, list)
+        or len(sections) != len(GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS)
+        or {str(item.get("key") or "") for item in sections if isinstance(item, dict)}
+        != set(GLOBAL_DOLLAR_REQUIRED_SECTION_KEYS)
+        or any(not isinstance(item, dict) for item in [*metrics, *charts, *sections])
+        or any(item.get("fallback_source") is not None for item in metrics)
+        or any(
+            not chart.get("data")
+            or chart.get("lineage_mode") != "per-point"
+            or chart.get("fallback_source") is not None
+            or chart.get("fallback_sources")
+            for chart in charts
+        )
+    ):
+        return False
+    metric_map = {str(item["key"]): item for item in metrics}
+    try:
+        change_inputs = metric_map["h10-broad-dollar-5d-change-pct"]["metadata"][
+            "input_lineage"
+        ]
+        if not isinstance(change_inputs, list) or len(change_inputs) != 6:
+            return False
+        expected_change = Decimal("100") * (
+            Decimal(str(change_inputs[-1]["raw_value"]))
+            / Decimal(str(change_inputs[0]["raw_value"]))
+            - Decimal("1")
+        )
+        total = Decimal(str(metric_map["fxswap-usd-outstanding"]["value"]))
+        regular = Decimal(
+            str(metric_map["fxswap-usd-outstanding-non-small-value"]["value"])
+        )
+        small = Decimal(
+            str(metric_map["fxswap-usd-outstanding-small-value"]["value"])
+        )
+        regular_inputs = metric_map[
+            "fxswap-usd-outstanding-non-small-value"
+        ]["metadata"]["input_lineage"]
+        counterparty_inputs = metric_map["fxswap-active-counterparties"]["metadata"][
+            "input_lineage"
+        ]
+        expected_counterparties = len(
+            {str(item["counterparty"]) for item in counterparty_inputs}
+        )
+    except (ArithmeticError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        not _fed_balance_sheet_decimal_equal(
+            metric_map["h10-broad-dollar-5d-change-pct"]["value"], expected_change
+        )
+        or not _fed_balance_sheet_decimal_equal(total, regular + small)
+        or not _fed_balance_sheet_decimal_equal(
+            regular,
+            sum(
+                (Decimal(str(item["amount_usd_millions"])) for item in regular_inputs),
+                Decimal("0"),
+            ),
+        )
+        or not _fed_balance_sheet_decimal_equal(
+            metric_map["fxswap-active-counterparties"]["value"],
+            Decimal(expected_counterparties),
+        )
+        or any(
+            (metric_map[key].get("metadata") or {}).get("formula") != formula
+            for key, formula in GLOBAL_DOLLAR_FORMULAS.items()
+        )
+    ):
+        return False
+    section_map = {str(item["key"]): item for item in sections}
+    active_rows = section_map["active-usd-liquidity-swap-operations"].get("rows")
+    methodology_rows = section_map["source-freshness-methodology"].get("rows")
+    gap_rows = section_map["licensed-market-data-gaps"].get("rows")
+    if (
+        not isinstance(active_rows, list)
+        or not isinstance(methodology_rows, list)
+        or len(methodology_rows) != 2
+        or not isinstance(gap_rows, list)
+        or len(gap_rows) != 9
+        or {
+            (str(item.get("pair")), str(item.get("tenor")))
+            for item in gap_rows
+            if isinstance(item, dict)
+        }
+        != {
+            (pair, tenor)
+            for pair in ("EUR/USD", "USD/JPY", "USD/CNH")
+            for tenor in ("1M", "3M", "1Y")
+        }
+        or any(
+            item.get("status") != "PURCHASE_REQUIRED"
+            or item.get("value") != "No public value"
+            for item in gap_rows
+        )
+    ):
+        return False
+
+    def cells_are_exact(row: dict[str, Any], keys: tuple[str, ...]) -> bool:
+        cells = row.get("cells_list") if isinstance(row, dict) else None
+        return bool(
+            isinstance(cells, list)
+            and len(cells) == len(keys)
+            and tuple(str(item.get("key") or "") for item in cells) == keys
+            and all(
+                isinstance(item.get("cell"), dict)
+                and item["cell"].get("kind") == "text"
+                for item in cells
+                if isinstance(item, dict)
+            )
+            and len([item for item in cells if isinstance(item, dict)]) == len(keys)
+            and row.get("fallback_source") is None
+        )
+
+    return bool(
+        all(
+            cells_are_exact(
+                row,
+                (
+                    "counterparty",
+                    "trade",
+                    "settlement",
+                    "maturity",
+                    "term",
+                    "rate",
+                    "amount",
+                    "technical-test",
+                ),
+            )
+            for row in active_rows
+        )
+        and all(
+            cells_are_exact(
+                row,
+                (
+                    "component",
+                    "observation",
+                    "prepared-as-of",
+                    "fetched",
+                    "fresh-until",
+                    "batch",
+                    "artifact",
+                    "quality",
+                    "license",
+                    "fallback",
+                ),
+            )
+            for row in methodology_rows
+        )
+        and all(
+            cells_are_exact(
+                row,
+                ("pair", "tenor", "status", "value", "candidate-source"),
+            )
+            for row in gap_rows
+        )
+    )
+
+
+def _global_dollar_normalized_metrics_match(snapshot: DashboardSnapshot) -> bool:
+    data = dict(snapshot.data or {})
+    stored_rows = list(
+        MetricSnapshot.objects.filter(batch_id=snapshot.batch_id).select_related(
+            "source", "fallback_source"
+        )
+    )
+    expected_keys = {
+        f"global-dollar-{key}" for key in GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS
+    }
+    stored = {
+        item.key: item
+        for item in stored_rows
+        if item.key.startswith("global-dollar-")
+    }
+    if len(stored_rows) != len(expected_keys) or set(stored) != expected_keys:
+        return False
+    for metric in data.get("metrics", []):
+        normalized = stored.get(f"global-dollar-{metric['key']}")
+        expected_metadata = _dashboard_metric_snapshot_metadata(
+            metric,
+            fingerprint=str(data.get("fingerprint") or ""),
+            payload_integrity_hash=str(data.get("payload_integrity_hash") or ""),
+        )
+        if (
+            normalized is None
+            or normalized.value is None
+            or not _fed_balance_sheet_decimal_equal(
+                normalized.value, metric.get("value")
+            )
+            or normalized.label != str(metric.get("label") or "")
+            or normalized.display_value != str(metric.get("display_value") or "")
+            or normalized.unit != str(metric.get("unit") or "")
+            or (normalized.change is None) != (metric.get("change") is None)
+            or (
+                normalized.change is not None
+                and not _fed_balance_sheet_decimal_equal(
+                    normalized.change, metric.get("change")
+                )
+            )
+            or normalized.source.key != metric.get("source_key")
+            or normalized.fallback_source_id is not None
+            or normalized.value_date
+            != _parse_payload_datetime(metric.get("value_date"))
+            or normalized.as_of != _parse_payload_datetime(metric.get("as_of"))
+            or normalized.fetched_at
+            != _parse_payload_datetime(metric.get("fetched_at"))
+            or normalized.quality_status != metric.get("quality_status")
+            or normalized.license_scope != str(metric.get("license_scope") or "")[:120]
+            or normalized.metadata != expected_metadata
+        ):
+            return False
+    return True
+
+
+def _global_dollar_component_runs_from_snapshot(
+    snapshot: DashboardSnapshot,
+) -> dict[str, IngestionRun] | None:
+    references = (snapshot.data or {}).get("component_runs")
+    if (
+        not isinstance(references, list)
+        or len(references) != len(GLOBAL_DOLLAR_DATASETS)
+        or not all(isinstance(item, dict) for item in references)
+    ):
+        return None
+    by_identity = {str(item.get("component") or ""): item for item in references}
+    if set(by_identity) != set(GLOBAL_DOLLAR_DATASETS):
+        return None
+    selected: dict[str, IngestionRun] = {}
+    for identity, (source_key, dataset) in GLOBAL_DOLLAR_DATASETS.items():
+        reference = by_identity[identity]
+        run = (
+            IngestionRun.objects.select_related("source")
+            .filter(pk=reference.get("ingestion_run_id"))
+            .first()
+        )
+        if (
+            run is None
+            or run.source.key != source_key
+            or run.dataset != dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or reference != _global_dollar_run_state(identity, run, status="valid")
+        ):
+            return None
+        try:
+            _global_dollar_artifact_bytes(run, identity=identity)
+        except ValueError:
+            return None
+        selected[identity] = run
+    return selected
+
+
+def _global_dollar_refresh_failure_is_valid(
+    snapshot: DashboardSnapshot,
+    value: Any,
+) -> bool:
+    """Bind a stale marker to the exact current component attempts."""
+
+    if not isinstance(value, dict) or set(value) != {
+        "checked_at",
+        "reason_code",
+        "reason",
+        "components",
+    }:
+        return False
+    reason_code = value.get("reason_code")
+    if (
+        reason_code not in GLOBAL_DOLLAR_REFRESH_FAILURE_REASONS
+        or value.get("reason") != GLOBAL_DOLLAR_REFRESH_FAILURE_REASONS[reason_code]
+    ):
+        return False
+    checked_at_raw = value.get("checked_at")
+    checked_at = _parse_payload_datetime(checked_at_raw)
+    if (
+        not isinstance(checked_at_raw, str)
+        or checked_at is None
+        or checked_at.isoformat() != checked_at_raw
+        or checked_at > timezone.now() + timedelta(minutes=5)
+    ):
+        return False
+    components = value.get("components")
+    if (
+        not isinstance(components, list)
+        or len(components) != len(GLOBAL_DOLLAR_DATASETS)
+        or not all(isinstance(component, dict) for component in components)
+    ):
+        return False
+    audited_attempts: dict[str, IngestionRun] = {}
+    for identity, component in zip(
+        GLOBAL_DOLLAR_DATASETS,
+        components,
+        strict=True,
+    ):
+        run = (
+            IngestionRun.objects.select_related("source")
+            .filter(pk=component.get("ingestion_run_id"))
+            .first()
+        )
+        source_key, dataset = GLOBAL_DOLLAR_DATASETS[identity]
+        latest_at_check = (
+            IngestionRun.objects.filter(
+                source__key=source_key,
+                dataset=dataset,
+                started_at__lte=checked_at,
+            )
+            .order_by("-started_at", "-id")
+            .first()
+        )
+        if (
+            run is None
+            or run.source.key != source_key
+            or run.dataset != dataset
+            or latest_at_check is None
+            or latest_at_check.pk != run.pk
+            or component != _global_dollar_run_state(identity, run)
+        ):
+            return False
+        audited_attempts[identity] = run
+    completed = [
+        run.completed_at or run.started_at for run in audited_attempts.values()
+    ]
+    if not completed or checked_at < max(completed):
+        return False
+    embedded = _global_dollar_component_runs_from_snapshot(snapshot)
+    if embedded is None or not any(
+        audited_attempts[identity].pk != embedded[identity].pk
+        for identity in GLOBAL_DOLLAR_DATASETS
+    ):
+        return False
+    incomplete = any(
+        run.status != IngestionRun.Status.SUCCESS
+        or run.row_count <= 0
+        for run in audited_attempts.values()
+    )
+    if incomplete:
+        if reason_code != "latest-attempt-incomplete":
+            return False
+    elif reason_code not in {
+        "candidate-validation",
+        "candidate-regression",
+        "publication-postcondition",
+    }:
+        return False
+    current_attempts = {
+        identity: _latest_global_dollar_attempt(identity)
+        for identity in GLOBAL_DOLLAR_DATASETS
+    }
+    if any(run is None for run in current_attempts.values()):
+        return False
+    for identity, audited in audited_attempts.items():
+        current = current_attempts[identity]
+        if current is None or current.pk == audited.pk:
+            continue
+        completed_at = current.completed_at or current.started_at
+        if (
+            current.status != IngestionRun.Status.SUCCESS
+            or current.row_count <= 0
+            or completed_at <= checked_at
+        ):
+            return False
+    return True
+
+
+def _global_dollar_snapshot_matches_runs(
+    snapshot: DashboardSnapshot,
+    *,
+    selected: dict[str, IngestionRun],
+    allow_expired: bool,
+    allow_refresh_failure: bool,
+    require_observations: bool,
+) -> bool:
+    data = dict(snapshot.data or {})
+    required_sources = {"federal-reserve", "internal", "ny-fed-markets"}
+    sources = {
+        item.key: item for item in Source.objects.filter(key__in=required_sources)
+    }
+    if set(sources) != required_sources:
+        return False
+    for source in sources.values():
+        if (
+            _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+                require_storage=True,
+            )
+            is None
+        ):
+            return False
+    refresh_failure = data.get("refresh_failure")
+    if allow_refresh_failure:
+        if (
+            snapshot.quality_status != Observation.Quality.STALE
+            or not _global_dollar_refresh_failure_is_valid(
+                snapshot,
+                refresh_failure,
+            )
+        ):
+            return False
+    elif refresh_failure is not None:
+        return False
+    valid_quality = (
+        {Observation.Quality.STALE}
+        if allow_refresh_failure
+        else {Observation.Quality.ESTIMATED, Observation.Quality.STALE}
+        if allow_expired
+        else {Observation.Quality.ESTIMATED}
+    )
+    expected_batches = {str(run.batch_id) for run in selected.values()}
+    if (
+        snapshot.key != "global-dollar"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or snapshot.title != GLOBAL_DOLLAR_TITLE
+        or snapshot.summary != GLOBAL_DOLLAR_SUMMARY
+        or snapshot.quality_status not in valid_quality
+        or data.get("demo") is not False
+        or data.get("required_notices") != public_source_notices(required_sources)
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or set(data.get("source_keys") or []) != required_sources
+        or set(data.get("component_batches") or []) != expected_batches
+        or _payload_fallback_source_keys(data)
+        or str(data.get("fingerprint") or "")
+        != _global_dollar_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or str(data.get("payload_integrity_hash") or "")
+        != _global_dollar_payload_integrity_hash(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or not _global_dollar_page_contract_is_buildable(data)
+    ):
+        return False
+    audited_payload = {
+        key: value for key, value in data.items() if key != "refresh_failure"
+    }
+    if (
+        not _payload_batch_ids(audited_payload) <= expected_batches
+        or not _payload_source_keys(audited_payload) <= required_sources
+    ):
+        return False
+    prepared, _failures = _global_dollar_page_data(
+        selected,
+        allow_expired=allow_expired or allow_refresh_failure,
+        require_observations=require_observations,
+    )
+    if prepared is None:
+        return False
+    metrics, charts, sections, extra = prepared
+    return bool(
+        data.get("metrics") == metrics
+        and data.get("charts") == charts
+        and data.get("sections") == sections
+        and data.get("chart_data") == charts[0]["data"]
+        and all(data.get(key) == value for key, value in extra.items())
+        and _global_dollar_normalized_metrics_match(snapshot)
+    )
+
+
+def _global_dollar_has_component_transition(
+    snapshot: DashboardSnapshot,
+    attempts: dict[str, IngestionRun | None] | None = None,
+) -> bool:
+    embedded = _global_dollar_component_runs_from_snapshot(snapshot)
+    if embedded is None:
+        return False
+    latest = attempts or {
+        identity: _latest_global_dollar_attempt(identity)
+        for identity in GLOBAL_DOLLAR_DATASETS
+    }
+    return bool(
+        set(latest) == set(GLOBAL_DOLLAR_DATASETS)
+        and all(run is not None for run in latest.values())
+        and any(
+            latest[identity] is not None
+            and latest[identity].pk != embedded[identity].pk
+            for identity in GLOBAL_DOLLAR_DATASETS
+        )
+    )
+
+
+def _global_dollar_snapshot_is_publicly_displayable_unchecked(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    attempts = {
+        identity: _latest_global_dollar_attempt(identity)
+        for identity in GLOBAL_DOLLAR_DATASETS
+    }
+    if all(run is not None for run in attempts.values()) and all(
+        run is not None
+        and run.status == IngestionRun.Status.SUCCESS
+        and run.row_count > 0
+        for run in attempts.values()
+    ):
+        selected = {
+            identity: run for identity, run in attempts.items() if run is not None
+        }
+        deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+        expired = deadline is not None and deadline < timezone.now()
+        if _global_dollar_snapshot_matches_runs(
+            snapshot,
+            selected=selected,
+            allow_expired=expired,
+            allow_refresh_failure=False,
+            require_observations=True,
+        ):
+            return True
+    embedded = _global_dollar_component_runs_from_snapshot(snapshot)
+    if embedded is None:
+        return False
+    if _global_dollar_snapshot_matches_runs(
+        snapshot,
+        selected=embedded,
+        allow_expired=True,
+        allow_refresh_failure=True,
+        require_observations=False,
+    ):
+        return True
+    return _global_dollar_has_component_transition(
+        snapshot, attempts
+    ) and _global_dollar_snapshot_matches_runs(
+        snapshot,
+        selected=embedded,
+        allow_expired=True,
+        allow_refresh_failure=False,
+        require_observations=False,
+    )
+
+
+def global_dollar_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    try:
+        return _global_dollar_snapshot_is_publicly_displayable_unchecked(snapshot)
+    except (
+        ArithmeticError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        return False
+
+
+def select_public_global_dollar_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="global-dollar",
+                is_published=True,
+                data__contract_version=GLOBAL_DOLLAR_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if global_dollar_snapshot_is_publicly_displayable(candidate)
+        ),
+        None,
+    )
+    if selected is not None:
+        deadline = _parse_payload_datetime((selected.data or {}).get("fresh_until"))
+        if (
+            deadline is not None
+            and deadline < timezone.now()
+            or _global_dollar_has_component_transition(selected)
+        ):
+            selected.quality_status = Observation.Quality.STALE
+    return selected
+
+
+def _mark_global_dollar_stale(
+    *,
+    reason_code: str,
+) -> None:
+    latest = (
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="global-dollar",
+            is_published=True,
+            data__contract_version=GLOBAL_DOLLAR_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    if latest is None:
+        return
+    embedded = _global_dollar_component_runs_from_snapshot(latest)
+    original_data = latest.data
+    audited_data = dict(original_data or {})
+    audited_data.pop("refresh_failure", None)
+    latest.data = audited_data
+    try:
+        retained_snapshot_is_valid = embedded is not None and (
+            _global_dollar_snapshot_matches_runs(
+                latest,
+                selected=embedded,
+                allow_expired=True,
+                allow_refresh_failure=False,
+                require_observations=False,
+            )
+        )
+    finally:
+        latest.data = original_data
+    if not retained_snapshot_is_valid:
+        return
+    reason = GLOBAL_DOLLAR_REFRESH_FAILURE_REASONS.get(reason_code)
+    if reason is None:
+        raise ValueError("unknown global-dollar refresh failure reason")
+    attempts = {
+        identity: _latest_global_dollar_attempt(identity)
+        for identity in GLOBAL_DOLLAR_DATASETS
+    }
+    if any(run is None for run in attempts.values()):
+        return
+    components = [
+        _global_dollar_run_state(identity, attempts[identity])
+        for identity in GLOBAL_DOLLAR_DATASETS
+    ]
+    data = dict(latest.data or {})
+    data["refresh_failure"] = {
+        "checked_at": timezone.now().isoformat(),
+        "reason_code": reason_code,
+        "reason": reason,
+        "components": components,
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+@transaction.atomic
+def _coordinate_global_dollar_dashboard(
+    trigger_runs: Iterable[IngestionRun],
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    source_keys = {"federal-reserve", "internal", "ny-fed-markets"}
+    for source_key in source_keys:
+        ensure_source(source_key)
+    list(
+        Source.objects.select_for_update()
+        .filter(key__in=source_keys)
+        .order_by("key")
+        .values_list("pk", flat=True)
+    )
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(source__key__in=source_keys, is_current=True)
+        .order_by("source__key")
+        .values_list("pk", flat=True)
+    )
+    selected, _states, triggered = _select_global_dollar_runs(trigger_runs)
+    if not triggered:
+        return [], set()
+    if selected is None:
+        _mark_global_dollar_stale(
+            reason_code="latest-attempt-incomplete",
+        )
+        return [], {"global-dollar"}
+    list(
+        IngestionRun.objects.select_for_update()
+        .filter(pk__in=[run.pk for run in selected.values()])
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+    previous = (
+        DashboardSnapshot.objects.filter(
+            key="global-dollar",
+            is_published=True,
+            data__contract_version=GLOBAL_DOLLAR_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+    expected_batches = {str(run.batch_id) for run in selected.values()}
+    if (
+        previous is not None
+        and set((previous.data or {}).get("component_batches") or [])
+        == expected_batches
+        and "refresh_failure" not in (previous.data or {})
+        and _global_dollar_snapshot_matches_runs(
+            previous,
+            selected=selected,
+            allow_expired=False,
+            allow_refresh_failure=False,
+            require_observations=True,
+        )
+    ):
+        return [], set()
+    prepared, _failures = _global_dollar_page_data(selected)
+    if prepared is None:
+        _mark_global_dollar_stale(
+            reason_code="candidate-validation",
+        )
+        return [], {"global-dollar"}
+    metrics, charts, sections, extra_data = prepared
+    if previous is not None:
+        old_dates = (previous.data or {}).get("component_value_dates") or {}
+        old_h10 = old_dates.get("h10") if isinstance(old_dates, dict) else {}
+        new_h10 = extra_data["component_value_dates"]["h10"]
+        old_swap = old_dates.get("swaps") if isinstance(old_dates, dict) else None
+        new_swap = extra_data["component_value_dates"]["swaps"]
+        if (
+            isinstance(old_h10, dict)
+            and any(
+                key in old_h10 and new_h10[key] < str(old_h10[key])
+                for key in new_h10
+            )
+            or old_swap is not None
+            and new_swap < str(old_swap)
+        ):
+            _mark_global_dollar_stale(
+                reason_code="candidate-regression",
+            )
+            return [], {"global-dollar"}
+    try:
+        with transaction.atomic():
+            published = _publish_dashboard(
+                key="global-dollar",
+                title=GLOBAL_DOLLAR_TITLE,
+                summary=GLOBAL_DOLLAR_SUMMARY,
+                metrics=metrics,
+                charts=charts,
+                sections=sections,
+                extra_data=extra_data,
+                required_metric_keys=GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS,
+                batch_id=uuid.uuid4(),
+            )
+            latest = (
+                DashboardSnapshot.objects.filter(
+                    key="global-dollar",
+                    is_published=True,
+                    data__contract_version=GLOBAL_DOLLAR_CONTRACT_VERSION,
+                )
+                .exclude(source__key="demo-market")
+                .select_related("source")
+                .order_by("-created_at", "-id")
+                .first()
+            )
+            if (
+                latest is None
+                or not _global_dollar_runs_still_latest(selected)
+                or not _global_dollar_snapshot_matches_runs(
+                    latest,
+                    selected=selected,
+                    allow_expired=False,
+                    allow_refresh_failure=False,
+                    require_observations=True,
+                )
+            ):
+                raise ValueError("global-dollar v1 publication postcondition failed")
+    except (
+        ArithmeticError,
+        IndexError,
+        KeyError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        _mark_global_dollar_stale(
+            reason_code="publication-postcondition",
+        )
+        return [], {"global-dollar"}
+    return ([published] if published is not None else []), set()
+
+
+def _transmission_component_datasets(
+    page_key: str,
+) -> dict[str, tuple[str, str]]:
+    return {
+        "fed-balance-sheet": FED_BALANCE_SHEET_DATASETS,
+        "operations": OPERATIONS_DATASETS,
+        "reserves-rate-spreads": RESERVES_RATE_SPREADS_DATASETS,
+        "subsurface": SUBSURFACE_DATASETS,
+        "reserves": RESERVES_DATASETS,
+        "global-dollar": GLOBAL_DOLLAR_DATASETS,
+    }[page_key]
+
+
+def _transmission_component_required_sets(
+    page_key: str,
+) -> tuple[frozenset[str], frozenset[str]]:
+    return {
+        "fed-balance-sheet": (
+            FED_BALANCE_SHEET_REQUIRED_METRIC_KEYS,
+            FED_BALANCE_SHEET_REQUIRED_CHART_KEYS,
+        ),
+        "operations": (
+            OPERATIONS_REQUIRED_METRIC_KEYS,
+            OPERATIONS_REQUIRED_CHART_KEYS,
+        ),
+        "reserves-rate-spreads": (
+            RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS,
+            RESERVES_RATE_SPREADS_REQUIRED_CHART_KEYS,
+        ),
+        "subsurface": (
+            SUBSURFACE_REQUIRED_METRIC_KEYS,
+            SUBSURFACE_REQUIRED_CHART_KEYS,
+        ),
+        "reserves": (
+            RESERVES_REQUIRED_METRIC_KEYS,
+            RESERVES_REQUIRED_CHART_KEYS,
+        ),
+        "global-dollar": (
+            GLOBAL_DOLLAR_REQUIRED_METRIC_KEYS,
+            GLOBAL_DOLLAR_REQUIRED_CHART_KEYS,
+        ),
+    }[page_key]
+
+
+def _transmission_component_runs_from_snapshot(
+    snapshot: DashboardSnapshot,
+) -> dict[str, IngestionRun] | None:
+    expected = _transmission_component_datasets(snapshot.key)
+    references = (snapshot.data or {}).get("component_runs")
+    if (
+        not isinstance(references, list)
+        or len(references) != len(expected)
+        or not all(isinstance(item, dict) for item in references)
+    ):
+        return None
+    by_role = {str(item.get("component") or ""): item for item in references}
+    if set(by_role) != set(expected):
+        return None
+    selected: dict[str, IngestionRun] = {}
+    for role, (source_key, dataset) in expected.items():
+        reference = by_role[role]
+        run = (
+            IngestionRun.objects.select_related("source")
+            .filter(pk=reference.get("ingestion_run_id"))
+            .first()
+        )
+        if (
+            run is None
+            or run.source.key != source_key
+            or run.dataset != dataset
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            or str(reference.get("source") or "") != source_key
+            or str(reference.get("dataset") or "") != dataset
+            or reference.get("ingestion_run_id") != run.pk
+            or str(reference.get("batch_id") or "") != str(run.batch_id)
+            or reference.get("status") != "valid"
+            or int(reference.get("row_count") or 0) != run.row_count
+        ):
+            return None
+        selected[role] = run
+    return selected
+
+
+def _transmission_runs_are_latest(
+    page_key: str, selected: dict[str, IngestionRun]
+) -> bool:
+    expected = _transmission_component_datasets(page_key)
+    return all(
+        (
+            latest := IngestionRun.objects.filter(
+                source__key=source_key,
+                dataset=dataset,
+            )
+            .order_by("-started_at", "-id")
+            .first()
+        )
+        is not None
+        and latest.pk == selected[role].pk
+        and latest.status == IngestionRun.Status.SUCCESS
+        and latest.row_count > 0
+        for role, (source_key, dataset) in expected.items()
+    )
+
+
+def _transmission_child_payload_hash(snapshot: DashboardSnapshot) -> str:
+    builder = (
+        _global_dollar_payload_integrity_hash
+        if snapshot.key == "global-dollar"
+        else _dashboard_payload_integrity_hash
+    )
+    return builder(
+        title=snapshot.title,
+        summary=snapshot.summary,
+        snapshot_data=dict(snapshot.data or {}),
+    )
+
+
+def _transmission_child_fingerprint(snapshot: DashboardSnapshot) -> str:
+    builder = (
+        _global_dollar_content_fingerprint
+        if snapshot.key == "global-dollar"
+        else _dashboard_content_fingerprint
+    )
+    return builder(
+        title=snapshot.title,
+        summary=snapshot.summary,
+        snapshot_data=dict(snapshot.data or {}),
+    )
+
+
+def _transmission_metadata_mentions_digest(value: Any, digest: str) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _transmission_metadata_mentions_digest(item, digest)
+            for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _transmission_metadata_mentions_digest(item, digest) for item in value
+        )
+    return str(value or "").lower() == digest
+
+
+def _transmission_artifact_evidence(
+    page_key: str,
+    runs: dict[str, IngestionRun],
+) -> list[dict[str, Any]] | None:
+    """Return honest per-run acquisition evidence without upgrading child v1."""
+
+    root = Path(
+        getattr(
+            settings,
+            "RAW_ARTIFACT_ROOT",
+            settings.BASE_DIR / "data" / "artifacts",
+        )
+    )
+    evidence: list[dict[str, Any]] = []
+    datasets = _transmission_component_datasets(page_key)
+    for role in datasets:
+        run = runs[role]
+        artifacts = list(RawArtifact.objects.filter(run=run).order_by("pk"))
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for artifact in artifacts:
+            digest = str(artifact.sha256 or "").lower()
+            if (
+                len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+                or artifact.size_bytes <= 0
+                or not _transmission_metadata_mentions_digest(
+                    dict(run.metadata or {}), digest
+                )
+            ):
+                return None
+            item = {
+                "artifact_id": artifact.pk,
+                "uri": artifact.uri,
+                "sha256": digest,
+                "size_bytes": artifact.size_bytes,
+                "content_type": artifact.content_type,
+            }
+            if artifact.uri.startswith("private://"):
+                artifact_path = root / digest[:2] / f"{digest}.bin"
+                try:
+                    payload = artifact_path.read_bytes()
+                except OSError:
+                    return None
+                if (
+                    len(payload) != artifact.size_bytes
+                    or hashlib.sha256(payload).hexdigest() != digest
+                ):
+                    return None
+                grouped["PRIVATE_BYTES"].append(item)
+            elif f"sha256={digest}" in artifact.uri.lower():
+                grouped["HASH_POINTER_ONLY"].append(item)
+            else:
+                # NOT_AVAILABLE is reserved for child-v1 runs with no
+                # RawArtifact rows.  An existing row with an unrecognised URI
+                # is an integrity failure, not an acquisition gap.
+                return None
+        if not artifacts:
+            grouped["NOT_AVAILABLE_UNDER_CHILD_V1"].append(
+                {
+                    "reason": (
+                        "The referenced child v1 has no acquisition artifact row "
+                        "for this input run."
+                    )
+                }
+            )
+        source_key, dataset = datasets[role]
+        for status in (
+            "PRIVATE_BYTES",
+            "HASH_POINTER_ONLY",
+            "NOT_AVAILABLE_UNDER_CHILD_V1",
+        ):
+            if status not in grouped:
+                continue
+            evidence.append(
+                {
+                    "component_page_key": page_key,
+                    "input_role": role,
+                    "source": source_key,
+                    "dataset": dataset,
+                    "run_id": run.pk,
+                    "batch_id": str(run.batch_id),
+                    "artifact_status": status,
+                    "artifacts": grouped[status],
+                }
+            )
+    return evidence
+
+
+def _transmission_child_licences_are_current(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    source_keys = set((snapshot.data or {}).get("source_keys") or [])
+    if not source_keys or "demo-market" in source_keys:
+        return False
+    sources = {item.key: item for item in Source.objects.filter(key__in=source_keys)}
+    return bool(
+        set(sources) == source_keys
+        and all(
+            _effective_source_license(
+                source,
+                require_public=True,
+                require_derived=True,
+                require_storage=True,
+            )
+            is not None
+            for source in sources.values()
+        )
+    )
+
+
+def _transmission_child_contract_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    mode: str,
+) -> bool:
+    if mode not in {"current_candidate", "retained", "natural_expiry"}:
+        return False
+    data = dict(snapshot.data or {})
+    component = TRANSMISSION_CHAIN_COMPONENTS.get(snapshot.key)
+    if component is None:
+        return False
+    metric_keys, chart_keys = _transmission_component_required_sets(snapshot.key)
+    selected = _transmission_component_runs_from_snapshot(snapshot)
+    if (
+        selected is None
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or data.get("demo") is not False
+        or "title" in data
+        or "summary" in data
+        or data.get("contract_version") != component["contract_version"]
+        or {str(item.get("key") or "") for item in data.get("metrics", [])}
+        != set(metric_keys)
+        or {str(item.get("key") or "") for item in data.get("charts", [])}
+        != set(chart_keys)
+        or str(data.get("fingerprint") or "")
+        != _transmission_child_fingerprint(snapshot)
+        or str(data.get("payload_integrity_hash") or "")
+        != _transmission_child_payload_hash(snapshot)
+        or _payload_fallback_source_keys(data)
+        or not _transmission_child_licences_are_current(snapshot)
+        or _transmission_artifact_evidence(snapshot.key, selected) is None
+    ):
+        return False
+    refresh_failure = data.get("refresh_failure")
+    current_mode = mode in {"current_candidate", "natural_expiry"}
+    if current_mode and not _transmission_runs_are_latest(snapshot.key, selected):
+        return False
+    if current_mode and refresh_failure is not None:
+        return False
+    if (
+        mode == "retained"
+        and refresh_failure is not None
+        and (
+            snapshot.quality_status != Observation.Quality.STALE
+            or not _fed_balance_sheet_refresh_failure_is_valid(refresh_failure)
+        )
+    ):
+        return False
+    naturally_expired = mode == "natural_expiry"
+    if mode == "current_candidate":
+        deadline = _parse_payload_datetime(data.get("fresh_until"))
+        if (
+            deadline is None
+            or deadline < timezone.now()
+            or refresh_failure is not None
+        ):
+            return False
+    if snapshot.key == "fed-balance-sheet":
+        if mode == "retained":
+            return _fed_balance_sheet_retained_stale_is_displayable(
+                snapshot,
+                require_persisted_failure=(refresh_failure is not None),
+            )
+        return _fed_balance_sheet_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_natural_expiry=naturally_expired,
+        )
+    if snapshot.key == "operations":
+        if mode == "retained":
+            return _operations_embedded_snapshot_is_valid(
+                snapshot,
+                require_persisted_failure=(refresh_failure is not None),
+            )
+        return _operations_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_natural_expiry=naturally_expired,
+        )
+    if snapshot.key == "subsurface":
+        if mode == "retained":
+            return _subsurface_embedded_snapshot_is_valid(
+                snapshot,
+                require_persisted_failure=(refresh_failure is not None),
+            )
+        return _subsurface_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_natural_expiry=naturally_expired,
+        )
+    if snapshot.key == "global-dollar":
+        return _global_dollar_snapshot_matches_runs(
+            snapshot,
+            selected=selected,
+            allow_expired=mode != "current_candidate",
+            allow_refresh_failure=(
+                mode == "retained" and refresh_failure is not None
+            ),
+            require_observations=mode != "retained",
+        )
+    if snapshot.key == "reserves":
+        return _reserves_snapshot_contract_is_valid(
+            snapshot,
+            selected_runs=selected,
+            allow_retained_stale=(
+                mode == "retained" and refresh_failure is not None
+            ),
+            allow_natural_expiry=(
+                mode == "natural_expiry"
+                or mode == "retained" and refresh_failure is None
+            ),
+            allow_expired=mode != "current_candidate",
+        )
+    return _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=selected,
+        allow_stale=mode != "current_candidate",
+        allow_expired=mode != "current_candidate",
+        reconcile_metric_snapshots=True,
+    )
+
+
+def _transmission_component_fetched_at(snapshot: DashboardSnapshot) -> datetime | None:
+    values: list[datetime] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                if key == "fetched_at":
+                    parsed = _parse_payload_datetime(nested)
+                    if parsed is not None:
+                        values.append(parsed)
+                visit(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                visit(nested)
+
+    visit(
+        {
+            key: value
+            for key, value in (snapshot.data or {}).items()
+            if key != "refresh_failure"
+        }
+    )
+    return max(values) if values else None
+
+
+def _transmission_publication_quality(snapshot: DashboardSnapshot) -> str:
+    qualities = {
+        str(item.get("quality_status") or "")
+        for item in [
+            *((snapshot.data or {}).get("metrics") or []),
+            *((snapshot.data or {}).get("charts") or []),
+        ]
+        if isinstance(item, dict)
+    }
+    if Observation.Quality.ERROR in qualities:
+        return Observation.Quality.ERROR
+    if Observation.Quality.FALLBACK in qualities:
+        return Observation.Quality.FALLBACK
+    if qualities == {Observation.Quality.FRESH}:
+        return Observation.Quality.FRESH
+    return Observation.Quality.ESTIMATED
+
+
+def _transmission_component_metric_rows(
+    snapshot: DashboardSnapshot,
+) -> dict[str, MetricSnapshot] | None:
+    required_metrics, _required_charts = _transmission_component_required_sets(
+        snapshot.key
+    )
+    rows = list(
+        MetricSnapshot.objects.filter(
+            batch_id=snapshot.batch_id,
+            key__startswith=f"{snapshot.key}-",
+        )
+        .select_related("source", "fallback_source")
+        .order_by("key")
+    )
+    by_child_key = {
+        item.key.removeprefix(f"{snapshot.key}-"): item for item in rows
+    }
+    if set(by_child_key) != set(required_metrics):
+        return None
+    return by_child_key
+
+
+def _transmission_component_envelope(
+    snapshot: DashboardSnapshot,
+) -> dict[str, Any] | None:
+    selected = _transmission_component_runs_from_snapshot(snapshot)
+    normalized = _transmission_component_metric_rows(snapshot)
+    if selected is None or normalized is None:
+        return None
+    evidence = _transmission_artifact_evidence(snapshot.key, selected)
+    fetched_at = _transmission_component_fetched_at(snapshot)
+    fresh_until = _parse_payload_datetime(
+        (snapshot.data or {}).get("fresh_until")
+    )
+    if evidence is None or fetched_at is None or fresh_until is None:
+        return None
+    source_keys = sorted(set((snapshot.data or {}).get("source_keys") or []))
+    scopes: list[dict[str, str]] = []
+    for source in Source.objects.filter(key__in=source_keys).order_by("key"):
+        licence = _effective_source_license(
+            source,
+            require_public=True,
+            require_derived=True,
+            require_storage=True,
+        )
+        if licence is None:
+            return None
+        scopes.append({"source_key": source.key, "scope": licence.scope})
+    runs = [
+        {
+            "input_role": role,
+            "source": selected[role].source.key,
+            "dataset": selected[role].dataset,
+            "run_id": selected[role].pk,
+            "batch_id": str(selected[role].batch_id),
+            "row_count": selected[role].row_count,
+            "started_at": selected[role].started_at.isoformat(),
+            "completed_at": (
+                selected[role].completed_at.isoformat()
+                if selected[role].completed_at
+                else None
+            ),
+        }
+        for role in _transmission_component_datasets(snapshot.key)
+    ]
+    return {
+        "component_page_key": snapshot.key,
+        "component_contract_version": (snapshot.data or {}).get(
+            "contract_version"
+        ),
+        "component_snapshot_id": snapshot.pk,
+        "component_publication_batch_id": str(snapshot.batch_id),
+        "component_fingerprint": str(
+            (snapshot.data or {}).get("fingerprint") or ""
+        ),
+        "component_payload_integrity_hash": str(
+            (snapshot.data or {}).get("payload_integrity_hash") or ""
+        ),
+        "component_metric_snapshots": [
+            {
+                "child_metric_key": child_key,
+                "metric_snapshot_id": normalized[child_key].pk,
+                "metric_snapshot_key": normalized[child_key].key,
+                "metric_snapshot_batch_id": str(normalized[child_key].batch_id),
+            }
+            for child_key in sorted(normalized)
+        ],
+        "input_runs": runs,
+        "artifact_evidence": evidence,
+        "as_of": snapshot.as_of.isoformat(),
+        "fetched_at": fetched_at.isoformat(),
+        "fresh_until": fresh_until.isoformat(),
+        "publication_quality_status": _transmission_publication_quality(
+            snapshot
+        ),
+        "source_keys": source_keys,
+        "datasets": [
+            {"source": source_key, "dataset": dataset}
+            for source_key, dataset in sorted(
+                {(run["source"], run["dataset"]) for run in runs}
+            )
+        ],
+        "license_decisions": scopes,
+        "fallback_sources": [],
+    }
+
+
+def _transmission_run_reference(
+    envelopes: dict[str, dict[str, Any]], page_key: str, role: str
+) -> dict[str, Any] | None:
+    return next(
+        (
+            item
+            for item in envelopes[page_key]["input_runs"]
+            if item.get("input_role") == role
+        ),
+        None,
+    )
+
+
+def _transmission_artifact_identity(
+    envelope: dict[str, Any], role: str
+) -> list[dict[str, Any]] | None:
+    matches = [
+        item
+        for item in envelope.get("artifact_evidence", [])
+        if item.get("input_role") == role
+    ]
+    if not matches:
+        return None
+    return [
+        {
+            "artifact_status": item.get("artifact_status"),
+            "artifacts": item.get("artifacts"),
+        }
+        for item in matches
+    ]
+
+
+def _transmission_shared_input_reconciliation(
+    envelopes: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    rows: list[dict[str, Any]] = []
+    for input_name, left_page, left_role, right_page, right_role in (
+        TRANSMISSION_CHAIN_SHARED_INPUTS
+    ):
+        left = _transmission_run_reference(envelopes, left_page, left_role)
+        right = _transmission_run_reference(envelopes, right_page, right_role)
+        if left is None or right is None:
+            return None
+        identity = (
+            left.get("source"),
+            left.get("dataset"),
+            left.get("run_id"),
+            left.get("batch_id"),
+        )
+        if identity != (
+            right.get("source"),
+            right.get("dataset"),
+            right.get("run_id"),
+            right.get("batch_id"),
+        ):
+            return None
+        left_artifacts = _transmission_artifact_identity(
+            envelopes[left_page], left_role
+        )
+        right_artifacts = _transmission_artifact_identity(
+            envelopes[right_page], right_role
+        )
+        if left_artifacts is None or left_artifacts != right_artifacts:
+            return None
+        fields = TRANSMISSION_CHAIN_SHARED_INPUT_FIELDS[input_name]
+        rows.append(
+            {
+                "input": input_name,
+                "left_component": left_page,
+                "left_input_role": left_role,
+                "right_component": right_page,
+                "right_input_role": right_role,
+                "source": identity[0],
+                "dataset": identity[1],
+                "run_id": identity[2],
+                "batch_id": identity[3],
+                "left_fields": fields["left"],
+                "right_fields": fields["right"],
+                "artifact_identity": left_artifacts,
+                "status": "MATCHED",
+            }
+        )
+    return rows
+
+
+def _transmission_upstream_fields(value: Any) -> list[str]:
+    fields: set[str] = set()
+
+    def visit(nested: Any) -> None:
+        if isinstance(nested, dict):
+            for key, item in nested.items():
+                if key in {
+                    "series_key",
+                    "source_field",
+                    "upstream_field",
+                    "treasury_field",
+                } and item:
+                    fields.add(str(item))
+                visit(item)
+        elif isinstance(nested, list):
+            for item in nested:
+                visit(item)
+
+    visit(value)
+    return sorted(fields)
+
+
+def _transmission_lineage_batches(value: Any) -> set[str]:
+    batches = _payload_batch_ids(value)
+    if isinstance(value, dict):
+        for raw in value.get("input_batch_ids", []):
+            if raw:
+                batches.add(str(raw))
+        for nested in value.values():
+            batches.update(_transmission_lineage_batches(nested))
+    elif isinstance(value, list):
+        for nested in value:
+            batches.update(_transmission_lineage_batches(nested))
+    return batches
+
+
+def _transmission_scoped_component_evidence(
+    value: dict[str, Any],
+    envelope: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
+    batches = _transmission_lineage_batches(value)
+    runs = [
+        item
+        for item in envelope["input_runs"]
+        if str(item.get("batch_id") or "") in batches
+    ]
+    if not runs:
+        return None
+    identities = {
+        (item["run_id"], item["batch_id"])
+        for item in runs
+    }
+    artifacts = [
+        item
+        for item in envelope["artifact_evidence"]
+        if (item.get("run_id"), item.get("batch_id")) in identities
+    ]
+    if not artifacts or {
+        (item.get("run_id"), item.get("batch_id")) for item in artifacts
+    } != identities:
+        return None
+    return runs, artifacts
+
+
+def _transmission_copy_metric(
+    *,
+    outer_key: str,
+    snapshot: DashboardSnapshot,
+    envelope: dict[str, Any],
+) -> dict[str, Any] | None:
+    page_key, child_key = TRANSMISSION_CHAIN_METRIC_MAP[outer_key]
+    if page_key != snapshot.key:
+        return None
+    child_metric = next(
+        (
+            item
+            for item in (snapshot.data or {}).get("metrics", [])
+            if item.get("key") == child_key
+        ),
+        None,
+    )
+    child_rows = _transmission_component_metric_rows(snapshot)
+    if child_metric is None or child_rows is None or child_key not in child_rows:
+        return None
+    expected_formula = TRANSMISSION_CHAIN_FORMULAS.get(outer_key)
+    child_formula = (child_metric.get("metadata") or {}).get("formula")
+    if expected_formula is not None and child_formula != expected_formula:
+        return None
+    scoped = _transmission_scoped_component_evidence(child_metric, envelope)
+    if scoped is None:
+        return None
+    scoped_runs, scoped_artifacts = scoped
+    normalized = child_rows[child_key]
+    copied = deepcopy(child_metric)
+    copied["key"] = outer_key
+    metadata = deepcopy(copied.get("metadata") or {})
+    metadata.update(
+        {
+            "component_page_key": page_key,
+            "component_contract_version": envelope[
+                "component_contract_version"
+            ],
+            "component_snapshot_id": envelope["component_snapshot_id"],
+            "component_publication_batch_id": envelope[
+                "component_publication_batch_id"
+            ],
+            "component_fingerprint": envelope["component_fingerprint"],
+            "component_payload_integrity_hash": envelope[
+                "component_payload_integrity_hash"
+            ],
+            "component_metric_snapshot_id": normalized.pk,
+            "component_metric_snapshot_key": normalized.key,
+            "component_metric_snapshot_batch_id": str(normalized.batch_id),
+            "component_all_input_runs": envelope["input_runs"],
+            "component_all_artifact_evidence": envelope["artifact_evidence"],
+            "component_input_runs": scoped_runs,
+            "artifact_evidence": scoped_artifacts,
+            "input_datasets": [
+                {
+                    "input_role": item["input_role"],
+                    "source": item["source"],
+                    "dataset": item["dataset"],
+                }
+                for item in scoped_runs
+            ],
+            "upstream_fields": _transmission_upstream_fields(
+                child_metric.get("metadata") or {}
+            ),
+        }
+    )
+    copied["metadata"] = metadata
+    return copied
+
+
+def _transmission_chart_date_range(data: Any) -> tuple[str | None, str | None]:
+    rows = data if isinstance(data, list) else (
+        data.get("_rows", []) if isinstance(data, dict) else []
+    )
+    dates = sorted(
+        str(row.get("date"))
+        for row in rows
+        if isinstance(row, dict) and row.get("date")
+    )
+    return (dates[0], dates[-1]) if dates else (None, None)
+
+
+def _transmission_copy_chart(
+    *, snapshot: DashboardSnapshot, envelope: dict[str, Any]
+) -> dict[str, Any] | None:
+    chart_key = str(TRANSMISSION_CHAIN_COMPONENTS[snapshot.key]["chart_key"])
+    child_chart = next(
+        (
+            item
+            for item in (snapshot.data or {}).get("charts", [])
+            if item.get("key") == chart_key
+        ),
+        None,
+    )
+    if child_chart is None:
+        return None
+    scoped = _transmission_scoped_component_evidence(child_chart, envelope)
+    if scoped is None:
+        return None
+    scoped_runs, scoped_artifacts = scoped
+    copied = deepcopy(child_chart)
+    start_date, end_date = _transmission_chart_date_range(copied.get("data"))
+    copied.update(
+        {
+            "component_page_key": snapshot.key,
+            "component_chart_key": chart_key,
+            "component_contract_version": envelope[
+                "component_contract_version"
+            ],
+            "component_snapshot_id": envelope["component_snapshot_id"],
+            "component_publication_batch_id": envelope[
+                "component_publication_batch_id"
+            ],
+            "component_fingerprint": envelope["component_fingerprint"],
+            "component_payload_integrity_hash": envelope[
+                "component_payload_integrity_hash"
+            ],
+            "data_start_date": start_date,
+            "data_end_date": end_date,
+            "component_all_input_runs": envelope["input_runs"],
+            "component_all_artifact_evidence": envelope["artifact_evidence"],
+            "component_input_runs": scoped_runs,
+            "artifact_evidence": scoped_artifacts,
+        }
+    )
+    return copied
+
+
+def _transmission_cell(key: str, value: Any, *, kind: str = "text") -> dict[str, Any]:
+    return {"key": key, "cell": {"kind": kind, "value": value}}
+
+
+def _transmission_table_section(
+    *,
+    key: str,
+    title: str,
+    description: str,
+    columns: tuple[tuple[str, str], ...],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rendered_rows = []
+    for row in rows:
+        copied = deepcopy(row)
+        copied["cells_list"] = [
+            _transmission_cell(column_key, copied.get(column_key, ""))
+            for column_key, _label in columns
+        ]
+        rendered_rows.append(copied)
+    return {
+        "key": key,
+        "title": title,
+        "description": description,
+        "columns": [
+            {"key": column_key, "label": label}
+            for column_key, label in columns
+        ],
+        "rows": rendered_rows,
+        "full_width": True,
+    }
+
+
+def _transmission_sections(
+    *,
+    envelopes: dict[str, dict[str, Any]],
+    reconciliation: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    layer_rows = []
+    for page_key, component in TRANSMISSION_CHAIN_COMPONENTS.items():
+        envelope = envelopes[page_key]
+        layer_rows.append(
+            {
+                "layer": page_key,
+                "claim_scope": component["claim_scope"],
+                "metrics": ", ".join(component["metric_keys"]),
+                "as_of": envelope["as_of"],
+                "fetched_at": envelope["fetched_at"],
+                "fresh_until": envelope["fresh_until"],
+                "quality": envelope["publication_quality_status"],
+                "stale": "false",
+                "refresh_failure": "none",
+                "snapshot": envelope["component_snapshot_id"],
+                "batch": envelope["component_publication_batch_id"],
+                "hash": (
+                    f"semantic={envelope['component_fingerprint']}; "
+                    f"payload={envelope['component_payload_integrity_hash']}"
+                ),
+                "sources": ", ".join(envelope["source_keys"]),
+                "datasets": ", ".join(
+                    f"{item['source']}/{item['dataset']}"
+                    for item in envelope["datasets"]
+                ),
+                "licence": "; ".join(
+                    f"{item['source_key']}: {item['scope']}"
+                    for item in envelope["license_decisions"]
+                ),
+                "fallback": "none",
+                "boundary": component["semantic_boundary"],
+            }
+        )
+    shared_rows = [
+        {
+            "input": item["input"],
+            "left": (
+                f"{item['left_component']}/{item['left_input_role']}"
+            ),
+            "right": (
+                f"{item['right_component']}/{item['right_input_role']}"
+            ),
+            "source": item["source"],
+            "dataset": item["dataset"],
+            "run": item["run_id"],
+            "batch": item["batch_id"],
+            "left_fields": ", ".join(item["left_fields"]),
+            "right_fields": ", ".join(item["right_fields"]),
+            "artifact": json.dumps(
+                item["artifact_identity"],
+                sort_keys=True,
+                ensure_ascii=False,
+            ),
+            "status": item["status"],
+        }
+        for item in reconciliation
+    ]
+    gap_rows = [
+        {
+            "item": "Six audited official component revisions",
+            "status": "LIVE",
+            "scope": "The twelve copied values and six copied charts in this v1 contract.",
+        },
+        {
+            "item": "Transparent Atlas calculations",
+            "status": "PROXY",
+            "scope": "Net liquidity, rate spreads, reserve coverage and SOFR volume Z-score.",
+        },
+        {
+            "item": "Composite score, thresholds and resonance labels",
+            "status": "NEEDS_SOURCE",
+            "scope": "No score or tight/loose/stress state is published.",
+        },
+        {
+            "item": "Energy layer methodology and EIA redistribution review",
+            "status": "LICENSE_REVIEW",
+            "scope": "Exact public-display series and interpretation remain unapproved.",
+        },
+        {
+            "item": "Executable CME/ICE energy curves",
+            "status": "PURCHASE_REQUIRED",
+            "scope": "Licensed executable curve data is not available in v1.",
+        },
+        {
+            "item": "Cross-currency basis, forwards and dealer implied funding",
+            "status": "PURCHASE_REQUIRED",
+            "scope": "H.10 reference rates are not a substitute.",
+        },
+        {
+            "item": "FFIEC AOCI/HTM/AFS and capacity interpretation",
+            "status": "NEEDS_SOURCE",
+            "scope": "A reviewed aggregate banking contract is required.",
+        },
+        {
+            "item": "Primary Dealer, SCOOS and OFR candidate proxies",
+            "status": "LICENSE_REVIEW",
+            "scope": "Future activity/friction evidence; not an intermediary-capacity score.",
+        },
+        {
+            "item": "Dealer books, haircuts, specials and market impact",
+            "status": "PURCHASE_REQUIRED",
+            "scope": "Commercial microstructure data is outside v1.",
+        },
+        {
+            "item": "Complete OAS/CDX/VIX/MOVE/equity/commodity/FX response",
+            "status": "PURCHASE_REQUIRED",
+            "scope": "Official references cover only a partial asset-response surface.",
+        },
+    ]
+    unavailable = [
+        item
+        for envelope in envelopes.values()
+        for item in envelope["artifact_evidence"]
+        if item["artifact_status"] == "NOT_AVAILABLE_UNDER_CHILD_V1"
+    ]
+    for item in unavailable:
+        gap_rows.append(
+            {
+                "item": (
+                    f"{item['component_page_key']}/{item['input_role']} "
+                    "acquisition artifact"
+                ),
+                "status": "NEEDS_SOURCE",
+                "scope": (
+                    "NOT_AVAILABLE_UNDER_CHILD_V1; no private bytes or verified "
+                    "URL+hash pointer is claimed by the parent."
+                ),
+            }
+        )
+    freshness_values = [
+        _parse_payload_datetime(envelope["fresh_until"])
+        for envelope in envelopes.values()
+    ]
+    if any(value is None for value in freshness_values):
+        raise ValueError("transmission component freshness is malformed")
+    freshness = min(
+        value for value in freshness_values if value is not None
+    ).isoformat()
+    source_keys = sorted(
+        set().union(*(set(item["source_keys"]) for item in envelopes.values()))
+    )
+    sections = [
+        _transmission_table_section(
+            key="layer-evidence-ledger",
+            title="六层官方证据台账",
+            description=(
+                "每层保留自己的时点、许可、质量和语义边界；stale=false "
+                "是该 immutable revision 的发布状态。"
+            ),
+            columns=(
+                ("layer", "组件"),
+                ("claim_scope", "证据范围"),
+                ("metrics", "两项指标"),
+                ("as_of", "有效日"),
+                ("fetched_at", "抓取"),
+                ("fresh_until", "新鲜至"),
+                ("quality", "发布质量"),
+                ("stale", "发布时 stale"),
+                ("refresh_failure", "刷新状态"),
+                ("snapshot", "快照"),
+                ("batch", "发布批次"),
+                ("hash", "哈希"),
+                ("sources", "来源"),
+                ("datasets", "数据集"),
+                ("licence", "许可"),
+                ("fallback", "fallback"),
+                ("boundary", "语义边界"),
+            ),
+            rows=layer_rows,
+        ),
+        _transmission_table_section(
+            key="shared-input-reconciliation",
+            title="共享输入对账",
+            description=(
+                "对账 acquisition identity；不要求两个组件的派生 scalar 相等。"
+            ),
+            columns=(
+                ("input", "共享输入"),
+                ("left", "组件 A"),
+                ("right", "组件 B"),
+                ("source", "来源"),
+                ("dataset", "数据集"),
+                ("run", "run"),
+                ("batch", "batch"),
+                ("left_fields", "A 字段"),
+                ("right_fields", "B 字段"),
+                ("artifact", "artifact identity"),
+                ("status", "对账"),
+            ),
+            rows=shared_rows,
+        ),
+        _transmission_table_section(
+            key="methodology-and-licensing-gaps",
+            title="方法与许可缺口",
+            description=(
+                "缺口使用明确状态，不用空白、估算值或未授权数据替代。"
+            ),
+            columns=(
+                ("item", "项目"),
+                ("status", "状态"),
+                ("scope", "边界 / 下一步"),
+            ),
+            rows=gap_rows,
+        ),
+    ]
+    sections[0].update(
+        {
+            "source_keys": source_keys,
+            "fresh_until": freshness,
+            "quality_status": Observation.Quality.ESTIMATED,
+        }
+    )
+    sections[1].update(
+        {
+            "source_keys": source_keys,
+            "fresh_until": freshness,
+            "quality_status": Observation.Quality.ESTIMATED,
+        }
+    )
+    return sections
+
+
+def _transmission_semantic_manifest(
+    *,
+    metrics: list[dict[str, Any]],
+    charts: list[dict[str, Any]],
+    sections: list[dict[str, Any]],
+    envelopes: dict[str, dict[str, Any]],
+    reconciliation: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "required_metric_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS),
+        "required_chart_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS),
+        "required_section_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS),
+        "metrics": [
+            {
+                "key": item["key"],
+                "label": item.get("label"),
+                "value": item.get("value"),
+                "display_value": item.get("display_value"),
+                "change": item.get("change"),
+                "unit": item.get("unit"),
+                "source_key": item.get("source_key"),
+                "formula": (item.get("metadata") or {}).get("formula"),
+            }
+            for item in metrics
+        ],
+        "charts": [
+            {
+                "key": item["key"],
+                "component_page_key": item["component_page_key"],
+                "component_chart_key": item["component_chart_key"],
+                "component_fingerprint": item["component_fingerprint"],
+            }
+            for item in charts
+        ],
+        "sections": [
+            {
+                "key": item["key"],
+                "columns": [column["key"] for column in item["columns"]],
+                "row_semantics": [
+                    {
+                        key: row.get(key)
+                        for key in (
+                            "layer",
+                            "claim_scope",
+                            "metrics",
+                            "boundary",
+                            "input",
+                            "left",
+                            "right",
+                            "source",
+                            "dataset",
+                            "status",
+                            "item",
+                            "scope",
+                        )
+                        if key in row
+                    }
+                    for row in item["rows"]
+                ],
+            }
+            for item in sections
+        ],
+        "components": [
+            {
+                "component_page_key": page_key,
+                "component_contract_version": envelopes[page_key][
+                    "component_contract_version"
+                ],
+                "component_fingerprint": envelopes[page_key][
+                    "component_fingerprint"
+                ],
+            }
+            for page_key in TRANSMISSION_CHAIN_COMPONENTS
+        ],
+        "shared_input_reconciliation": [
+            {
+                "input": item["input"],
+                "source": item["source"],
+                "dataset": item["dataset"],
+                "left_fields": item["left_fields"],
+                "right_fields": item["right_fields"],
+                "artifact_statuses": sorted(
+                    {
+                        str(evidence.get("artifact_status") or "")
+                        for evidence in item.get("artifact_identity", [])
+                        if isinstance(evidence, dict)
+                        and evidence.get("artifact_status")
+                    }
+                ),
+                "status": item["status"],
+            }
+            for item in reconciliation
+        ],
+    }
+
+
+def _transmission_page_data(
+    components: dict[str, DashboardSnapshot],
+    *,
+    publication_timestamp: datetime | None = None,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+] | None:
+    if set(components) != set(TRANSMISSION_CHAIN_COMPONENTS):
+        return None
+    envelopes: dict[str, dict[str, Any]] = {}
+    for page_key in TRANSMISSION_CHAIN_COMPONENTS:
+        envelope = _transmission_component_envelope(components[page_key])
+        if envelope is None:
+            return None
+        envelopes[page_key] = envelope
+    reconciliation = _transmission_shared_input_reconciliation(envelopes)
+    if reconciliation is None:
+        return None
+    metrics: list[dict[str, Any]] = []
+    for outer_key, (page_key, _child_key) in TRANSMISSION_CHAIN_METRIC_MAP.items():
+        copied = _transmission_copy_metric(
+            outer_key=outer_key,
+            snapshot=components[page_key],
+            envelope=envelopes[page_key],
+        )
+        if copied is None:
+            return None
+        metrics.append(copied)
+    charts = []
+    for page_key in TRANSMISSION_CHAIN_COMPONENTS:
+        copied_chart = _transmission_copy_chart(
+            snapshot=components[page_key],
+            envelope=envelopes[page_key],
+        )
+        if copied_chart is None:
+            return None
+        charts.append(copied_chart)
+    sections = _transmission_sections(
+        envelopes=envelopes,
+        reconciliation=reconciliation,
+    )
+    generated = publication_timestamp or timezone.now()
+    if generated.tzinfo is None:
+        generated = generated.replace(tzinfo=UTC)
+    generated_at = generated.isoformat()
+    component_fetched = [
+        _parse_payload_datetime(envelope["fetched_at"])
+        for envelope in envelopes.values()
+    ]
+    component_as_of = [
+        _parse_payload_datetime(envelope["as_of"])
+        for envelope in envelopes.values()
+    ]
+    if any(value is None for value in [*component_fetched, *component_as_of]):
+        return None
+    fetched_at = max(
+        value for value in component_fetched if value is not None
+    ).isoformat()
+    extra_data = {
+        "contract_version": TRANSMISSION_CHAIN_CONTRACT_VERSION,
+        "formula_version": TRANSMISSION_CHAIN_FORMULA_VERSION,
+        "formulas": dict(TRANSMISSION_CHAIN_FORMULAS),
+        "required_metric_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS),
+        "required_chart_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS),
+        "required_section_keys": sorted(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS),
+        "component_snapshots": [
+            envelopes[page_key] for page_key in TRANSMISSION_CHAIN_COMPONENTS
+        ],
+        "shared_input_reconciliation": reconciliation,
+        "semantic_manifest": _transmission_semantic_manifest(
+            metrics=metrics,
+            charts=charts,
+            sections=sections,
+            envelopes=envelopes,
+            reconciliation=reconciliation,
+        ),
+        "as_of": min(
+            value for value in component_as_of if value is not None
+        ).isoformat(),
+        "fetched_at": fetched_at,
+        "generated_at": generated_at,
+        "published_at": generated_at,
+        "semantic_boundary": (
+            "Official evidence chain only; not a pressure index, complete "
+            "financial-conditions index, resonance judgement or trading signal."
+        ),
+    }
+    return metrics, charts, sections, extra_data
+
+
+def _transmission_page_contract_is_buildable(data: dict[str, Any]) -> bool:
+    metrics = data.get("metrics")
+    charts = data.get("charts")
+    sections = data.get("sections")
+    envelopes = data.get("component_snapshots")
+    reconciliation = data.get("shared_input_reconciliation")
+    if (
+        data.get("contract_version") != TRANSMISSION_CHAIN_CONTRACT_VERSION
+        or data.get("formula_version") != TRANSMISSION_CHAIN_FORMULA_VERSION
+        or data.get("formulas") != TRANSMISSION_CHAIN_FORMULAS
+        or data.get("required_metric_keys")
+        != sorted(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS)
+        or data.get("required_chart_keys")
+        != sorted(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS)
+        or data.get("required_section_keys")
+        != sorted(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS)
+        or not isinstance(metrics, list)
+        or len(metrics) != len(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS)
+        or {str(item.get("key") or "") for item in metrics}
+        != set(TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS)
+        or not isinstance(charts, list)
+        or len(charts) != len(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS)
+        or {str(item.get("key") or "") for item in charts}
+        != set(TRANSMISSION_CHAIN_REQUIRED_CHART_KEYS)
+        or not isinstance(sections, list)
+        or len(sections) != len(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS)
+        or {str(item.get("key") or "") for item in sections}
+        != set(TRANSMISSION_CHAIN_REQUIRED_SECTION_KEYS)
+        or not isinstance(envelopes, list)
+        or len(envelopes) != len(TRANSMISSION_CHAIN_COMPONENTS)
+        or not isinstance(reconciliation, list)
+        or len(reconciliation) != len(TRANSMISSION_CHAIN_SHARED_INPUTS)
+    ):
+        return False
+    by_page = {
+        str(item.get("component_page_key") or ""): item
+        for item in envelopes
+        if isinstance(item, dict)
+    }
+    if set(by_page) != set(TRANSMISSION_CHAIN_COMPONENTS):
+        return False
+    if any(
+        item.get("fallback_sources") != []
+        or not item.get("component_fingerprint")
+        or not item.get("component_payload_integrity_hash")
+        or not item.get("input_runs")
+        or not item.get("artifact_evidence")
+        for item in by_page.values()
+    ):
+        return False
+    if any(
+        item.get("status") != "MATCHED"
+        or not item.get("source")
+        or not item.get("dataset")
+        or not item.get("run_id")
+        or not item.get("batch_id")
+        for item in reconciliation
+    ):
+        return False
+    for section in sections:
+        columns = section.get("columns")
+        rows = section.get("rows")
+        if not isinstance(columns, list) or not isinstance(rows, list):
+            return False
+        expected_columns = [str(item.get("key") or "") for item in columns]
+        if not expected_columns or any(
+            not isinstance(row, dict)
+            or [item.get("key") for item in row.get("cells_list", [])]
+            != expected_columns
+            for row in rows
+        ):
+            return False
+    return True
+
+
+def _transmission_normalized_metrics_match(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    """Reconcile the outer batch to exactly the twelve copied payload metrics."""
+
+    metrics = list((snapshot.data or {}).get("metrics") or [])
+    rows = list(
+        MetricSnapshot.objects.filter(batch_id=snapshot.batch_id)
+        .select_related("source", "fallback_source")
+        .order_by("key")
+    )
+    by_key = {row.key: row for row in rows}
+    expected_keys = {
+        f"transmission-chain-{key}"
+        for key in TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS
+    }
+    if len(rows) != len(expected_keys) or set(by_key) != expected_keys:
+        return False
+    fingerprint = str((snapshot.data or {}).get("fingerprint") or "")
+    payload_hash = str(
+        (snapshot.data or {}).get("payload_integrity_hash") or ""
+    )
+    for metric in metrics:
+        key = str(metric.get("key") or "")
+        stored = by_key.get(f"transmission-chain-{key}")
+        value = metric.get("value")
+        change = metric.get("change")
+        if (
+            stored is None
+            or value is None
+            or stored.value is None
+            or stored.label != metric.get("label")
+            or stored.value.quantize(Decimal("0.00000001"))
+            != Decimal(str(value)).quantize(Decimal("0.00000001"))
+            or stored.display_value != str(metric.get("display_value") or "")
+            or (
+                stored.change.quantize(Decimal("0.000001"))
+                if stored.change is not None
+                else None
+            )
+            != (
+                Decimal(str(change)).quantize(Decimal("0.000001"))
+                if change is not None
+                else None
+            )
+            or stored.unit != str(metric.get("unit") or "")
+            or stored.value_date
+            != _parse_payload_datetime(
+                metric.get("value_date") or metric.get("as_of")
+            )
+            or stored.as_of
+            != _parse_payload_datetime(
+                metric.get("as_of") or metric.get("value_date")
+            )
+            or stored.fetched_at
+            != _parse_payload_datetime(metric.get("fetched_at"))
+            or stored.source.key != metric.get("source_key")
+            or stored.fallback_source_id is not None
+            or metric.get("fallback_source") not in {None, ""}
+            or stored.quality_status != metric.get("quality_status")
+            or stored.license_scope
+            != str(metric.get("license_scope") or "")[:120]
+            or stored.metadata
+            != _dashboard_metric_snapshot_metadata(
+                metric,
+                fingerprint=fingerprint,
+                payload_integrity_hash=payload_hash,
+            )
+        ):
+            return False
+    return True
+
+
+def _transmission_components_from_snapshot(
+    snapshot: DashboardSnapshot,
+) -> dict[str, DashboardSnapshot] | None:
+    """Resolve every immutable child reference and rebuild its exact envelope."""
+
+    envelopes = (snapshot.data or {}).get("component_snapshots")
+    if (
+        not isinstance(envelopes, list)
+        or len(envelopes) != len(TRANSMISSION_CHAIN_COMPONENTS)
+        or not all(isinstance(item, dict) for item in envelopes)
+    ):
+        return None
+    by_page = {
+        str(item.get("component_page_key") or ""): item for item in envelopes
+    }
+    if set(by_page) != set(TRANSMISSION_CHAIN_COMPONENTS):
+        return None
+    components: dict[str, DashboardSnapshot] = {}
+    for page_key, component in TRANSMISSION_CHAIN_COMPONENTS.items():
+        envelope = by_page[page_key]
+        child = (
+            DashboardSnapshot.objects.select_related("source")
+            .filter(
+                pk=envelope.get("component_snapshot_id"),
+                key=page_key,
+                batch_id=envelope.get("component_publication_batch_id"),
+                is_published=True,
+                data__contract_version=component["contract_version"],
+            )
+            .exclude(source__key="demo-market")
+            .first()
+        )
+        if child is None:
+            return None
+        rebuilt = _transmission_component_envelope(child)
+        if rebuilt is None or rebuilt != envelope:
+            return None
+        components[page_key] = child
+    return components
+
+
+def _transmission_latest_valid_child(
+    page_key: str,
+    *,
+    mode: str = "current_candidate",
+) -> DashboardSnapshot | None:
+    component = TRANSMISSION_CHAIN_COMPONENTS[page_key]
+    candidates = (
+        DashboardSnapshot.objects.filter(
+            key=page_key,
+            is_published=True,
+            data__contract_version=component["contract_version"],
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")[:50]
+    )
+    return next(
+        (
+            candidate
+            for candidate in candidates
+            if _transmission_child_contract_is_valid(
+                candidate, mode=mode
+            )
+        ),
+        None,
+    )
+
+
+def _transmission_attempt_state(
+    page_key: str,
+    role: str,
+    run: IngestionRun,
+) -> dict[str, Any]:
+    source_key, dataset = _transmission_component_datasets(page_key)[role]
+    return {
+        "component_page_key": page_key,
+        "input_role": role,
+        "source": source_key,
+        "dataset": dataset,
+        "ingestion_run_id": run.pk,
+        "batch_id": str(run.batch_id),
+        "started_at": run.started_at.isoformat(),
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "status": run.status,
+        "row_count": run.row_count,
+        "error": run.error,
+    }
+
+
+def _transmission_latest_attempts(
+) -> dict[str, dict[str, IngestionRun | None]]:
+    attempts: dict[str, dict[str, IngestionRun | None]] = {}
+    for page_key in TRANSMISSION_CHAIN_COMPONENTS:
+        attempts[page_key] = {}
+        for role, (source_key, dataset) in _transmission_component_datasets(
+            page_key
+        ).items():
+            attempts[page_key][role] = (
+                IngestionRun.objects.select_related("source")
+                .filter(source__key=source_key, dataset=dataset)
+                .order_by("-started_at", "-id")
+                .first()
+            )
+    return attempts
+
+
+def _transmission_marker_attempts(
+    attempts: dict[str, dict[str, IngestionRun | None]],
+) -> list[dict[str, Any]] | None:
+    states: list[dict[str, Any]] = []
+    for page_key in TRANSMISSION_CHAIN_COMPONENTS:
+        for role in _transmission_component_datasets(page_key):
+            run = attempts[page_key][role]
+            if run is None:
+                return None
+            states.append(_transmission_attempt_state(page_key, role, run))
+    return states
+
+
+def _transmission_refresh_failure_is_valid(
+    snapshot: DashboardSnapshot,
+    *,
+    require_current_attempts: bool,
+) -> bool:
+    marker = (snapshot.data or {}).get("refresh_failure")
+    if not isinstance(marker, dict) or set(marker) != {
+        "checked_at",
+        "reason_code",
+        "reason",
+        "attempts",
+    }:
+        return False
+    reason_code = marker.get("reason_code")
+    if (
+        reason_code not in TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS
+        or marker.get("reason")
+        != TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS[reason_code]
+    ):
+        return False
+    checked_at_raw = marker.get("checked_at")
+    checked_at = _parse_payload_datetime(checked_at_raw)
+    if (
+        not isinstance(checked_at_raw, str)
+        or checked_at is None
+        or checked_at.isoformat() != checked_at_raw
+        or checked_at > timezone.now() + timedelta(minutes=5)
+    ):
+        return False
+    states = marker.get("attempts")
+    expected_count = sum(
+        len(_transmission_component_datasets(page_key))
+        for page_key in TRANSMISSION_CHAIN_COMPONENTS
+    )
+    if (
+        not isinstance(states, list)
+        or len(states) != expected_count
+        or not all(isinstance(item, dict) for item in states)
+    ):
+        return False
+    current = _transmission_latest_attempts()
+    has_terminal_incomplete_attempt = False
+    position = 0
+    for page_key in TRANSMISSION_CHAIN_COMPONENTS:
+        for role, (source_key, dataset) in _transmission_component_datasets(
+            page_key
+        ).items():
+            state = states[position]
+            position += 1
+            run = (
+                IngestionRun.objects.select_related("source")
+                .filter(pk=state.get("ingestion_run_id"))
+                .first()
+            )
+            latest_at_check = (
+                IngestionRun.objects.filter(
+                    source__key=source_key,
+                    dataset=dataset,
+                    started_at__lte=checked_at,
+                )
+                .order_by("-started_at", "-id")
+                .first()
+            )
+            if (
+                run is None
+                or latest_at_check is None
+                or latest_at_check.pk != run.pk
+                or run.status == IngestionRun.Status.RUNNING
+                or state != _transmission_attempt_state(page_key, role, run)
+                or checked_at < (run.completed_at or run.started_at)
+                or (
+                    require_current_attempts
+                    and (
+                        current[page_key][role] is None
+                        or current[page_key][role].pk != run.pk
+                    )
+                )
+            ):
+                return False
+            has_terminal_incomplete_attempt = bool(
+                has_terminal_incomplete_attempt
+                or run.status != IngestionRun.Status.SUCCESS
+                or run.row_count <= 0
+            )
+    if (
+        reason_code == "latest-attempt-incomplete"
+    ) != has_terminal_incomplete_attempt:
+        return False
+    return True
+
+
+def _transmission_direct_successor(
+    referenced: IngestionRun,
+    latest: IngestionRun,
+) -> bool:
+    successor = (
+        IngestionRun.objects.filter(
+            source=referenced.source,
+            dataset=referenced.dataset,
+        )
+        .filter(
+            Q(started_at__gt=referenced.started_at)
+            | Q(started_at=referenced.started_at, id__gt=referenced.id)
+        )
+        .order_by("started_at", "id")
+        .first()
+    )
+    return successor is not None and successor.pk == latest.pk
+
+
+def _transmission_terminal_successor_chain(
+    referenced: IngestionRun,
+    marker_run: IngestionRun,
+) -> bool:
+    """Prove every real attempt between a retained run and its latest marker."""
+
+    successors = list(
+        IngestionRun.objects.filter(
+            source=referenced.source,
+            dataset=referenced.dataset,
+        )
+        .filter(
+            Q(started_at__gt=referenced.started_at)
+            | Q(started_at=referenced.started_at, id__gt=referenced.id)
+        )
+        .filter(
+            Q(started_at__lt=marker_run.started_at)
+            | Q(
+                started_at=marker_run.started_at,
+                id__lte=marker_run.id,
+            )
+        )
+        .order_by("started_at", "id")
+    )
+    return bool(
+        successors
+        and successors[-1].pk == marker_run.pk
+        and all(
+            run.status != IngestionRun.Status.RUNNING
+            and run.completed_at is not None
+            for run in successors
+        )
+    )
+
+
+def _transmission_marker_run(
+    snapshot: DashboardSnapshot,
+    page_key: str,
+    role: str,
+) -> IngestionRun | None:
+    marker = (snapshot.data or {}).get("refresh_failure") or {}
+    state = next(
+        (
+            item
+            for item in marker.get("attempts", [])
+            if item.get("component_page_key") == page_key
+            and item.get("input_role") == role
+        ),
+        None,
+    )
+    if not isinstance(state, dict):
+        return None
+    return IngestionRun.objects.select_related("source").filter(
+        pk=state.get("ingestion_run_id")
+    ).first()
+
+
+def _transmission_transition_is_valid(
+    snapshot: DashboardSnapshot,
+    components: dict[str, DashboardSnapshot],
+) -> bool:
+    attempts = _transmission_latest_attempts()
+    marker = (snapshot.data or {}).get("refresh_failure")
+    if marker is not None and not _transmission_refresh_failure_is_valid(
+        snapshot, require_current_attempts=False
+    ):
+        return False
+    changed = False
+    for page_key, child in components.items():
+        embedded = _transmission_component_runs_from_snapshot(child)
+        if embedded is None:
+            return False
+        current_child = _transmission_latest_valid_child(page_key)
+        if current_child is not None and current_child.pk != child.pk:
+            changed = True
+        for role, referenced in embedded.items():
+            latest = attempts[page_key][role]
+            if latest is None:
+                return False
+            if latest.pk == referenced.pk:
+                continue
+            changed = True
+            latest_is_success = bool(
+                latest.status == IngestionRun.Status.SUCCESS
+                and latest.row_count > 0
+            )
+            latest_is_running = bool(
+                latest.status == IngestionRun.Status.RUNNING
+                and latest.completed_at is None
+            )
+            marker_run = (
+                _transmission_marker_run(snapshot, page_key, role)
+                if marker is not None
+                else None
+            )
+            if (
+                not latest_is_success
+                and not latest_is_running
+                and (marker_run is None or marker_run.pk != latest.pk)
+            ):
+                return False
+            if marker_run is None or marker_run.pk == referenced.pk:
+                if not _transmission_direct_successor(referenced, latest):
+                    return False
+            elif (
+                not _transmission_terminal_successor_chain(
+                    referenced, marker_run
+                )
+                or latest.pk != marker_run.pk
+                and not _transmission_direct_successor(marker_run, latest)
+            ):
+                return False
+            if latest_is_success:
+                if current_child is None:
+                    return False
+                current_runs = _transmission_component_runs_from_snapshot(
+                    current_child
+                )
+                if current_runs is None or current_runs[role].pk != latest.pk:
+                    return False
+    return changed
+
+
+def _transmission_parent_static_contract(
+    snapshot: DashboardSnapshot,
+) -> dict[str, DashboardSnapshot] | None:
+    data = dict(snapshot.data or {})
+    expected_payload_keys = set(TRANSMISSION_CHAIN_PAYLOAD_KEYS)
+    if "refresh_failure" in data:
+        expected_payload_keys.add("refresh_failure")
+    published_at = _parse_payload_datetime(data.get("published_at"))
+    generated_at = _parse_payload_datetime(data.get("generated_at"))
+    if (
+        snapshot.key != "transmission-chain"
+        or not snapshot.is_published
+        or snapshot.source.key != "internal"
+        or snapshot.title != TRANSMISSION_CHAIN_TITLE
+        or snapshot.summary != TRANSMISSION_CHAIN_SUMMARY
+        or set(data) != expected_payload_keys
+        or "title" in data
+        or "summary" in data
+        or data.get("demo") is not False
+        or data.get("publication_batch_id") != str(snapshot.batch_id)
+        or published_at is None
+        or generated_at is None
+        or published_at != generated_at
+        or published_at > timezone.now() + timedelta(minutes=5)
+        or not _transmission_page_contract_is_buildable(data)
+        or _payload_fallback_source_keys(data)
+        or str(data.get("fingerprint") or "")
+        != _transmission_chain_content_fingerprint(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+        or str(data.get("payload_integrity_hash") or "")
+        != _transmission_chain_payload_integrity_hash(
+            title=snapshot.title,
+            summary=snapshot.summary,
+            snapshot_data=data,
+        )
+    ):
+        return None
+    source_keys = set(data.get("source_keys") or [])
+    if (
+        not source_keys
+        or "demo-market" in source_keys
+        or source_keys
+        != _payload_source_keys(
+            [data.get("metrics"), data.get("charts"), data.get("sections")]
+        )
+        or data.get("required_notices")
+        != public_source_notices(source_keys)
+        or set(data.get("component_batches") or [])
+        != _payload_batch_ids(
+            [data.get("metrics"), data.get("charts"), data.get("sections")]
+        )
+    ):
+        return None
+    sources = {item.key: item for item in Source.objects.filter(key__in=source_keys)}
+    if set(sources) != source_keys or any(
+        _effective_source_license(
+            source,
+            require_public=True,
+            require_derived=True,
+            require_storage=True,
+        )
+        is None
+        for source in sources.values()
+    ):
+        return None
+    components = _transmission_components_from_snapshot(snapshot)
+    if components is None:
+        return None
+    prepared = _transmission_page_data(
+        components,
+        publication_timestamp=published_at,
+    )
+    if prepared is None:
+        return None
+    metrics, charts, sections, extra = prepared
+    envelope_freshness = [
+        _parse_payload_datetime(item.get("fresh_until"))
+        for item in data.get("component_snapshots", [])
+        if isinstance(item, dict)
+    ]
+    expected_as_of = _parse_payload_datetime(extra.get("as_of"))
+    if (
+        len(envelope_freshness) != len(TRANSMISSION_CHAIN_COMPONENTS)
+        or any(value is None for value in envelope_freshness)
+        or expected_as_of is None
+    ):
+        return None
+    expected_fresh_until = min(
+        value for value in envelope_freshness if value is not None
+    ).isoformat()
+    if (
+        data.get("metrics") != metrics
+        or data.get("charts") != charts
+        or data.get("sections") != sections
+        or data.get("chart_data") != charts[0].get("data")
+        or any(data.get(key) != value for key, value in extra.items())
+        or data.get("fresh_until") != expected_fresh_until
+        or not _transmission_normalized_metrics_match(snapshot)
+    ):
+        return None
+    if snapshot.as_of != expected_as_of:
+        return None
+    return components
+
+
+def _transmission_snapshot_mode(
+    snapshot: DashboardSnapshot,
+) -> str | None:
+    components = _transmission_parent_static_contract(snapshot)
+    if components is None:
+        return None
+    marker = (snapshot.data or {}).get("refresh_failure")
+    deadline = _parse_payload_datetime((snapshot.data or {}).get("fresh_until"))
+    component_qualities = {
+        item.get("quality_status")
+        for item in [
+            *((snapshot.data or {}).get("metrics") or []),
+            *((snapshot.data or {}).get("charts") or []),
+        ]
+        if isinstance(item, dict)
+    }
+    if Observation.Quality.ERROR in component_qualities:
+        expected_quality = Observation.Quality.ERROR
+    elif Observation.Quality.STALE in component_qualities:
+        expected_quality = Observation.Quality.STALE
+    elif component_qualities == {Observation.Quality.FRESH}:
+        expected_quality = Observation.Quality.FRESH
+    else:
+        expected_quality = Observation.Quality.ESTIMATED
+    if expected_quality != Observation.Quality.ESTIMATED:
+        return None
+    latest_children = {
+        page_key: _transmission_latest_valid_child(page_key)
+        for page_key in TRANSMISSION_CHAIN_COMPONENTS
+    }
+    exact_current_children = all(
+        latest_children[page_key] is not None
+        and latest_children[page_key].pk == components[page_key].pk
+        for page_key in TRANSMISSION_CHAIN_COMPONENTS
+    )
+    latest_naturally_expired_children = {
+        page_key: _transmission_latest_valid_child(
+            page_key, mode="natural_expiry"
+        )
+        for page_key in TRANSMISSION_CHAIN_COMPONENTS
+    }
+    exact_naturally_expired_children = all(
+        latest_naturally_expired_children[page_key] is not None
+        and latest_naturally_expired_children[page_key].pk
+        == components[page_key].pk
+        for page_key in TRANSMISSION_CHAIN_COMPONENTS
+    )
+    if (
+        marker is None
+        and deadline is not None
+        and deadline >= timezone.now()
+        and exact_current_children
+        and all(
+            _transmission_child_contract_is_valid(
+                child, mode="current_candidate"
+            )
+            for child in components.values()
+        )
+        and snapshot.quality_status == expected_quality
+    ):
+        return "current_candidate"
+    if (
+        marker is not None
+        and snapshot.quality_status == Observation.Quality.STALE
+        and _transmission_refresh_failure_is_valid(
+            snapshot, require_current_attempts=True
+        )
+        and all(
+            _transmission_child_contract_is_valid(child, mode="retained")
+            for child in components.values()
+        )
+    ):
+        return "retained_failure"
+    if (
+        all(
+            _transmission_child_contract_is_valid(child, mode="retained")
+            for child in components.values()
+        )
+        and _transmission_transition_is_valid(snapshot, components)
+        and (
+            marker is None
+            and snapshot.quality_status == expected_quality
+            or marker is not None
+            and snapshot.quality_status == Observation.Quality.STALE
+        )
+    ):
+        return "transition_pending"
+    if (
+        marker is None
+        and deadline is not None
+        and deadline < timezone.now()
+        and exact_naturally_expired_children
+        and all(
+            _transmission_child_contract_is_valid(
+                child, mode="natural_expiry"
+            )
+            for child in components.values()
+        )
+        and snapshot.quality_status
+        in {
+            expected_quality,
+            Observation.Quality.STALE,
+        }
+    ):
+        return "natural_expiry"
+    return None
+
+
+def transmission_chain_snapshot_is_publicly_displayable(
+    snapshot: DashboardSnapshot,
+) -> bool:
+    """Fail closed for malformed JSON, missing rows or unavailable artifacts."""
+
+    try:
+        return _transmission_snapshot_mode(snapshot) is not None
+    except (
+        ArithmeticError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        return False
+
+
+def _transmission_changed_components(
+    snapshot: DashboardSnapshot,
+) -> frozenset[str]:
+    """Return validated child/run identities newer than the immutable parent."""
+
+    components = _transmission_parent_static_contract(snapshot)
+    if components is None:
+        return frozenset()
+    attempts = _transmission_latest_attempts()
+    changed: set[str] = set()
+    for page_key, child in components.items():
+        current_child = _transmission_latest_valid_child(page_key)
+        if current_child is not None and current_child.pk != child.pk:
+            changed.add(page_key)
+        referenced = _transmission_component_runs_from_snapshot(child)
+        if referenced is None:
+            return frozenset()
+        if any(
+            attempts[page_key][role] is not None
+            and attempts[page_key][role].pk != run.pk
+            for role, run in referenced.items()
+        ):
+            changed.add(page_key)
+    return frozenset(changed)
+
+
+def select_public_transmission_chain_snapshot(
+    candidates: Iterable[DashboardSnapshot] | None = None,
+) -> DashboardSnapshot | None:
+    if candidates is None:
+        candidates = (
+            DashboardSnapshot.objects.filter(
+                key="transmission-chain",
+                is_published=True,
+                data__contract_version=TRANSMISSION_CHAIN_CONTRACT_VERSION,
+            )
+            .exclude(source__key="demo-market")
+            .select_related("source")
+            .order_by("-created_at", "-id")[:50]
+        )
+    for candidate in candidates:
+        try:
+            mode = _transmission_snapshot_mode(candidate)
+        except (
+            ArithmeticError,
+            AttributeError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            zipfile.BadZipFile,
+        ):
+            continue
+        if mode is None:
+            continue
+        if mode != "current_candidate":
+            candidate.quality_status = Observation.Quality.STALE
+        setattr(candidate, "transmission_chain_state", mode)
+        setattr(
+            candidate,
+            "transmission_chain_changed_components",
+            _transmission_changed_components(candidate),
+        )
+        return candidate
+    return None
+
+
+def _mark_transmission_chain_stale(*, reason_code: str) -> None:
+    """Advance only the parent's unhashed failure audit overlay."""
+
+    reason = TRANSMISSION_CHAIN_REFRESH_FAILURE_REASONS.get(reason_code)
+    if reason is None:
+        raise ValueError("unknown transmission-chain failure reason")
+    candidates = list(
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="transmission-chain",
+            is_published=True,
+            data__contract_version=TRANSMISSION_CHAIN_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")
+        [:50]
+    )
+    latest = None
+    original_data: dict[str, Any] | None = None
+    for candidate in candidates:
+        if candidate.quality_status not in {
+            Observation.Quality.ESTIMATED,
+            Observation.Quality.STALE,
+        }:
+            continue
+        candidate_original_data = candidate.data
+        candidate_original_quality = candidate.quality_status
+        audited_data = dict(candidate_original_data or {})
+        audited_data.pop("refresh_failure", None)
+        candidate.data = audited_data
+        try:
+            components = _transmission_parent_static_contract(candidate)
+            retained_is_valid = bool(
+                components is not None
+                and all(
+                    _transmission_child_contract_is_valid(
+                        child, mode="retained"
+                    )
+                    for child in components.values()
+                )
+            )
+        finally:
+            candidate.data = candidate_original_data
+            candidate.quality_status = candidate_original_quality
+        if retained_is_valid:
+            latest = candidate
+            original_data = dict(candidate_original_data or {})
+            break
+    if latest is None or original_data is None:
+        return
+    attempts = _transmission_latest_attempts()
+    if any(
+        run is not None and run.status == IngestionRun.Status.RUNNING
+        for page_attempts in attempts.values()
+        for run in page_attempts.values()
+    ):
+        return
+    attempt_states = _transmission_marker_attempts(attempts)
+    if attempt_states is None:
+        return
+    checked_at = timezone.now()
+    completed = [
+        run.completed_at or run.started_at
+        for page_attempts in attempts.values()
+        for run in page_attempts.values()
+        if run is not None
+    ]
+    if completed and checked_at < max(completed):
+        return
+    data = dict(original_data)
+    data["refresh_failure"] = {
+        "checked_at": checked_at.isoformat(),
+        "reason_code": reason_code,
+        "reason": reason,
+        "attempts": attempt_states,
+    }
+    latest.data = data
+    latest.quality_status = Observation.Quality.STALE
+    latest.save(update_fields=["data", "quality_status", "updated_at"])
+
+
+@transaction.atomic
+def _coordinate_transmission_chain_dashboard(
+    trigger_runs: Iterable[IngestionRun] = (),
+) -> tuple[list[DashboardSnapshot], set[str]]:
+    """Atomically compose the six strict immutable component publications."""
+
+    del trigger_runs  # Latest-attempt truth, rather than caller scope, controls v1.
+    source_keys = {
+        "internal",
+        *(
+            source_key
+            for page_key in TRANSMISSION_CHAIN_COMPONENTS
+            for source_key, _dataset in _transmission_component_datasets(
+                page_key
+            ).values()
+        ),
+    }
+    for source_key in source_keys:
+        ensure_source(source_key)
+    locked_sources = list(
+        Source.objects.select_for_update()
+        .filter(key__in=source_keys)
+        .order_by("key")
+    )
+    if {source.key for source in locked_sources} != source_keys:
+        _mark_transmission_chain_stale(reason_code="component-validation")
+        return [], {"transmission-chain"}
+    list(
+        SourceLicense.objects.select_for_update()
+        .filter(source__in=locked_sources, is_current=True)
+        .order_by("source__key", "pk")
+        .values_list("pk", flat=True)
+    )
+    attempts = _transmission_latest_attempts()
+    attempt_rows = [
+        run
+        for page_attempts in attempts.values()
+        for run in page_attempts.values()
+        if run is not None
+    ]
+    list(
+        IngestionRun.objects.select_for_update()
+        .filter(pk__in={run.pk for run in attempt_rows})
+        .order_by("source__key", "dataset", "started_at", "id")
+        .values_list("pk", flat=True)
+    )
+    if any(
+        run.status == IngestionRun.Status.RUNNING for run in attempt_rows
+    ):
+        return [], {"transmission-chain"}
+    previous_candidates = list(
+        DashboardSnapshot.objects.select_for_update()
+        .filter(
+            key="transmission-chain",
+            is_published=True,
+            data__contract_version=TRANSMISSION_CHAIN_CONTRACT_VERSION,
+        )
+        .exclude(source__key="demo-market")
+        .select_related("source")
+        .order_by("-created_at", "-id")
+        [:50]
+    )
+    previous = None
+    for candidate in previous_candidates:
+        if candidate.quality_status not in {
+            Observation.Quality.ESTIMATED,
+            Observation.Quality.STALE,
+        }:
+            continue
+        referenced_children = _transmission_parent_static_contract(candidate)
+        if referenced_children is not None and all(
+            _transmission_child_contract_is_valid(child, mode="retained")
+            for child in referenced_children.values()
+        ):
+            previous = candidate
+            break
+    components = {
+        page_key: _transmission_latest_valid_child(page_key)
+        for page_key in TRANSMISSION_CHAIN_COMPONENTS
+    }
+    if any(child is None for child in components.values()):
+        incomplete = any(
+            run is None
+            or run.status != IngestionRun.Status.SUCCESS
+            or run.row_count <= 0
+            for page_attempts in attempts.values()
+            for run in page_attempts.values()
+        )
+        if previous is not None:
+            current_mode = _transmission_snapshot_mode(previous)
+            if current_mode != "natural_expiry":
+                _mark_transmission_chain_stale(
+                    reason_code=(
+                        "latest-attempt-incomplete"
+                        if incomplete
+                        else "component-validation"
+                    )
+                )
+        return [], {"transmission-chain"}
+    selected = {
+        page_key: child
+        for page_key, child in components.items()
+        if child is not None
+    }
+    list(
+        DashboardSnapshot.objects.select_for_update()
+        .filter(pk__in={child.pk for child in selected.values()})
+        .order_by("key", "pk")
+        .values_list("pk", flat=True)
+    )
+    child_batches = {child.batch_id for child in selected.values()}
+    list(
+        MetricSnapshot.objects.select_for_update()
+        .filter(batch_id__in=child_batches)
+        .order_by("batch_id", "key", "pk")
+        .values_list("pk", flat=True)
+    )
+    if previous is not None and "refresh_failure" not in (previous.data or {}):
+        previous_envelopes = {
+            str(item.get("component_page_key") or ""): item
+            for item in (previous.data or {}).get("component_snapshots", [])
+            if isinstance(item, dict)
+        }
+        selected_identity = {
+            page_key: (
+                child.pk,
+                str(child.batch_id),
+                str((child.data or {}).get("fingerprint") or ""),
+                str((child.data or {}).get("payload_integrity_hash") or ""),
+            )
+            for page_key, child in selected.items()
+        }
+        previous_identity = {
+            page_key: (
+                envelope.get("component_snapshot_id"),
+                envelope.get("component_publication_batch_id"),
+                envelope.get("component_fingerprint"),
+                envelope.get("component_payload_integrity_hash"),
+            )
+            for page_key, envelope in previous_envelopes.items()
+        }
+        if (
+            selected_identity == previous_identity
+            and _transmission_snapshot_mode(previous) == "current_candidate"
+        ):
+            return [], set()
+    publication_timestamp = timezone.now()
+    prepared = _transmission_page_data(
+        selected,
+        publication_timestamp=publication_timestamp,
+    )
+    if prepared is None:
+        _mark_transmission_chain_stale(reason_code="shared-input-mismatch")
+        return [], {"transmission-chain"}
+    if previous is not None:
+        old_envelopes = {
+            str(item.get("component_page_key") or ""): item
+            for item in (previous.data or {}).get("component_snapshots", [])
+            if isinstance(item, dict)
+        }
+        new_envelopes = {
+            page_key: _transmission_component_envelope(child)
+            for page_key, child in selected.items()
+        }
+        regressed = False
+        if set(old_envelopes) == set(TRANSMISSION_CHAIN_COMPONENTS):
+            for page_key in TRANSMISSION_CHAIN_COMPONENTS:
+                new_envelope = new_envelopes[page_key]
+                if new_envelope is None:
+                    regressed = True
+                    break
+                new_as_of = _parse_payload_datetime(new_envelope.get("as_of"))
+                old_as_of = _parse_payload_datetime(
+                    old_envelopes[page_key].get("as_of")
+                )
+                if (
+                    new_as_of is not None
+                    and old_as_of is not None
+                    and new_as_of < old_as_of
+                ):
+                    regressed = True
+                    break
+        if regressed:
+            _mark_transmission_chain_stale(reason_code="candidate-regression")
+            return [], {"transmission-chain"}
+    published: DashboardSnapshot | None = None
+    try:
+        with transaction.atomic():
+            published = _publish_transmission_chain_revision(
+                components=selected,
+                publication_timestamp=publication_timestamp,
+                batch_id=uuid.uuid4(),
+            )
+            latest = (
+                DashboardSnapshot.objects.filter(
+                    key="transmission-chain",
+                    is_published=True,
+                    data__contract_version=TRANSMISSION_CHAIN_CONTRACT_VERSION,
+                )
+                .exclude(source__key="demo-market")
+                .select_related("source")
+                .order_by("-created_at", "-id")
+                .first()
+            )
+            current_attempts = _transmission_latest_attempts()
+            if (
+                latest is None
+                or _transmission_snapshot_mode(latest) != "current_candidate"
+                or any(
+                    current_attempts[page_key][role] is None
+                    or current_attempts[page_key][role].pk
+                    != attempts[page_key][role].pk
+                    for page_key in TRANSMISSION_CHAIN_COMPONENTS
+                    for role in _transmission_component_datasets(page_key)
+                )
+                or any(
+                    (current_child := _transmission_latest_valid_child(page_key))
+                    is None
+                    or current_child.pk != selected[page_key].pk
+                    for page_key in TRANSMISSION_CHAIN_COMPONENTS
+                )
+            ):
+                raise ValueError(
+                    "transmission-chain v1 publication postcondition failed"
+                )
+    except (
+        ArithmeticError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        zipfile.BadZipFile,
+    ):
+        _mark_transmission_chain_stale(reason_code="publication-postcondition")
+        return [], {"transmission-chain"}
     return ([published] if published is not None else []), set()
 
 
@@ -16970,6 +25945,8 @@ def _guard_fed_balance_sheet_component_persistence(
             {"ONRRP"},
             {
                 "ONRRP",
+                "ONRRP-NON-SMALL-VALUE-TOTAL",
+                "ONRRP-SMALL-VALUE-TOTAL",
                 "ONRRP-RATE",
                 "ONRRP-PARTICIPANTS",
                 "ONRRP-BANK",
@@ -17311,6 +26288,179 @@ def _store_subsurface_ny_fed_observations(result, source, run) -> int:
     return row_count
 
 
+def _operations_run_identity_from_dataset(dataset: str) -> str | None:
+    return next(
+        (
+            identity
+            for identity, (_source_key, expected_dataset) in OPERATIONS_DATASETS.items()
+            if dataset == expected_dataset
+        ),
+        None,
+    )
+
+
+def _guard_operations_ny_fed_persistence(
+    result: Any,
+    source: Source,
+    run: IngestionRun,
+) -> str:
+    """Reject malformed, unlicensed or superseded operations exact batches."""
+
+    identity = _operations_run_identity_from_dataset(str(result.dataset))
+    if (
+        identity is None
+        or source.key != "ny-fed-markets"
+        or run.source_id != source.pk
+        or run.dataset != result.dataset
+    ):
+        raise ValueError("operations NY Fed persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("operations NY Fed source lacks storage licence")
+    latest = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset=run.dataset)
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest is None or latest.pk != run.pk:
+        raise ValueError(
+            f"superseded {run.dataset} ingestion run cannot persist observations"
+        )
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("operations NY Fed fetched_at is future-dated")
+
+    today_et = timezone.now().astimezone(ZoneInfo("America/New_York")).date()
+    seen: set[tuple[str, date]] = set()
+    observed: set[str] = set()
+    dates_by_series: dict[str, set[date]] = defaultdict(set)
+    for record in result.records:
+        if record.get("value") is None:
+            continue
+        raw_period = record.get("date")
+        try:
+            if not isinstance(raw_period, str):
+                raise ValueError("date must be canonical text")
+            period = date.fromisoformat(raw_period)
+            if raw_period != period.isoformat():
+                raise ValueError("date must be canonical YYYY-MM-DD")
+            series_key = str(record.get("series_id") or "").lower()
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("operations exact batch contains a malformed row") from exc
+        row_identity = (series_key, period)
+        if (
+            series_key not in OPERATIONS_ALLOWED_SERIES[identity]
+            or not value.is_finite()
+            or value < 0
+            or period > today_et
+            or row_identity in seen
+        ):
+            raise ValueError(
+                "operations exact batch has an unknown, negative, future, or "
+                "duplicate row"
+            )
+        seen.add(row_identity)
+        observed.add(series_key)
+        dates_by_series[series_key].add(period)
+    if not OPERATIONS_REQUIRED_SERIES[identity] <= observed:
+        raise ValueError("operations exact batch lacks required series")
+
+    complete_date_series = {
+        "treasury": {"treasury-purchases"},
+        "onrrp": {
+            "onrrp",
+            "onrrp-non-small-value-total",
+            "onrrp-small-value-total",
+            "onrrp-rate",
+            "onrrp-participants",
+        },
+        "srf": {
+            "srp",
+            "srp-non-small-value-total",
+            "srp-small-value-total",
+            "srp-non-small-value-treasury",
+            "srp-non-small-value-agency",
+            "srp-non-small-value-mbs",
+            "srp-non-small-value-rate",
+        },
+    }.get(identity)
+    if complete_date_series:
+        date_sets = [dates_by_series[key] for key in sorted(complete_date_series)]
+        if not date_sets or any(item != date_sets[0] for item in date_sets[1:]):
+            raise ValueError(
+                "operations exact batch required series do not share one date set"
+            )
+    primary_series = {
+        "treasury": "treasury-purchases",
+        "onrrp": "onrrp",
+        "srf": "srp-non-small-value-total",
+        "soma": "soma-total",
+    }[identity]
+    candidate_latest = max(dates_by_series[primary_series])
+    durable_watermarks: list[date] = []
+    existing_latest = (
+        Observation.objects.filter(source=source, series__key=primary_series)
+        .exclude(batch_id=run.batch_id)
+        .order_by("-value_date", "-id")
+        .first()
+    )
+    if existing_latest is not None:
+        durable_watermarks.append(existing_latest.value_date.date())
+    for previous in (
+        IngestionRun.objects.filter(source=source, dataset=run.dataset)
+        .exclude(pk=run.pk)
+        .values_list("metadata", flat=True)
+    ):
+        raw_watermark = (previous or {}).get("latest_value_date")
+        if raw_watermark:
+            try:
+                durable_watermarks.append(date.fromisoformat(str(raw_watermark)))
+            except ValueError as exc:
+                raise ValueError(
+                    "operations durable latest-value-date watermark is invalid"
+                ) from exc
+    if durable_watermarks and candidate_latest < max(durable_watermarks):
+        raise ValueError("operations exact batch latest value date regressed")
+    run.metadata = {
+        **dict(run.metadata or {}),
+        "latest_value_date": candidate_latest.isoformat(),
+        "exact_series": sorted(observed),
+    }
+    run.save(update_fields=["metadata", "updated_at"])
+    return identity
+
+
+def _store_operations_ny_fed_observations(result, source, run) -> int:
+    """Persist one operations component with exactly one private raw artifact."""
+
+    identity = _guard_operations_ny_fed_persistence(result, source, run)
+    if identity == "srf":
+        row_count = _store_subsurface_ny_fed_observations(result, source, run)
+    else:
+        if identity == "onrrp":
+            _guard_fed_balance_sheet_component_persistence(result, source, run)
+        row_count = store_series_observations(result, source, run)
+        Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+            fallback_source=None
+        )
+        persist_private_raw_artifact(run=run, result=result)
+        if identity == "onrrp":
+            _guard_fed_balance_sheet_component_persistence(result, source, run)
+    _guard_operations_ny_fed_persistence(result, source, run)
+    if (
+        row_count <= 0
+        or Observation.objects.filter(source=source, batch_id=run.batch_id).count()
+        != row_count
+        or RawArtifact.objects.filter(run=run).count() != 1
+    ):
+        raise ValueError("operations NY Fed exact-batch postcondition failed")
+    return row_count
+
+
 def _store_prates_observations(result, source, run) -> int:
     _guard_daily_rate_persistence(
         result,
@@ -17328,8 +26478,389 @@ def _store_prates_observations(result, source, run) -> int:
     return row_count
 
 
+def _validated_h10_raw_contract(result: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    raw_bytes = result.raw_bytes
+    if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
+        raise ValueError("H.10 exact ZIP bytes are required")
+    payload = bytes(raw_bytes)
+    if len(payload) > 16 * 1024 * 1024:
+        raise ValueError("H.10 ZIP exceeds the persistence size limit")
+    digest = hashlib.sha256(payload).hexdigest()
+    metadata = dict(result.metadata or {})
+    if (
+        int(metadata.get("archive_size") or 0) != len(payload)
+        or int(metadata.get("byte_length") or 0) != len(payload)
+        or str(metadata.get("archive_sha256") or "").lower() != digest
+        or str(metadata.get("sha256") or "").lower() != digest
+        or metadata.get("content_type") != "application/zip"
+    ):
+        raise ValueError("H.10 ZIP hash, size or content type is inconsistent")
+    validator = FederalReserveH10Provider()
+    try:
+        raw_records, raw_metadata = validator._parse_archive(
+            io.BytesIO(payload),
+            tuple(H10_TARGET_SERIES),
+            fetched_at=result.fetched_at,
+            archive_size=len(payload),
+        )
+    finally:
+        validator.close()
+    if json.dumps(raw_records, sort_keys=True, default=str) != json.dumps(
+        result.records, sort_keys=True, default=str
+    ):
+        raise ValueError("H.10 normalized records do not match the exact ZIP")
+    required_metadata = {
+        "archive_member",
+        "archive_member_size",
+        "archive_member_sha256",
+        "source_prepared_at",
+        "latest_valid_dates",
+    }
+    if any(metadata.get(key) != raw_metadata.get(key) for key in required_metadata):
+        raise ValueError("H.10 member or release metadata does not match exact ZIP")
+    return raw_records, raw_metadata
+
+
+def _h10_prepared_watermark(metadata: dict[str, Any]) -> datetime | None:
+    """Read current or pre-v1 H.10 release metadata without losing ET semantics."""
+
+    if metadata.get("source_prepared_at"):
+        prepared = _parse_payload_datetime(metadata.get("source_prepared_at"))
+        if prepared is None:
+            raise ValueError("durable H.10 Prepared watermark is invalid")
+        return prepared
+    raw_legacy = metadata.get("prepared_at")
+    if not raw_legacy:
+        return None
+    try:
+        prepared = datetime.fromisoformat(str(raw_legacy).replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("durable H.10 legacy Prepared watermark is invalid") from exc
+    if prepared.tzinfo is None:
+        prepared = prepared.replace(tzinfo=ZoneInfo("America/New_York"))
+    return prepared.astimezone(UTC)
+
+
+def _guard_h10_persistence(result: Any, source: Source, run: IngestionRun) -> None:
+    if (
+        source.key != "federal-reserve"
+        or result.provider != "federal-reserve"
+        or result.dataset != "h10"
+        or run.source_id != source.pk
+        or run.dataset != "h10"
+    ):
+        raise ValueError("H.10 persistence identity mismatch")
+    Source.objects.select_for_update().get(pk=source.pk)
+    if _effective_source_license(source, lock=True, require_storage=True) is None:
+        raise ValueError("H.10 source lacks historical-storage permission")
+    latest_attempt = (
+        IngestionRun.objects.select_for_update()
+        .filter(source=source, dataset="h10")
+        .order_by("-started_at", "-id")
+        .first()
+    )
+    if latest_attempt is None or latest_attempt.pk != run.pk:
+        raise ValueError("superseded H.10 run cannot persist observations")
+
+    raw_records, raw_metadata = _validated_h10_raw_contract(result)
+    numeric = [item for item in raw_records if item.get("value") is not None]
+    exact_series = {str(item.get("series_id") or "").lower() for item in numeric}
+    expected_series = {
+        str(item["series_id"]).lower() for item in H10_TARGET_SERIES.values()
+    }
+    if exact_series != expected_series:
+        raise ValueError("H.10 exact batch lacks required numeric series")
+
+    prepared = _parse_payload_datetime(raw_metadata.get("source_prepared_at"))
+    fetched_at = result.fetched_at
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    if prepared is None or fetched_at > timezone.now() + timedelta(minutes=5):
+        raise ValueError("H.10 release or fetch time is invalid")
+
+    latest_dates: dict[str, date] = {}
+    seen: set[tuple[str, date]] = set()
+    for record in numeric:
+        raw_period = record.get("date")
+        try:
+            if not isinstance(raw_period, str):
+                raise ValueError("date must be text")
+            period = date.fromisoformat(raw_period)
+            value = Decimal(str(record.get("value")))
+        except (ArithmeticError, TypeError, ValueError) as exc:
+            raise ValueError("H.10 exact batch contains a malformed row") from exc
+        series_key = str(record.get("series_id") or "").lower()
+        identity = (series_key, period)
+        if (
+            raw_period != period.isoformat()
+            or identity in seen
+            or series_key not in expected_series
+            or not value.is_finite()
+            or value <= 0
+            or record.get("status") != "A"
+            or period > fetched_at.astimezone(ZoneInfo("America/New_York")).date()
+        ):
+            raise ValueError("H.10 exact batch row failed strict validation")
+        seen.add(identity)
+        latest_dates[series_key] = max(period, latest_dates.get(series_key, period))
+    declared_latest = {
+        H10_TARGET_SERIES[board_id]["series_id"].lower(): date.fromisoformat(raw_date)
+        for board_id, raw_date in raw_metadata["latest_valid_dates"].items()
+    }
+    if latest_dates != declared_latest:
+        raise ValueError("H.10 latest-valid-date metadata does not match rows")
+    if prepared.astimezone(ZoneInfo("America/New_York")).date() < max(
+        latest_dates.values()
+    ):
+        raise ValueError("H.10 Prepared date precedes latest valid observations")
+
+    prepared_watermarks: list[datetime] = []
+    date_watermarks: dict[str, list[date]] = defaultdict(list)
+    for previous_metadata in (
+        IngestionRun.objects.filter(source=source, dataset="h10")
+        .exclude(pk=run.pk)
+        .values_list("metadata", flat=True)
+    ):
+        previous_metadata = dict(previous_metadata or {})
+        previous_prepared = _h10_prepared_watermark(previous_metadata)
+        if previous_prepared is not None:
+            prepared_watermarks.append(previous_prepared)
+        for board_id, raw_period in (
+            previous_metadata.get("latest_valid_dates") or {}
+        ).items():
+            target = H10_TARGET_SERIES.get(str(board_id))
+            if target is None:
+                continue
+            try:
+                date_watermarks[target["series_id"].lower()].append(
+                    date.fromisoformat(str(raw_period))
+                )
+            except ValueError as exc:
+                raise ValueError("durable H.10 date watermark is invalid") from exc
+    for series_key in expected_series:
+        latest_observation = (
+            Observation.objects.filter(source=source, series__key=series_key)
+            .order_by("-value_date", "-id")
+            .first()
+        )
+        if latest_observation is not None:
+            date_watermarks[series_key].append(latest_observation.value_date.date())
+    if prepared_watermarks and prepared < max(prepared_watermarks):
+        raise ValueError("H.10 Prepared timestamp regressed")
+    if any(
+        date_watermarks[key] and latest_dates[key] < max(date_watermarks[key])
+        for key in expected_series
+    ):
+        raise ValueError("H.10 latest valid observation regressed")
+
+    run.metadata = {
+        **dict(run.metadata or {}),
+        **dict(result.metadata or {}),
+        "source_prepared_at": prepared.isoformat(),
+        "latest_valid_dates": raw_metadata["latest_valid_dates"],
+        "exact_series": sorted(exact_series),
+    }
+    run.save(update_fields=["metadata", "updated_at"])
+
+
 def _store_h10_observations(result, source, run) -> int:
-    return _store_board_archive_observations(result, source, run)
+    _guard_h10_persistence(result, source, run)
+    row_count = store_series_observations(
+        result,
+        source,
+        run,
+        preserve_batches=True,
+    )
+    Observation.objects.filter(source=source, batch_id=run.batch_id).update(
+        fallback_source=None
+    )
+    persist_private_raw_artifact(
+        run=run,
+        result=result,
+        namespace="federal-reserve",
+    )
+    _guard_h10_persistence(result, source, run)
+    if (
+        row_count <= 0
+        or Observation.objects.filter(source=source, batch_id=run.batch_id).count()
+        != row_count
+        or RawArtifact.objects.filter(run=run).count() != 1
+    ):
+        raise ValueError("H.10 exact-batch persistence postcondition failed")
+    return row_count
+
+
+def _validate_global_dollar_swap_history_witness(
+    operations: list[dict[str, Any]],
+    *,
+    coverage_end: date,
+) -> None:
+    """Prove the response is the known full official history, not ``last/N``.
+
+    The search endpoint does not sign its request parameters into the body, so
+    URL metadata alone cannot distinguish a complete response from a short
+    response fetched through ``last/N`` and relabelled by a caller.  These
+    deliberately conservative witnesses bind v1 to the currently reviewed NY
+    Fed history.  A legitimate historical revision must update this contract
+    through review instead of silently weakening publication.
+    """
+
+    if len(operations) < GLOBAL_DOLLAR_SWAP_MIN_RETURNED_COUNT:
+        raise ValueError("global-dollar USD swap history is below the reviewed row floor")
+    trade_dates = [operation.get("trade_date") for operation in operations]
+    if (
+        not trade_dates
+        or any(not isinstance(trade_date, date) for trade_date in trade_dates)
+        or min(trade_dates) != GLOBAL_DOLLAR_SWAP_FIRST_TRADE_DATE
+    ):
+        raise ValueError("global-dollar USD swap first-trade witness changed")
+    if max(trade_dates) < coverage_end - timedelta(days=35):
+        raise ValueError("global-dollar USD swap recent-trade witness is stale")
+    observed = {
+        (
+            str(operation.get("counterparty") or ""),
+            operation.get("trade_date"),
+            operation.get("settlement_date"),
+            operation.get("maturity_date"),
+            operation.get("term_in_days"),
+            operation.get("interest_rate"),
+            operation.get("amount"),
+            operation.get("is_small_value"),
+        )
+        for operation in operations
+    }
+    if not GLOBAL_DOLLAR_SWAP_HISTORY_WITNESSES.issubset(observed):
+        raise ValueError("global-dollar USD swap reviewed history witnesses are missing")
+
+
+def _validated_global_dollar_swap_coverage_contract(
+    *,
+    metadata: dict[str, Any],
+    fetched_at: datetime,
+    raw_bytes: bytes,
+) -> tuple[list[dict[str, Any]], date, date]:
+    """Revalidate the official search URL, window and every returned row."""
+
+    if timezone.is_naive(fetched_at):
+        fetched_at = fetched_at.replace(tzinfo=UTC)
+    try:
+        coverage_start = date.fromisoformat(str(metadata.get("coverage_start") or ""))
+        coverage_end = date.fromisoformat(str(metadata.get("coverage_end") or ""))
+    except ValueError as exc:
+        raise ValueError("global-dollar USD swap coverage dates are invalid") from exc
+    parsed_endpoint = urlparse(str(metadata.get("endpoint") or ""))
+    endpoint_query = parse_qs(parsed_endpoint.query, keep_blank_values=True)
+    expected_query = {
+        "startDate": [coverage_start.isoformat()],
+        "endDate": [coverage_end.isoformat()],
+        "dateType": ["trade"],
+    }
+    if (
+        metadata.get("coverage_mode") != "explicit-search"
+        or metadata.get("coverage_complete") is not True
+        or coverage_start != date(2007, 1, 1)
+        or metadata.get("date_type") != "trade"
+        or metadata.get("outstanding_as_of") != coverage_end.isoformat()
+        or parsed_endpoint.scheme != "https"
+        or parsed_endpoint.netloc.lower() != "markets.newyorkfed.org"
+        or parsed_endpoint.path != "/api/fxs/usdollar/search.json"
+        or endpoint_query != expected_query
+        or coverage_end
+        != fetched_at.astimezone(ZoneInfo("America/New_York")).date()
+    ):
+        raise ValueError("global-dollar USD swap official search proof is invalid")
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    if (
+        int(metadata.get("byte_length") or 0) != len(raw_bytes)
+        or str(metadata.get("sha256") or "").lower() != digest
+    ):
+        raise ValueError("global-dollar USD swap raw hash or size is invalid")
+    try:
+        payload = json.loads(raw_bytes)
+        operations = NYFedMarketsProvider.validate_usd_fx_swap_operations(
+            payload,
+            strict=True,
+            fetched_at=fetched_at,
+        )
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise ValueError("global-dollar USD swap raw response is invalid") from exc
+    _validate_global_dollar_swap_history_witness(
+        operations,
+        coverage_end=coverage_end,
+    )
+    if (
+        int(metadata.get("returned_count") or -1) != len(operations)
+        or any(
+            item["trade_date"] is None
+            or item["trade_date"] < coverage_start
+            or item["trade_date"] > coverage_end
+            for item in operations
+        )
+    ):
+        raise ValueError("global-dollar USD swap coverage does not match raw rows")
+    for operation in operations:
+        raw_updated = operation["source"].get("lastUpdated")
+        try:
+            updated = datetime.fromisoformat(
+                str(raw_updated or "").replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("global-dollar USD swap lastUpdated is invalid") from exc
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=ZoneInfo("America/New_York"))
+        if updated > fetched_at + timedelta(minutes=5):
+            raise ValueError("global-dollar USD swap lastUpdated exceeds fetch time")
+    return operations, coverage_start, coverage_end
+
+
+def _store_global_dollar_swap_observations(result, source, run) -> int:
+    """Persist the complete NY Fed search response used by global-dollar v1."""
+
+    metadata = dict(result.metadata or {})
+    if (
+        source.key != "ny-fed-markets"
+        or result.provider != "ny-fed-markets"
+        or result.dataset != "fx-swaps:usdollar"
+    ):
+        raise ValueError("global-dollar USD swap search coverage is incomplete")
+    if not isinstance(result.raw_bytes, (bytes, bytearray)) or not result.raw_bytes:
+        raise ValueError("global-dollar USD swap exact JSON bytes are required")
+    parsed, _coverage_start, as_of_date = (
+        _validated_global_dollar_swap_coverage_contract(
+            metadata=metadata,
+            fetched_at=result.fetched_at,
+            raw_bytes=bytes(result.raw_bytes),
+        )
+    )
+    durable_coverage_dates: list[date] = []
+    for previous in (
+        IngestionRun.objects.filter(source=source, dataset="fx-swaps:usdollar")
+        .exclude(pk=run.pk)
+        .values_list("metadata", flat=True)
+    ):
+        raw_date = (previous or {}).get("coverage_end")
+        if raw_date:
+            try:
+                durable_coverage_dates.append(date.fromisoformat(str(raw_date)))
+            except ValueError as exc:
+                raise ValueError("durable USD swap coverage watermark is invalid") from exc
+    if durable_coverage_dates and as_of_date < max(durable_coverage_dates):
+        raise ValueError("global-dollar USD swap coverage end regressed")
+    rebuilt_records = NYFedMarketsProvider.usd_fx_swap_records(
+        parsed,
+        as_of_date=as_of_date,
+        history_limit=None,
+    )
+    if json.dumps(rebuilt_records, sort_keys=True, default=str) != json.dumps(
+        result.records, sort_keys=True, default=str
+    ):
+        raise ValueError("global-dollar USD swap rows do not match exact JSON")
+    run.metadata = {**dict(run.metadata or {}), **metadata}
+    run.save(update_fields=["metadata", "updated_at"])
+    row_count = _store_subsurface_ny_fed_observations(result, source, run)
+    if RawArtifact.objects.filter(run=run).count() != 1:
+        raise ValueError("global-dollar USD swap requires one private artifact")
+    return row_count
 
 
 def _store_release_workbook_observations(result, source, run) -> int:
@@ -17535,6 +27066,7 @@ _DASHBOARD_FINGERPRINT_VOLATILE_KEYS = frozenset(
         "component_batches",
         "fetched_at",
         "fingerprint",
+        "payload_integrity_hash",
         "fresh_until",
         "publication_batch_id",
         "required_notices",
@@ -17590,7 +27122,426 @@ def _dashboard_content_fingerprint(
     ).hexdigest()
 
 
-def _publish_dashboard(
+def _dashboard_payload_integrity_hash(
+    *, title: str, summary: str, snapshot_data: dict[str, Any]
+) -> str:
+    """Hash the exact published payload, including acquisition lineage.
+
+    Only the hash itself and a later refresh-failure marker are excluded.  The
+    semantic fingerprint remains the dedupe identity; this hash is the
+    immutable audit anchor for batches, run IDs, timestamps and notices.
+    """
+
+    exact_data = dict(snapshot_data)
+    exact_data.pop("payload_integrity_hash", None)
+    exact_data.pop("refresh_failure", None)
+
+    return hashlib.sha256(
+        json.dumps(
+            {"title": title, "summary": summary, **exact_data},
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+_ASSETS_FX_EXACT_ACQUISITION_KEYS = frozenset(
+    {
+        "input_run",
+        "component_run",
+        "acquisition_artifact",
+        "input_run_id",
+        "ingestion_run_id",
+        "run_id",
+        "artifact_id",
+        "private_uri",
+        "uri",
+        "batch_id",
+        "batch_ids",
+        "component_batches",
+        "input_batch_ids",
+        "publication_batch_id",
+        "required_notices",
+        "fetched_at",
+        "fresh_until",
+        "component_fetched_at",
+        "prepared_at",
+        "completed_at",
+        "run-batch",
+        "prepared",
+        "fetched",
+        "fresh-until",
+        "batch",
+        "archive",
+        "member",
+        "acquisition_sha256",
+        "archive_member_sha256",
+        "sha256",
+        "member_sha256",
+        "cells_list",
+        "fingerprint",
+        "payload_integrity_hash",
+        "refresh_failure",
+    }
+)
+
+
+def _without_exact_assets_fx_acquisition(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_exact_assets_fx_acquisition(item)
+            for key, item in value.items()
+            if key not in _ASSETS_FX_EXACT_ACQUISITION_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_exact_assets_fx_acquisition(item) for item in value]
+    return value
+
+
+def _assets_fx_content_fingerprint(
+    *,
+    title: str,
+    summary: str,
+    snapshot_data: dict[str, Any],
+) -> str:
+    """Hash visible semantics while excluding only acquisition identity."""
+
+    return hashlib.sha256(
+        json.dumps(
+            _without_exact_assets_fx_acquisition(
+                {"title": title, "summary": summary, "data": snapshot_data}
+            ),
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _assets_fx_payload_integrity_hash(
+    *,
+    title: str,
+    summary: str,
+    snapshot_data: dict[str, Any],
+) -> str:
+    """Hash the exact nested assets-fx payload and all lineage fields."""
+
+    exact_data = dict(snapshot_data)
+    exact_data.pop("payload_integrity_hash", None)
+    exact_data.pop("refresh_failure", None)
+    return hashlib.sha256(
+        json.dumps(
+            {"title": title, "summary": summary, "data": exact_data},
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+_GLOBAL_DOLLAR_EXACT_ACQUISITION_KEYS = frozenset(
+    {
+        "input_runs",
+        "acquisition_artifacts",
+        "input_run_id",
+        "ingestion_run_id",
+        "run_id",
+        "artifact_id",
+        "private_uri",
+        "uri",
+        "started_at",
+        "completed_at",
+        "component_fetched_at",
+        "fetched",
+        "fresh-until",
+        "batch",
+        "cells_list",
+        "acquisition_sha256",
+        "archive_member_sha256",
+        "sha256",
+        "member_sha256",
+        "artifact",
+    }
+)
+
+
+def _without_exact_global_dollar_acquisition(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_exact_global_dollar_acquisition(item)
+            for key, item in value.items()
+            if key not in _GLOBAL_DOLLAR_EXACT_ACQUISITION_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_exact_global_dollar_acquisition(item) for item in value]
+    return value
+
+
+def _global_dollar_content_fingerprint(
+    *, title: str, summary: str, snapshot_data: dict[str, Any]
+) -> str:
+    """Hash global-dollar semantics without allowing payload key shadowing."""
+
+    return hashlib.sha256(
+        json.dumps(
+            _without_volatile_dashboard_lineage(
+                _without_exact_global_dollar_acquisition(
+                    {"title": title, "summary": summary, "data": snapshot_data}
+                )
+            ),
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _global_dollar_payload_integrity_hash(
+    *, title: str, summary: str, snapshot_data: dict[str, Any]
+) -> str:
+    """Hash the exact global-dollar payload with fixed title/summary fields."""
+
+    exact_data = dict(snapshot_data)
+    exact_data.pop("payload_integrity_hash", None)
+    exact_data.pop("refresh_failure", None)
+    return hashlib.sha256(
+        json.dumps(
+            {"title": title, "summary": summary, "data": exact_data},
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _transmission_chain_content_fingerprint(
+    *, title: str, summary: str, snapshot_data: dict[str, Any]
+) -> str:
+    """Hash the explicit transmission semantic manifest.
+
+    The manifest is constructed by the dedicated coordinator.  It contains the
+    twelve copied values, six chart identities, three section contracts, all
+    child semantic fingerprints and the shared-input reconciliation result.
+    Acquisition IDs never enter this projection, while child identities are
+    never removed recursively by the generic dashboard canonicalizer.
+    """
+
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "title": title,
+                "summary": summary,
+                "contract_version": snapshot_data.get("contract_version"),
+                "formula_version": snapshot_data.get("formula_version"),
+                "semantic_manifest": snapshot_data.get("semantic_manifest"),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _transmission_chain_payload_integrity_hash(
+    *, title: str, summary: str, snapshot_data: dict[str, Any]
+) -> str:
+    """Hash the exact nested parent payload without recursive exclusions."""
+
+    exact_data = dict(snapshot_data)
+    exact_data.pop("payload_integrity_hash", None)
+    exact_data.pop("refresh_failure", None)
+    return hashlib.sha256(
+        json.dumps(
+            {"title": title, "summary": summary, "data": exact_data},
+            sort_keys=True,
+            ensure_ascii=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
+
+
+def _dashboard_metric_snapshot_metadata(
+    item: dict[str, Any],
+    *,
+    fingerprint: str,
+    payload_integrity_hash: str,
+) -> dict[str, Any]:
+    """Return the exact normalized metadata contract stored for one metric."""
+
+    component_metadata = item.get("metadata") or {}
+    normalized = {
+        "component_batch_id": item.get("batch_id"),
+        "formula": component_metadata.get("formula"),
+        "source_field": component_metadata.get("source_field"),
+        "common_effective_date": component_metadata.get("common_effective_date"),
+        "input_series": component_metadata.get("input_series", []),
+        "source_keys": item.get("source_keys", []),
+        "input_batch_ids": component_metadata.get("input_batch_ids", []),
+        "input_value_dates": component_metadata.get("input_value_dates", []),
+        "input_lineage": component_metadata.get("input_lineage", []),
+        "active_operations": component_metadata.get("active_operations"),
+        "all_active_operations": component_metadata.get("all_active_operations"),
+        "small_value_active_operations": component_metadata.get(
+            "small_value_active_operations"
+        ),
+        "swap_as_of": component_metadata.get("swap_as_of"),
+        "swap_total": component_metadata.get("swap_total"),
+        "swap_small_value": component_metadata.get("swap_small_value"),
+        "previous_value": component_metadata.get("previous_value"),
+        "previous_value_date": component_metadata.get("previous_value_date"),
+        "previous_input_lineage": component_metadata.get(
+            "previous_input_lineage", []
+        ),
+        "model_label": component_metadata.get("model_label"),
+        "freshness_basis": component_metadata.get("freshness_basis"),
+        "seasonal_basis": component_metadata.get("seasonal_basis"),
+        "preliminary": bool(component_metadata.get("preliminary")),
+        "revision_indicator": component_metadata.get("revision_indicator"),
+        "footnote_id": component_metadata.get("footnote_id"),
+        "prates_status": component_metadata.get("prates_status"),
+        "calculation_owner": component_metadata.get("calculation_owner"),
+        "normalization": component_metadata.get("normalization"),
+        "quote_convention": component_metadata.get("quote_convention"),
+        "acquisition_sha256": component_metadata.get("acquisition_sha256"),
+        "archive_member_sha256": component_metadata.get("archive_member_sha256"),
+        "component": component_metadata.get("component"),
+        "input_run_id": component_metadata.get("input_run_id"),
+        "treasury_field": component_metadata.get("treasury_field"),
+        "bank_discount_rate": component_metadata.get("bank_discount_rate"),
+        "coverage_proxy": component_metadata.get("coverage_proxy"),
+        "sample_window": component_metadata.get("sample_window"),
+        "lag_calendar_days": component_metadata.get("lag_calendar_days"),
+        "minimum_sample_count": component_metadata.get("minimum_sample_count"),
+        "maximum_sample_count": component_metadata.get("maximum_sample_count"),
+        "sample_count": component_metadata.get("sample_count"),
+        "population_mean": component_metadata.get("population_mean"),
+        "population_std": component_metadata.get("population_std"),
+        "population_standard_deviation": component_metadata.get(
+            "population_standard_deviation"
+        ),
+        "sample_changes": component_metadata.get("sample_changes", []),
+        "current_8w_change": component_metadata.get("current_8w_change"),
+        "component_page_key": component_metadata.get("component_page_key"),
+        "component_snapshot_id": component_metadata.get("component_snapshot_id"),
+        "component_publication_batch_id": component_metadata.get(
+            "component_publication_batch_id"
+        ),
+        "component_fingerprint": component_metadata.get("component_fingerprint"),
+        "component_payload_integrity_hash": component_metadata.get(
+            "component_payload_integrity_hash"
+        ),
+        "component_contract_version": component_metadata.get(
+            "component_contract_version"
+        ),
+        "component_metric_snapshot_id": component_metadata.get(
+            "component_metric_snapshot_id"
+        ),
+        "component_metric_snapshot_key": component_metadata.get(
+            "component_metric_snapshot_key"
+        ),
+        "component_metric_snapshot_batch_id": component_metadata.get(
+            "component_metric_snapshot_batch_id"
+        ),
+        "component_input_runs": component_metadata.get(
+            "component_input_runs", []
+        ),
+        "component_all_input_runs": component_metadata.get(
+            "component_all_input_runs", []
+        ),
+        "artifact_evidence": component_metadata.get("artifact_evidence", []),
+        "component_all_artifact_evidence": component_metadata.get(
+            "component_all_artifact_evidence", []
+        ),
+        "input_datasets": component_metadata.get("input_datasets", []),
+        "upstream_fields": component_metadata.get("upstream_fields", []),
+        "inherited_license_scope": item.get("license_scope")
+        or component_metadata.get("inherited_license_scope"),
+        "publication_fingerprint": fingerprint,
+        "payload_integrity_hash": payload_integrity_hash,
+        "public_snapshot": True,
+    }
+    assets_fx_change_fields = (
+        "current_value",
+        "current_value_date",
+        "current_input_lineage",
+        "change_formula",
+        "change_quality_status",
+        "change_calculation_owner",
+    )
+    for field in assets_fx_change_fields:
+        if field in component_metadata:
+            normalized[field] = component_metadata[field]
+    return normalized
+
+
+def _dashboard_metric_snapshot_matches_payload(
+    stored: MetricSnapshot,
+    metric: dict[str, Any],
+    *,
+    fingerprint: str,
+    payload_integrity_hash: str,
+) -> bool:
+    """Require every normalized field to match one published metric exactly."""
+
+    value = metric.get("value")
+    change = metric.get("change")
+    expected_fallback = str(metric.get("fallback_source") or "") or None
+    try:
+        expected_value_date = _parse_payload_datetime(
+            metric.get("value_date") or metric.get("as_of")
+        )
+        expected_as_of = _parse_payload_datetime(
+            metric.get("as_of") or metric.get("value_date")
+        )
+        expected_fetched_at = _parse_payload_datetime(metric.get("fetched_at"))
+        return bool(
+            value is not None
+            and stored.value is not None
+            and stored.label == metric.get("label")
+            and stored.value.quantize(Decimal("0.00000001"))
+            == Decimal(str(value)).quantize(Decimal("0.00000001"))
+            and stored.display_value == str(metric.get("display_value") or "")
+            and (
+                stored.change.quantize(Decimal("0.000001"))
+                if stored.change is not None
+                else None
+            )
+            == (
+                Decimal(str(change)).quantize(Decimal("0.000001"))
+                if change is not None
+                else None
+            )
+            and stored.unit == str(metric.get("unit") or "")
+            and stored.value_date == expected_value_date
+            and stored.as_of == expected_as_of
+            and stored.fetched_at == expected_fetched_at
+            and stored.source.key == metric.get("source_key")
+            and (
+                stored.fallback_source.key
+                if stored.fallback_source is not None
+                else None
+            )
+            == expected_fallback
+            and stored.quality_status == metric.get("quality_status")
+            and stored.license_scope
+            == str(metric.get("license_scope") or "")[:120]
+            and stored.metadata
+            == _dashboard_metric_snapshot_metadata(
+                metric,
+                fingerprint=fingerprint,
+                payload_integrity_hash=payload_integrity_hash,
+            )
+        )
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+
+
+_ASSETS_FX_CORE_PUBLISH_CAPABILITY = object()
+_TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY = object()
+
+
+def _publish_dashboard_core(
     *,
     key: str,
     title: str,
@@ -17602,7 +27553,23 @@ def _publish_dashboard(
     extra_data: dict[str, Any] | None = None,
     required_metric_keys: frozenset[str] | None = None,
     batch_id: uuid.UUID,
+    snapshot_as_of: datetime | None = None,
+    snapshot_fresh_until: str | None = None,
+    _publish_capability: object | None = None,
 ) -> DashboardSnapshot | None:
+    if (
+        key == "assets-fx"
+        and _publish_capability is not _ASSETS_FX_CORE_PUBLISH_CAPABILITY
+    ):
+        raise ValueError("assets-fx must be published by its dedicated v1 publisher")
+    if (
+        key == "transmission-chain"
+        and _publish_capability
+        is not _TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY
+    ):
+        raise ValueError(
+            "transmission-chain must be published by its dedicated v1 publisher"
+        )
     if not metrics:
         return None
     source = ensure_source("internal")
@@ -17722,7 +27689,9 @@ def _publish_dashboard(
         for item in [*metrics, *normalized_charts]
         if item.get("as_of")
     ]
-    as_of = min(as_of_values) if as_of_values else timezone.now()
+    as_of = snapshot_as_of or (
+        min(as_of_values) if as_of_values else timezone.now()
+    )
     if as_of.tzinfo is None:
         as_of = as_of.replace(tzinfo=UTC)
     component_qualities = {
@@ -17755,7 +27724,10 @@ def _publish_dashboard(
         "fresh_until",
         "publication_batch_id",
         "fingerprint",
+        "payload_integrity_hash",
         "refresh_failure",
+        "title",
+        "summary",
     }
     if reserved_extra_keys & normalized_extra_data.keys():
         raise ValueError("dashboard extra_data attempted to replace reserved fields")
@@ -17768,7 +27740,8 @@ def _publish_dashboard(
         "component_batches": component_batches,
         "source_keys": source_keys,
         "required_notices": public_source_notices(source_keys),
-        "fresh_until": min(
+        "fresh_until": snapshot_fresh_until
+        or min(
             (
                 item["fresh_until"]
                 for item in [*metrics, *normalized_charts, *(sections or [])]
@@ -17779,114 +27752,35 @@ def _publish_dashboard(
         "publication_batch_id": str(batch_id),
         **normalized_extra_data,
     }
-    fingerprint = _dashboard_content_fingerprint(
+    fingerprint_builder = {
+        "assets-fx": _assets_fx_content_fingerprint,
+        "global-dollar": _global_dollar_content_fingerprint,
+        "transmission-chain": _transmission_chain_content_fingerprint,
+    }.get(key, _dashboard_content_fingerprint)
+    payload_hash_builder = {
+        "assets-fx": _assets_fx_payload_integrity_hash,
+        "global-dollar": _global_dollar_payload_integrity_hash,
+        "transmission-chain": _transmission_chain_payload_integrity_hash,
+    }.get(key, _dashboard_payload_integrity_hash)
+    fingerprint = fingerprint_builder(
         title=title,
         summary=summary,
         snapshot_data=snapshot_data,
     )
     snapshot_data["fingerprint"] = fingerprint
+    payload_integrity_hash = payload_hash_builder(
+        title=title,
+        summary=summary,
+        snapshot_data=snapshot_data,
+    )
+    snapshot_data["payload_integrity_hash"] = payload_integrity_hash
 
     def metric_metadata(item: dict[str, Any]) -> dict[str, Any]:
-        component_metadata = item.get("metadata") or {}
-        return {
-            "component_batch_id": item.get("batch_id"),
-            "formula": component_metadata.get("formula"),
-            "source_field": component_metadata.get("source_field"),
-            "common_effective_date": component_metadata.get(
-                "common_effective_date"
-            ),
-            "input_series": component_metadata.get("input_series", []),
-            "source_keys": item.get("source_keys", []),
-            "input_batch_ids": component_metadata.get(
-                "input_batch_ids", []
-            ),
-            "input_value_dates": component_metadata.get(
-                "input_value_dates", []
-            ),
-            "input_lineage": component_metadata.get("input_lineage", []),
-            "active_operations": component_metadata.get("active_operations"),
-            "all_active_operations": component_metadata.get(
-                "all_active_operations"
-            ),
-            "small_value_active_operations": component_metadata.get(
-                "small_value_active_operations"
-            ),
-            "swap_as_of": component_metadata.get("swap_as_of"),
-            "swap_total": component_metadata.get("swap_total"),
-            "swap_small_value": component_metadata.get(
-                "swap_small_value"
-            ),
-            "previous_value": component_metadata.get("previous_value"),
-            "previous_value_date": component_metadata.get(
-                "previous_value_date"
-            ),
-            "previous_input_lineage": component_metadata.get(
-                "previous_input_lineage", []
-            ),
-            "model_label": component_metadata.get("model_label"),
-            "freshness_basis": component_metadata.get("freshness_basis"),
-            "seasonal_basis": component_metadata.get("seasonal_basis"),
-            "preliminary": bool(component_metadata.get("preliminary")),
-            "revision_indicator": component_metadata.get(
-                "revision_indicator"
-            ),
-            "footnote_id": component_metadata.get("footnote_id"),
-            "prates_status": component_metadata.get("prates_status"),
-            "calculation_owner": component_metadata.get(
-                "calculation_owner"
-            ),
-            "normalization": component_metadata.get("normalization"),
-            "quote_convention": component_metadata.get("quote_convention"),
-            "treasury_field": component_metadata.get("treasury_field"),
-            "bank_discount_rate": component_metadata.get(
-                "bank_discount_rate"
-            ),
-            "coverage_proxy": component_metadata.get("coverage_proxy"),
-            "sample_window": component_metadata.get("sample_window"),
-            "lag_calendar_days": component_metadata.get(
-                "lag_calendar_days"
-            ),
-            "minimum_sample_count": component_metadata.get(
-                "minimum_sample_count"
-            ),
-            "maximum_sample_count": component_metadata.get(
-                "maximum_sample_count"
-            ),
-            "sample_count": component_metadata.get("sample_count"),
-            "population_mean": component_metadata.get("population_mean"),
-            "population_std": component_metadata.get("population_std"),
-            "population_standard_deviation": component_metadata.get(
-                "population_standard_deviation"
-            ),
-            "sample_changes": component_metadata.get("sample_changes", []),
-            "current_8w_change": component_metadata.get(
-                "current_8w_change"
-            ),
-            "component_page_key": component_metadata.get(
-                "component_page_key"
-            ),
-            "component_snapshot_id": component_metadata.get(
-                "component_snapshot_id"
-            ),
-            "component_publication_batch_id": component_metadata.get(
-                "component_publication_batch_id"
-            ),
-            "component_fingerprint": component_metadata.get(
-                "component_fingerprint"
-            ),
-            "component_metric_snapshot_id": component_metadata.get(
-                "component_metric_snapshot_id"
-            ),
-            "component_metric_snapshot_key": component_metadata.get(
-                "component_metric_snapshot_key"
-            ),
-            "component_metric_snapshot_batch_id": component_metadata.get(
-                "component_metric_snapshot_batch_id"
-            ),
-            "inherited_license_scope": item.get("license_scope")
-            or component_metadata.get("inherited_license_scope"),
-            "public_snapshot": True,
-        }
+        return _dashboard_metric_snapshot_metadata(
+            item,
+            fingerprint=fingerprint,
+            payload_integrity_hash=payload_integrity_hash,
+        )
 
     def parsed_datetime(raw_value: Any, fallback: datetime) -> datetime:
         if not raw_value:
@@ -17959,16 +27853,52 @@ def _publish_dashboard(
         .first()
     )
     if latest and latest.data.get("fingerprint") == fingerprint:
-        snapshot_data["publication_batch_id"] = str(latest.batch_id)
-        latest.data = snapshot_data
-        latest.as_of = as_of
-        latest.quality_status = quality
-        latest.save(
-            update_fields=["data", "as_of", "quality_status", "updated_at"]
+        idempotent_data = deepcopy(snapshot_data)
+        idempotent_data["publication_batch_id"] = str(latest.batch_id)
+        if (
+            key in APPEND_ONLY_PUBLICATION_KEYS
+            and normalized_extra_data.get("contract_version") is not None
+        ):
+            # Parent publication timestamps are fixed once for a revision.  A
+            # coordinator retry with the exact same immutable component set is
+            # a no-op, even though its in-memory candidate was assembled later.
+            for timestamp_key in ("generated_at", "published_at"):
+                if timestamp_key in (latest.data or {}):
+                    idempotent_data[timestamp_key] = latest.data[timestamp_key]
+        idempotent_data["payload_integrity_hash"] = payload_hash_builder(
+            title=title,
+            summary=summary,
+            snapshot_data=idempotent_data,
         )
-        for item in metrics:
-            store_metric(item, latest.batch_id)
-        return None
+        audited_latest_data = dict(latest.data or {})
+        audited_latest_data.pop("refresh_failure", None)
+        if (
+            key in APPEND_ONLY_PUBLICATION_KEYS
+            and normalized_extra_data.get("contract_version") is not None
+        ):
+            if (
+                latest.title == title
+                and latest.summary == summary
+                and audited_latest_data == idempotent_data
+                and "refresh_failure" not in (latest.data or {})
+                and latest.quality_status
+                not in {Observation.Quality.ERROR, Observation.Quality.STALE}
+            ):
+                return None
+        else:
+            snapshot_data = idempotent_data
+            payload_integrity_hash = str(
+                snapshot_data["payload_integrity_hash"]
+            )
+            latest.data = snapshot_data
+            latest.as_of = as_of
+            latest.quality_status = quality
+            latest.save(
+                update_fields=["data", "as_of", "quality_status", "updated_at"]
+            )
+            for item in metrics:
+                store_metric(item, latest.batch_id)
+            return None
     for item in metrics:
         store_metric(item, batch_id)
     return DashboardSnapshot.objects.create(
@@ -17981,6 +27911,129 @@ def _publish_dashboard(
         data=snapshot_data,
         source=source,
         is_published=True,
+    )
+
+
+def _publish_dashboard(
+    *,
+    key: str,
+    title: str,
+    summary: str,
+    metrics: list[dict[str, Any]],
+    chart_data: Any = None,
+    charts: list[dict[str, Any]] | None = None,
+    sections: list[dict[str, Any]] | None = None,
+    extra_data: dict[str, Any] | None = None,
+    required_metric_keys: frozenset[str] | None = None,
+    batch_id: uuid.UUID,
+) -> DashboardSnapshot | None:
+    """Publish generic dashboards; independent contracts are never writable here."""
+
+    if key in {"assets-fx", "transmission-chain"}:
+        raise ValueError(f"{key} must be published by its dedicated v1 publisher")
+    return _publish_dashboard_core(
+        key=key,
+        title=title,
+        summary=summary,
+        metrics=metrics,
+        chart_data=chart_data,
+        charts=charts,
+        sections=sections,
+        extra_data=extra_data,
+        required_metric_keys=required_metric_keys,
+        batch_id=batch_id,
+    )
+
+
+def _publish_assets_fx_revision(
+    *,
+    run: IngestionRun,
+    batch_id: uuid.UUID,
+) -> DashboardSnapshot | None:
+    """Persist only a recomputed strict assets-fx revision."""
+
+    latest = _latest_h10_attempt()
+    if latest is None or latest.pk != run.pk:
+        raise ValueError("assets-fx publisher requires the latest H.10 attempt")
+    prepared, _failures = _assets_fx_page_data(run)
+    if prepared is None:
+        raise ValueError("assets-fx v1 payload is not buildable")
+    metrics, charts, sections, extra_data = prepared
+    metric_dates = [
+        _parse_payload_datetime(item.get("value_date")) for item in metrics
+    ]
+    if any(value is None for value in metric_dates):
+        raise ValueError("assets-fx metric value dates are incomplete")
+    snapshot_as_of = min(value for value in metric_dates if value is not None)
+    snapshot_fresh_until = min(
+        str(item["fresh_until"])
+        for item in [*metrics, *charts, *sections]
+        if item.get("fresh_until")
+    )
+    return _publish_dashboard_core(
+        key="assets-fx",
+        title=ASSETS_FX_TITLE,
+        summary=ASSETS_FX_SUMMARY,
+        metrics=metrics,
+        charts=charts,
+        sections=sections,
+        extra_data=extra_data,
+        required_metric_keys=ASSETS_FX_REQUIRED_METRIC_KEYS,
+        batch_id=batch_id,
+        snapshot_as_of=snapshot_as_of,
+        snapshot_fresh_until=snapshot_fresh_until,
+        _publish_capability=_ASSETS_FX_CORE_PUBLISH_CAPABILITY,
+    )
+
+
+def _publish_transmission_chain_revision(
+    *,
+    components: dict[str, DashboardSnapshot],
+    publication_timestamp: datetime,
+    batch_id: uuid.UUID,
+) -> DashboardSnapshot | None:
+    """Persist only a recomputed strict six-component parent revision."""
+
+    if set(components) != set(TRANSMISSION_CHAIN_COMPONENTS) or any(
+        not _transmission_child_contract_is_valid(
+            child,
+            mode="current_candidate",
+        )
+        for child in components.values()
+    ):
+        raise ValueError("transmission-chain components are not current and strict")
+    prepared = _transmission_page_data(
+        components,
+        publication_timestamp=publication_timestamp,
+    )
+    if prepared is None:
+        raise ValueError("transmission-chain parent contract is not buildable")
+    metrics, charts, sections, extra_data = prepared
+    snapshot_as_of = _parse_payload_datetime(extra_data.get("as_of"))
+    if snapshot_as_of is None:
+        raise ValueError("transmission-chain parent as-of is missing")
+    component_freshness = [
+        _parse_payload_datetime((child.data or {}).get("fresh_until"))
+        for child in components.values()
+    ]
+    if any(value is None for value in component_freshness):
+        raise ValueError("transmission-chain component freshness is missing")
+    snapshot_fresh_until = min(
+        value for value in component_freshness if value is not None
+    ).isoformat()
+    return _publish_dashboard_core(
+        key="transmission-chain",
+        title=TRANSMISSION_CHAIN_TITLE,
+        summary=TRANSMISSION_CHAIN_SUMMARY,
+        metrics=metrics,
+        charts=charts,
+        sections=sections,
+        extra_data=extra_data,
+        required_metric_keys=TRANSMISSION_CHAIN_REQUIRED_METRIC_KEYS,
+        batch_id=batch_id,
+        snapshot_as_of=snapshot_as_of,
+        snapshot_fresh_until=snapshot_fresh_until,
+        _publish_capability=_TRANSMISSION_CHAIN_CORE_PUBLISH_CAPABILITY,
     )
 
 
@@ -18319,50 +28372,6 @@ def publish_official_dashboards(
             "required_metric_keys": LIQUIDITY_REQUIRED_METRIC_KEYS,
         },
         {
-            "key": "transmission-chain",
-            "title": "美元流动性传导链",
-            "summary": "先显示美国财政与 Repo 官方输入；离岸基差、中介能力与资产反应缺口见下方台账，不发布伪精确总分。",
-            "metrics": _existing(
-                _metric("WRBWFRBL", "准备金", scale=Decimal("0.000001"), suffix=" USD tn"),
-                _metric("TGA", "TGA", scale=Decimal("0.001"), suffix=" USD bn"),
-                _metric(
-                    "ONRRP", "ON RRP", decimals=3, scale=Decimal("0.001"), suffix=" USD bn"
-                ),
-                _metric(
-                    "SOFR", "SOFR", suffix="%", aligned_with=("EFFR", "IORB")
-                ),
-                _metric(
-                    "IORB", "IORB", suffix="%", aligned_with=("SOFR", "EFFR")
-                ),
-                _derived_metric("sofr-effr", "SOFR−EFFR", "SOFR", "EFFR", basis_points=True),
-                _derived_metric("sofr-iorb", "SOFR−IORB", "SOFR", "IORB", basis_points=True),
-                _metric(
-                    "FXSWAP-USD-OUTSTANDING",
-                    "央行美元互换",
-                    decimals=0,
-                    suffix=" USD mn",
-                ),
-            ),
-            "chart_data": _history_rows(
-                {"SOFR": "SOFR", "EFFR": "EFFR", "IORB": "IORB"},
-                require_all=True,
-            ),
-        },
-        {
-            "key": "operations",
-            "title": "公开市场操作",
-            "summary": "ON RRP 和常备回购按操作日聚合，常备回购合并早午两场；SOMA 为周三国内证券持仓，不等于 H.4.1 总资产。",
-            "metrics": _existing(
-                _metric(
-                    "ONRRP", "ON RRP", decimals=3, scale=Decimal("0.001"), suffix=" USD bn"
-                ),
-                _metric("SRP", "常备回购", decimals=0, suffix=" USD mn"),
-                _metric("SRP-RATE", "常备回购利率", suffix="%"),
-                _metric("SOMA-TOTAL", "SOMA", scale=Decimal("0.000001"), suffix=" USD tn"),
-            ),
-            "chart_data": _history_rows({"SOMA-TOTAL": "SOMA"}, limit=104),
-        },
-        {
             "key": "fed-funds",
             "title": "联邦基金利率",
             "summary": (
@@ -18386,24 +28395,6 @@ def publish_official_dashboards(
             "charts": rates_prepared[1],
             "sections": rates_prepared[2],
             "extra_data": rates_prepared[3],
-        },
-        {
-            "key": "assets-fx",
-            "title": "外汇",
-            "summary": "日频参考值直接来自 Federal Reserve H.10；广义美元指数不是 ICE DXY，参考汇率也不是可交易实时现货或远期报价。",
-            "metrics": _existing(
-                _metric("H10-BROAD-DOLLAR", "广义美元指数", decimals=2),
-                _metric("H10-EURUSD", "EUR/USD 参考汇率", decimals=4),
-                _metric("H10-USDCNY", "USD/CNY 参考汇率", decimals=4),
-                _metric("H10-USDJPY", "USD/JPY 参考汇率", decimals=4),
-            ),
-            "chart_data": _history_rows(
-                {
-                    "H10-BROAD-DOLLAR": "广义美元指数",
-                    "H10-EURUSD": "EUR/USD",
-                },
-                limit=120,
-            ),
         },
         {
             "key": "yield-curve",
@@ -18504,26 +28495,6 @@ def publish_official_dashboards(
             "sections": reserves_sections,
             "extra_data": reserves_extra_data,
             "required_metric_keys": RESERVES_REQUIRED_METRIC_KEYS,
-        },
-        {
-            "key": "global-dollar",
-            "title": "全球美元",
-            "summary": "央行美元互换按 settlementDate ≤ as_of < maturityDate 计算在途余额，技术测试单列；跨币种基差仍需授权数据。",
-            "metrics": _existing(
-                _metric(
-                    "FXSWAP-USD-OUTSTANDING",
-                    "央行美元互换",
-                    decimals=0,
-                    suffix=" USD mn",
-                ),
-                _metric(
-                    "FXSWAP-USD-OUTSTANDING-SMALL-VALUE",
-                    "其中技术测试",
-                    decimals=0,
-                    suffix=" USD mn",
-                ),
-            ),
-            "chart_data": _history_rows({"FXSWAP-USD-OUTSTANDING": "在途互换"}, limit=120),
         },
         {
             "key": "economy",
@@ -18676,18 +28647,34 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                 (
                     "reverse_repo_results",
                     {"limit": 120},
-                    _store_fed_balance_sheet_component_observations,
+                    _store_operations_ny_fed_observations,
+                ),
+                (
+                    "treasury_purchases",
+                    {"limit": 100},
+                    _store_operations_ny_fed_observations,
                 ),
                 (
                     "standing_repo_results",
-                    {"limit": 240},
-                    _store_subsurface_ny_fed_observations,
+                    {"limit": 240, "strict": True},
+                    _store_operations_ny_fed_observations,
                 ),
-                ("soma_summary", {"limit": 260}),
+                (
+                    "soma_summary",
+                    {"limit": 260},
+                    _store_operations_ny_fed_observations,
+                ),
                 (
                     "usd_fx_swaps",
-                    {"limit": 500},
-                    _store_subsurface_ny_fed_observations,
+                    {
+                        "start_date": "2007-01-01",
+                        "end_date": timezone.now()
+                        .astimezone(ZoneInfo("America/New_York"))
+                        .date()
+                        .isoformat(),
+                        "date_type": "trade",
+                    },
+                    _store_global_dollar_swap_observations,
                 ),
             ),
         ),
@@ -18791,7 +28778,10 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
                 persist = persist_override[0] if persist_override else store_series_observations
                 run = record_provider_result(result, persist=persist)
                 runs.append(run)
-                if method_name != "treasury_bill_rates_13w_coupon_equivalent":
+                if method_name not in {
+                    "treasury_bill_rates_13w_coupon_equivalent",
+                    "treasury_purchases",
+                }:
                     liquidity_trigger_runs.append(run)
     finally:
         for provider, _ in providers:
@@ -18900,6 +28890,26 @@ def refresh_official_data(*, current_year: int | None = None) -> dict[str, Any]:
     )
     dashboards.extend(subsurface_dashboards)
     stale_dashboard_keys |= stale_subsurface_keys
+    operations_dashboards, stale_operations_keys = (
+        _coordinate_operations_dashboard(runs)
+    )
+    dashboards.extend(operations_dashboards)
+    stale_dashboard_keys |= stale_operations_keys
+    assets_fx_dashboards, stale_assets_fx_keys = (
+        _coordinate_assets_fx_dashboard(runs)
+    )
+    dashboards.extend(assets_fx_dashboards)
+    stale_dashboard_keys |= stale_assets_fx_keys
+    global_dollar_dashboards, stale_global_dollar_keys = (
+        _coordinate_global_dollar_dashboard(runs)
+    )
+    dashboards.extend(global_dollar_dashboards)
+    stale_dashboard_keys |= stale_global_dollar_keys
+    transmission_dashboards, stale_transmission_keys = (
+        _coordinate_transmission_chain_dashboard(runs)
+    )
+    dashboards.extend(transmission_dashboards)
+    stale_dashboard_keys |= stale_transmission_keys
     auction_dashboards, stale_auction_keys = _coordinate_auction_dashboard(
         runs
     )
@@ -19026,6 +29036,10 @@ def refresh_h41_data() -> dict[str, Any]:
         _coordinate_reserves_dashboard([run])
     )
     dashboards.extend(reserves_dashboards)
+    transmission_dashboards, stale_transmission_keys = (
+        _coordinate_transmission_chain_dashboard([run])
+    )
+    dashboards.extend(transmission_dashboards)
     liquidity_dashboards, stale_liquidity_keys = (
         _coordinate_liquidity_dashboard([run])
     )
@@ -19046,6 +29060,7 @@ def refresh_h41_data() -> dict[str, Any]:
             stale_fed_balance_keys
             | stale_reserves_keys
             | stale_liquidity_keys
+            | stale_transmission_keys
         ),
     }
 
@@ -19072,6 +29087,11 @@ def refresh_h8_data() -> dict[str, Any]:
     }
     run.save(update_fields=["metadata", "updated_at"])
     dashboards, stale_keys = _coordinate_reserves_dashboard([run])
+    transmission_dashboards, stale_transmission_keys = (
+        _coordinate_transmission_chain_dashboard([run])
+    )
+    dashboards.extend(transmission_dashboards)
+    stale_keys |= stale_transmission_keys
     return {
         "runs": [
             {
@@ -19122,6 +29142,10 @@ def refresh_prates_data() -> dict[str, Any]:
         _coordinate_subsurface_dashboard([run])
     )
     dashboards.extend(subsurface_dashboards)
+    transmission_dashboards, stale_transmission_keys = (
+        _coordinate_transmission_chain_dashboard([run])
+    )
+    dashboards.extend(transmission_dashboards)
     return {
         "runs": [
             {
@@ -19139,6 +29163,7 @@ def refresh_prates_data() -> dict[str, Any]:
             | stale_liquidity_keys
             | stale_rate_spread_keys
             | stale_subsurface_keys
+            | stale_transmission_keys
         ),
     }
 
@@ -19152,11 +29177,17 @@ def refresh_h10_data() -> dict[str, Any]:
         run = record_provider_result(result, persist=_store_h10_observations)
     finally:
         provider.close()
-    dashboards = (
-        publish_official_dashboards(keys=H10_PUBLICATION_KEYS)
-        if _has_publishable_run([run])
-        else []
+    dashboards, stale_assets_fx_keys = _coordinate_assets_fx_dashboard(
+        [run]
     )
+    global_dollar_dashboards, stale_global_dollar_keys = (
+        _coordinate_global_dollar_dashboard([run])
+    )
+    dashboards.extend(global_dollar_dashboards)
+    transmission_dashboards, stale_transmission_keys = (
+        _coordinate_transmission_chain_dashboard([run])
+    )
+    dashboards.extend(transmission_dashboards)
     return {
         "runs": [
             {
@@ -19169,6 +29200,11 @@ def refresh_h10_data() -> dict[str, Any]:
             }
         ],
         "dashboard_keys": [dashboard.key for dashboard in dashboards],
+        "stale_dashboard_keys": sorted(
+            stale_assets_fx_keys
+            | stale_global_dollar_keys
+            | stale_transmission_keys
+        ),
     }
 
 

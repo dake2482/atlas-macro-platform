@@ -19,6 +19,7 @@ from research.official_data import (
     RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS,
     _coordinate_reserves_dashboard,
     _coordinate_reserves_rate_spreads_dashboard,
+    _reserves_rate_spreads_snapshot_contract_is_valid,
     _store_h8_observations,
     _store_h41_observations,
     select_public_reserves_rate_spreads_snapshot,
@@ -345,6 +346,60 @@ def test_rate_spreads_coordinator_publishes_then_retains_stale_on_latest_failure
 
 
 @pytest.mark.django_db
+def test_rate_spreads_strict_rebuild_rejects_exact_observation_tamper_when_expired(
+    monkeypatch,
+):
+    runs = _record_rate_runs()
+    dashboards, stale = _coordinate_reserves_rate_spreads_dashboard(
+        [runs["tbill"]]
+    )
+    assert stale == set()
+    snapshot = dashboards[0]
+    assert _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+    )
+
+    expired_now = FIXED_NOW + timedelta(days=10)
+    monkeypatch.setattr(
+        "research.official_data.timezone.now", lambda: expired_now
+    )
+    assert not _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+    )
+    assert _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+        allow_expired=True,
+    )
+
+    sofr_observation = Observation.objects.filter(
+        series__key="sofr",
+        batch_id=runs["sofr"].batch_id,
+    ).latest("value_date", "id")
+    original_value = sofr_observation.value
+    sofr_observation.value = original_value + Decimal("0.01")
+    sofr_observation.save(update_fields=["value", "updated_at"])
+    assert not _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+        allow_expired=True,
+    )
+
+    sofr_observation.value = original_value
+    sofr_observation.fetched_at = expired_now + timedelta(minutes=1)
+    sofr_observation.save(
+        update_fields=["value", "fetched_at", "updated_at"]
+    )
+    assert not _reserves_rate_spreads_snapshot_contract_is_valid(
+        snapshot,
+        selected_runs=runs,
+        allow_expired=True,
+    )
+
+
+@pytest.mark.django_db
 def test_rate_spreads_public_selector_rechecks_current_source_licence():
     runs = _record_rate_runs()
     _coordinate_reserves_rate_spreads_dashboard([runs["tbill"]])
@@ -423,7 +478,7 @@ def test_rate_spreads_rejects_regressed_common_date_and_retains_previous(
 
 
 @pytest.mark.django_db
-def test_rate_spreads_duplicate_trigger_and_same_value_recovery_are_idempotent():
+def test_rate_spreads_duplicate_is_idempotent_and_same_value_recovery_appends():
     initial = _record_rate_runs()
     _coordinate_reserves_rate_spreads_dashboard([initial["tbill"]])
     snapshot = DashboardSnapshot.objects.get(key="reserves-rate-spreads")
@@ -452,30 +507,35 @@ def test_rate_spreads_duplicate_trigger_and_same_value_recovery_are_idempotent()
         [recovered["tbill"]]
     )
 
-    assert dashboards == []
+    assert len(dashboards) == 1
     assert stale == set()
+    recovered_snapshot = dashboards[0]
     snapshot.refresh_from_db()
-    assert DashboardSnapshot.objects.filter(key="reserves-rate-spreads").count() == 1
+    assert DashboardSnapshot.objects.filter(key="reserves-rate-spreads").count() == 2
     assert snapshot.pk == identity["snapshot_pk"]
     assert snapshot.batch_id == identity["snapshot_batch"]
-    assert snapshot.data["fingerprint"] == identity["fingerprint"]
-    assert snapshot.quality_status == Observation.Quality.ESTIMATED
-    assert "refresh_failure" not in snapshot.data
+    assert snapshot.quality_status == Observation.Quality.STALE
+    assert "refresh_failure" in snapshot.data
+    assert recovered_snapshot.pk != identity["snapshot_pk"]
+    assert recovered_snapshot.batch_id != identity["snapshot_batch"]
+    assert recovered_snapshot.data["fingerprint"] == identity["fingerprint"]
+    assert recovered_snapshot.quality_status == Observation.Quality.ESTIMATED
+    assert "refresh_failure" not in recovered_snapshot.data
     recovered_batches = {str(run.batch_id) for run in recovered.values()}
-    assert set(snapshot.data["component_batches"]) == recovered_batches
+    assert set(recovered_snapshot.data["component_batches"]) == recovered_batches
     assert {
-        item["batch_id"] for item in snapshot.data["input_datasets"]
+        item["batch_id"] for item in recovered_snapshot.data["input_datasets"]
     } == recovered_batches
-    metric_rows = list(_rate_metric_rows(snapshot))
+    metric_rows = list(_rate_metric_rows(recovered_snapshot))
     assert len(metric_rows) == len(RESERVES_RATE_SPREADS_REQUIRED_METRIC_KEYS)
-    assert {item.pk for item in metric_rows} == set(identity["metric_pks"])
-    assert {item.batch_id for item in metric_rows} == {snapshot.batch_id}
+    assert {item.pk for item in metric_rows} != set(identity["metric_pks"])
+    assert {item.batch_id for item in metric_rows} == {recovered_snapshot.batch_id}
     assert set().union(
         *(set(item.metadata["input_batch_ids"]) for item in metric_rows)
     ) == recovered_batches
-    assert not MetricSnapshot.objects.filter(
+    assert MetricSnapshot.objects.filter(
         key__startswith="reserves-rate-spreads-"
-    ).exclude(batch_id=snapshot.batch_id).exists()
+    ).exclude(batch_id=recovered_snapshot.batch_id).exists()
 
 
 @pytest.mark.django_db

@@ -268,7 +268,7 @@ def test_fed_balance_sheet_v1_publishes_exact_common_contract(
 
 
 @pytest.mark.django_db
-def test_latest_failure_retains_stale_then_same_value_recovery_is_in_place(
+def test_latest_failure_retains_stale_then_same_value_recovery_appends_revision(
     client, monkeypatch
 ):
     snapshot, original_runs = _publish_complete(monkeypatch)
@@ -309,30 +309,34 @@ def test_latest_failure_retains_stale_then_same_value_recovery_is_in_place(
         recovered.values()
     )
     snapshot.refresh_from_db()
-    assert dashboards == [] and stale == set()
-    assert snapshot.pk == original_id
+    assert len(dashboards) == 1 and stale == set()
+    recovered_snapshot = dashboards[0]
+    assert recovered_snapshot.pk != original_id
+    assert recovered_snapshot.batch_id != original_batch
+    assert recovered_snapshot.data["fingerprint"] == original_fingerprint
+    assert "refresh_failure" not in recovered_snapshot.data
+    assert snapshot.data["refresh_failure"] == retained_failure
     assert snapshot.batch_id == original_batch
-    assert snapshot.data["fingerprint"] == original_fingerprint
-    assert "refresh_failure" not in snapshot.data
-    assert set(snapshot.data["component_batches"]) == {
+    assert set(recovered_snapshot.data["component_batches"]) == {
         str(run.batch_id) for run in recovered.values()
     }
     normalized = MetricSnapshot.objects.get(
-        key="fed-balance-sheet-net-liquidity", batch_id=original_batch
+        key="fed-balance-sheet-net-liquidity",
+        batch_id=recovered_snapshot.batch_id,
     )
     assert set(normalized.metadata["input_batch_ids"]) == {
         str(recovered[key].batch_id) for key in ("h41", "onrrp", "tga")
     }
 
-    unchanged = deepcopy(snapshot.data)
-    unchanged_updated_at = snapshot.updated_at
+    unchanged = deepcopy(recovered_snapshot.data)
+    unchanged_updated_at = recovered_snapshot.updated_at
     dashboards, stale = _coordinate_fed_balance_sheet_dashboard(
         recovered.values()
     )
-    snapshot.refresh_from_db()
+    recovered_snapshot.refresh_from_db()
     assert dashboards == [] and stale == set()
-    assert snapshot.data == unchanged
-    assert snapshot.updated_at == unchanged_updated_at
+    assert recovered_snapshot.data == unchanged
+    assert recovered_snapshot.updated_at == unchanged_updated_at
 
 
 @pytest.mark.django_db

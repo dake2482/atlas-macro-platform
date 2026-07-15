@@ -505,7 +505,7 @@ def test_fed_funds_uses_latest_nonfuture_three_way_common_date(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_other_policy_pages_align_direct_cards_and_history(monkeypatch):
+def test_generic_policy_publisher_never_builds_legacy_transmission(monkeypatch):
     runs = _fed_funds_runs(future_iorb=Decimal("3.40"))
     _assert_successful_runs(runs)
     monkeypatch.setattr(
@@ -513,17 +513,8 @@ def test_other_policy_pages_align_direct_cards_and_history(monkeypatch):
     )
 
     dashboards = publish_official_dashboards(keys={"transmission-chain"})
-    pages = {item.key: item.data for item in dashboards}
 
-    metrics = {
-        item["key"]: item for item in pages["transmission-chain"]["metrics"]
-    }
-    assert metrics["sofr"]["value_date"].startswith("2026-07-09")
-    assert metrics["iorb"]["value_date"].startswith("2026-07-09")
-    assert metrics["iorb"]["display_value"] == "3.65%"
-    transmission_rows = pages["transmission-chain"]["charts"][0]["data"]
-    assert max(row["date"] for row in transmission_rows) == "2026-07-09"
-    assert all({"SOFR", "EFFR", "IORB"} <= set(row) for row in transmission_rows)
+    assert dashboards == []
 
 
 @pytest.mark.django_db
@@ -750,6 +741,10 @@ def test_refresh_prates_entrypoint_coordinates_fed_funds(monkeypatch):
     )
     monkeypatch.setattr(
         "research.official_data._coordinate_subsurface_dashboard",
+        lambda runs: ([], set()),
+    )
+    monkeypatch.setattr(
+        "research.official_data._coordinate_transmission_chain_dashboard",
         lambda runs: ([], set()),
     )
 

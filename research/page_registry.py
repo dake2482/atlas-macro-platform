@@ -106,16 +106,45 @@ PAGE_CONFIGS = {
         "analysis": "油价反弹而黄金回落，短线更像增长/供给交易，尚未形成全面通胀冲击。",
     },
     "assets-fx": {
-        "title": "外汇",
-        "eyebrow": "Global Dollar",
-        "description": "美元指数、主要货币和离岸融资压力共同定义全球美元环境。",
-        "metrics": [
-            metric("DXY", "104.31", "+0.12%"),
-            metric("EUR/USD", "1.0824", "-0.08%"),
-            metric("USD/JPY", "157.12", "+0.34%"),
-            metric("USD/CNH", "7.284", "+0.10%"),
+        "title": "H.10 外汇参考",
+        "eyebrow": "Federal Reserve H.10 References",
+        "description": (
+            "仅展示 Federal Reserve H.10 Nominal Broad Dollar Index 与 "
+            "EUR/USD、USD/CNY、USD/JPY 日频参考值。它们不是 ICE DXY、"
+            "CNH、可执行现货、远期/NDF 或 cross-currency basis。"
+        ),
+        "snapshot_contract_version": 1,
+        "period_options": [
+            {"value": "3m", "label": "3 个月", "months": 3},
+            {"value": "1y", "label": "1 年", "months": 12},
+            {"value": "3y", "label": "3 年", "months": 36},
         ],
-        "analysis": "美元温和偏强，日元仍是潜在波动源。若离岸基差同步走弱，风险资产压力会被放大。",
+        "default_period": "1y",
+        "tab_options": [
+            {
+                "value": "broad-dollar",
+                "label": "Broad Dollar",
+                "chart_keys": ["fx-broad-dollar-history"],
+            },
+            {
+                "value": "major-fx",
+                "label": "Major FX",
+                "chart_keys": [
+                    "fx-major-reference-rates-usd-strength-rebased"
+                ],
+            },
+        ],
+        "default_tab": "broad-dollar",
+        "metrics": [
+            metric("H.10 Nominal Broad Dollar Index"),
+            metric("H.10 EUR/USD Reference"),
+            metric("H.10 USD/CNY Reference"),
+            metric("H.10 USD/JPY Reference"),
+        ],
+        "analysis": (
+            "只陈述 H.10 官方参考 level 和 Atlas Macro 透明变化/重基准计算；"
+            "不生成离岸美元压力分数、交易行动或市场报价。"
+        ),
     },
     "assets-crypto": {
         "title": "加密货币",
@@ -313,18 +342,32 @@ PAGE_CONFIGS = {
         ),
     },
     "transmission-chain": {
-        "title": "美元流动性传导链",
-        "eyebrow": "Six-Layer Pressure Index",
-        "description": "能源、离岸美元、在岸 Repo、银行负债表、中介能力和资产反应六层评分。",
+        "title": "六层官方证据传导链",
+        "eyebrow": "Six-Layer Official Evidence Chain",
+        "description": (
+            "Federal Reserve、New York Fed 与 Treasury 官方输入"
+            "按六个独立时点组件原子组合；这是可追溯证据链，"
+            "不是压力指数、完整金融条件指数或交易信号。"
+        ),
+        "snapshot_contract_version": 1,
         "metrics": [
-            metric("总压力", "5.6 / 10", "+0.3"),
-            metric("能源", "4 / 10", "稳定"),
-            metric("离岸美元", "6 / 10", "偏紧"),
-            metric("Repo", "5 / 10", "缓冲下降"),
-            metric("银行负债表", "6 / 10", "收缩"),
-            metric("中介能力", "4 / 10", "正常"),
+            metric("净流动性透明代理"),
+            metric("美联储总资产"),
+            metric("ON RRP 常规操作"),
+            metric("SRF 常规操作"),
+            metric("SOFR−IORB"),
+            metric("SOFR−13 周 T-bill"),
+            metric("SOFR 99P−IORB"),
+            metric("SOFR 成交量 Z60"),
+            metric("准备金覆盖代理"),
+            metric("准备金覆盖 8 周变化"),
+            metric("H.10 广义美元 5 日变化"),
+            metric("常规美元互换余额"),
         ],
-        "analysis": "当前薄弱点是离岸美元与银行负债表的共振，尚未扩散为全面中介压力。",
+        "analysis": (
+            "页面只展示六个已审计组件的直接值、透明公式、"
+            "共享输入对账与数据/许可缺口；解释严格限于各组件的证据边界。"
+        ),
     },
     "fed-balance-sheet": {
         "title": "美联储资产负债表",
@@ -349,14 +392,17 @@ PAGE_CONFIGS = {
     "operations": {
         "title": "公开市场操作",
         "eyebrow": "Open Market Operations",
-        "description": "RMP、SOMA、SRF 和最近操作记录。",
-        "metrics": [
-            metric("当日 RMP", "$0.0B", "无操作", source="NY Fed"),
-            metric("30D 累计", "$18.4B", "+$2.1B"),
-            metric("SRF", "$0.0B", "未使用"),
-            metric("SOMA", "$6.74T", "周 -$9B"),
-        ],
-        "analysis": "常备工具未激活，Repo 压力仍属于价格波动而非硬约束。",
+        "description": (
+            "纽约联储国债二级市场购买、ON RRP、SRF 与 SOMA "
+            "只在同刷新周期的四个精确批次齐备时发布。"
+        ),
+        "snapshot_contract_version": 1,
+        "metrics": [],
+        "analysis": (
+            "国债购买结果同时覆盖 RMP、本金再投资与可能未分类的"
+            "操作演练；官方 feed 没有稳定用途或 small-value 字段，"
+            "因此不发布伪精确 RMP-only 数据。"
+        ),
     },
     "rrp-tga": {
         "title": "RRP 与 TGA",
@@ -429,15 +475,27 @@ PAGE_CONFIGS = {
     },
     "global-dollar": {
         "title": "全球美元",
-        "eyebrow": "Offshore Funding",
-        "description": "跨币种基差、美元指数与央行互换衡量离岸融资压力。",
+        "eyebrow": "Official USD Reference & Swap Backstop",
+        "description": (
+            "Federal Reserve H.10 日频参考序列与 New York Fed 央行"
+            "美元流动性互换按两个异频 exact batch 发布。"
+        ),
+        "snapshot_contract_version": 1,
         "metrics": [
-            metric("USD/JPY 3M basis", "-34bp", "-6bp", source="授权 basis 适配器"),
-            metric("USD/CNH 3M basis", "-91bp", "-12bp", source="授权 basis 适配器"),
-            metric("EUR/USD 3M basis", "+4bp", "+1bp"),
-            metric("央行互换", "$0.12B", "+$0.02B"),
+            metric("Nominal Broad Dollar Index"),
+            metric("Broad Dollar 5D Change"),
+            metric("EUR/USD H.10 Reference"),
+            metric("USD/CNY H.10 Reference"),
+            metric("USD/JPY H.10 Reference"),
+            metric("USD Liquidity Swaps Outstanding"),
+            metric("Regular USD Swaps Outstanding"),
+            metric("Technical-Test USD Swaps Outstanding"),
+            metric("Active Regular Counterparties"),
         ],
-        "analysis": "亚洲美元融资偏紧，若 USD/CNH 基差继续走弱，应降低高杠杆风险敞口。",
+        "analysis": (
+            "本页不是 ICE DXY、可交易现货/远期或跨币种基差，"
+            "也不合成离岸美元压力分数、交易信号或行动建议。"
+        ),
     },
     "subsurface": {
         "title": "次表层资金流",

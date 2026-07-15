@@ -34,6 +34,15 @@ from research.services import (
 )
 
 TODAY = date(2026, 7, 13)
+FROZEN_OFFICIAL_DATA_NOW = datetime(2026, 7, 14, 10, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_official_data_now(monkeypatch):
+    monkeypatch.setattr(
+        "research.official_data.timezone.now",
+        lambda: FROZEN_OFFICIAL_DATA_NOW,
+    )
 
 
 def _auction_row(**overrides):

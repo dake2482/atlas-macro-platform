@@ -59,6 +59,16 @@ REAL_VALUES = {
     "20y": Decimal("2.45"),
     "30y": Decimal("2.50"),
 }
+TREASURY_CANONICAL_FEED_IDS = {
+    "daily_treasury_yield_curve": (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/pages/xml-item?data=daily_treasury_yield_curve"
+    ),
+    "daily_treasury_real_yield_curve": (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/pages/xml-item?data=daily_treasury_real_yield_curve"
+    ),
+}
 
 
 @pytest.fixture(autouse=True)
@@ -219,7 +229,7 @@ def _xml_curve_payload(
         else "daily_treasury_real_yield_curve"
     )
     title = title_override or TreasuryRatesProvider.CURVE_TITLES[curve]
-    feed_id = feed_id_override or f"https://home.treasury.gov/xml-item?data={curve}"
+    feed_id = feed_id_override or TREASURY_CANONICAL_FEED_IDS[curve]
     return (
         '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom" '
         'xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata" '
@@ -232,9 +242,12 @@ def _xml_curve_payload(
     )
 
 
-def _provider(payload: str) -> TreasuryRatesProvider:
+def _provider(
+    payload: str,
+    provider_class: type[TreasuryRatesProvider] = TreasuryRatesProvider,
+) -> TreasuryRatesProvider:
     client = httpx.Client(
-        base_url="https://home.treasury.gov",
+        base_url=provider_class.base_url,
         transport=httpx.MockTransport(
             lambda _request: httpx.Response(
                 200,
@@ -243,7 +256,7 @@ def _provider(payload: str) -> TreasuryRatesProvider:
             )
         ),
     )
-    return TreasuryRatesProvider(client=client)
+    return provider_class(client=client)
 
 
 def _curve_provider_result(component: str, year: int) -> ProviderResult:
@@ -1013,7 +1026,68 @@ def test_treasury_provider_rejects_feed_and_field_contract_drift():
     )
     assert "feed id" in _provider(evil_feed_id).yield_curve(year=2026).error
 
+    legacy_shortcut_feed_id = _xml_curve_payload(
+        component="nominal",
+        entries=[("2026-07-10", fields)],
+        feed_id_override=(
+            "https://home.treasury.gov/xml-item?data=daily_treasury_yield_curve"
+        ),
+    )
+    assert "feed id" in _provider(legacy_shortcut_feed_id).yield_curve(year=2026).error
+
     assert "outside the supported" in _provider(wrong_type).yield_curve(year=1989).error
+
+
+@pytest.mark.parametrize(
+    ("component", "method_name"),
+    (("nominal", "yield_curve"), ("real", "real_yield_curve")),
+)
+def test_treasury_curve_feed_identity_is_independent_of_transport_origin(
+    component,
+    method_name,
+):
+    class MirrorTreasuryProvider(TreasuryRatesProvider):
+        base_url = "https://mirror.invalid"
+
+    field_map = (
+        TreasuryRatesProvider.NOMINAL_FIELDS
+        if component == "nominal"
+        else TreasuryRatesProvider.REAL_FIELDS
+    )
+    values = NOMINAL_VALUES if component == "nominal" else REAL_VALUES
+    prefix = "UST-" if component == "nominal" else "TIPS-"
+    fields = {
+        field: str(values[series_id.removeprefix(prefix).lower()])
+        for field, series_id in field_map.items()
+    }
+    canonical_payload = _xml_curve_payload(
+        component=component,
+        entries=[("2026-07-10", fields)],
+    )
+    canonical_result = getattr(
+        _provider(canonical_payload, MirrorTreasuryProvider),
+        method_name,
+    )(year=2026)
+    assert canonical_result.ok, canonical_result.error
+
+    curve = (
+        "daily_treasury_yield_curve"
+        if component == "nominal"
+        else "daily_treasury_real_yield_curve"
+    )
+    mirror_payload = _xml_curve_payload(
+        component=component,
+        entries=[("2026-07-10", fields)],
+        feed_id_override=(
+            "https://mirror.invalid/resource-center/data-chart-center/"
+            f"interest-rates/pages/xml-item?data={curve}"
+        ),
+    )
+    mirror_result = getattr(
+        _provider(mirror_payload, MirrorTreasuryProvider),
+        method_name,
+    )(year=2026)
+    assert "feed id" in mirror_result.error
 
 
 @pytest.mark.django_db

@@ -18,8 +18,12 @@ from research.models import (
 )
 from research.services import ensure_source
 from research.thesis_publication import (
+    DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS,
     DAILY_EVIDENCE_COMPONENT_KEYS,
+    DAILY_EVIDENCE_CONTRACT_VERSION,
+    DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION,
     DAILY_EVIDENCE_PREFERRED_METRICS,
+    DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS,
     component_data_fingerprint,
     component_reference_fingerprint,
     daily_evidence_component_set_fingerprint,
@@ -36,8 +40,13 @@ def build_daily_components(
     marker: str,
     *,
     now: datetime | None = None,
+    component_contract_versions: dict[str, int] | None = None,
 ) -> tuple[list[DashboardSnapshot], list[MetricSnapshot]]:
     current_time = now or timezone.now()
+    versions = component_contract_versions or {
+        page_key: DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION
+        for page_key in DAILY_EVIDENCE_COMPONENT_KEYS
+    }
     source = ensure_source("internal")
     components: list[DashboardSnapshot] = []
     metrics: list[MetricSnapshot] = []
@@ -47,6 +56,28 @@ def build_daily_components(
         raw_metric_key = DAILY_EVIDENCE_PREFERRED_METRICS[page_key]
         fingerprint = _fingerprint(f"{marker}-{page_key}")
         fresh_until = current_time + timedelta(days=1)
+        component_data = {
+            "demo": False,
+            "contract_version": versions[page_key],
+            "publication_batch_id": str(batch_id),
+            "fingerprint": fingerprint,
+            "component_batches": [str(component_batch_id)],
+            "source_keys": [source.key],
+            "fresh_until": fresh_until.isoformat(),
+        }
+        if versions == DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS:
+            component_data.update(
+                {
+                    "formula_version": DAILY_EVIDENCE_V2_STRICT_FORMULA_VERSIONS.get(
+                        page_key,
+                        f"fixture-{page_key}-v{versions[page_key]}",
+                    ),
+                    "payload_integrity_hash": _fingerprint(
+                        f"{marker}-{page_key}-payload"
+                    ),
+                    "test_daily_component": True,
+                }
+            )
         component = DashboardSnapshot.objects.create(
             key=page_key,
             title=f"{marker} {page_key}",
@@ -54,15 +85,7 @@ def build_daily_components(
             batch_id=batch_id,
             quality_status=Observation.Quality.ESTIMATED,
             summary="Verified component fixture",
-            data={
-                "demo": False,
-                "contract_version": 1,
-                "publication_batch_id": str(batch_id),
-                "fingerprint": fingerprint,
-                "component_batches": [str(component_batch_id)],
-                "source_keys": [source.key],
-                "fresh_until": fresh_until.isoformat(),
-            },
+            data=component_data,
             source=source,
             is_published=True,
         )
@@ -138,39 +161,63 @@ def build_daily_evidence(
     marker: str,
     *,
     now: datetime | None = None,
+    contract_version: int = DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION,
 ) -> tuple[DashboardSnapshot, list[MetricSnapshot]]:
     current_time = now or timezone.now()
     source = ensure_source("internal")
-    components, metrics = build_daily_components(marker, now=current_time)
+    component_versions = (
+        DAILY_EVIDENCE_COMPONENT_CONTRACT_VERSIONS
+        if contract_version == DAILY_EVIDENCE_CONTRACT_VERSION
+        else {
+            page_key: DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION
+            for page_key in DAILY_EVIDENCE_COMPONENT_KEYS
+        }
+    )
+    components, metrics = build_daily_components(
+        marker,
+        now=current_time,
+        component_contract_versions=component_versions,
+    )
 
     component_references = []
     for component in components:
         reference = {
             "page_key": component.key,
             "demo": False,
-            "contract_version": 1,
+            "contract_version": component.data["contract_version"],
             "snapshot_id": component.pk,
             "publication_batch_id": str(component.batch_id),
             "fingerprint": component.data["fingerprint"],
             "as_of": component.as_of.isoformat(),
             "quality_status": component.quality_status,
             "source_key": component.source.key,
-            "component_batches": [
-                str(component.batch_id),
-                *component.data["component_batches"],
-            ],
+            "component_batches": sorted(
+                [
+                    str(component.batch_id),
+                    *component.data["component_batches"],
+                ]
+            ),
             "source_keys": [component.source.key],
             "fresh_until": component.data["fresh_until"],
             "metrics": component.data["metrics"],
             "component_data_sha256": component_data_fingerprint(component.data),
         }
+        if contract_version == DAILY_EVIDENCE_CONTRACT_VERSION:
+            reference.update(
+                {
+                    "formula_version": component.data.get("formula_version"),
+                    "payload_integrity_hash": component.data.get(
+                        "payload_integrity_hash"
+                    ),
+                }
+            )
         reference["component_payload_sha256"] = component_reference_fingerprint(reference)
         component_references.append(reference)
 
     parent_batch = uuid.uuid4()
     parent_data = {
         "demo": False,
-        "contract_version": 1,
+        "contract_version": contract_version,
         "publication_batch_id": str(parent_batch),
         "research_date": timezone.localdate(current_time).isoformat(),
         "required_components": list(DAILY_EVIDENCE_COMPONENT_KEYS),
@@ -234,6 +281,7 @@ def build_complete_thesis(
     report_date=None,
     now: datetime | None = None,
     publish: bool = True,
+    evidence_contract_version: int = DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION,
 ) -> Thesis:
     if now is None and report_date is not None:
         current_time = timezone.make_aware(
@@ -243,7 +291,11 @@ def build_complete_thesis(
     else:
         current_time = now or timezone.now()
     report_date = report_date or timezone.localdate(current_time)
-    snapshot, metrics = build_daily_evidence(marker, now=current_time)
+    snapshot, metrics = build_daily_evidence(
+        marker,
+        now=current_time,
+        contract_version=evidence_contract_version,
+    )
     thesis = Thesis.objects.create(
         date=report_date,
         regime=marker,

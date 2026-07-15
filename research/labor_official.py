@@ -22,6 +22,7 @@ import httpx
 from pypdf import PdfReader
 
 from .providers import HTTPProvider, ProviderResult
+from .raw_evidence import EvidenceResponse, build_evidence_bundle, parse_evidence_bundle
 
 HISTORY_URL = "https://oui.doleta.gov/unemploy/wkclaims/report.asp"
 CURRENT_RELEASE_URL = "https://www.dol.gov/ui/data.pdf"
@@ -369,27 +370,153 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
         data: dict[str, str] | None = None,
         allowed_hosts: frozenset[str],
         maximum: int,
-    ) -> tuple[bytes | None, ProviderResult | None]:
+    ) -> tuple[bytes | None, dict[str, str] | None, ProviderResult | None]:
         try:
             response = self.client.request(method, url, data=data)
             response.raise_for_status()
         except httpx.HTTPError as exc:
-            return None, ProviderResult.failure(
+            return None, None, ProviderResult.failure(
                 self.key, dataset, f"{type(exc).__name__}: {exc}"
             )
         host = (urlparse(str(response.url)).hostname or "").lower()
         if host not in allowed_hosts:
-            return None, ProviderResult.failure(
+            return None, None, ProviderResult.failure(
                 self.key, dataset, f"unexpected redirect host: {host}"
             )
         content = bytes(response.content)
         if not content or len(content) > maximum:
-            return None, ProviderResult.failure(
+            return None, None, ProviderResult.failure(
                 self.key,
                 dataset,
                 f"invalid response size: {len(content)} bytes",
             )
-        return content, None
+        content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+        if not content_type:
+            content_type = "application/pdf" if url.lower().endswith(".pdf") else "application/xml"
+        return content, {
+            "content_type": content_type,
+            "last_modified": response.headers.get("last-modified", ""),
+        }, None
+
+    @classmethod
+    def replay_evidence_bundle(
+        cls,
+        raw_bytes: bytes,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        evidence = parse_evidence_bundle(
+            raw_bytes,
+            expected_provider=cls.key,
+            expected_dataset="national-weekly-claims",
+        )
+        entries = {
+            item["role"]: item for item in evidence.manifest["responses"]
+        }
+        history_roles: dict[int, str] = {}
+        for role in entries:
+            match = re.fullmatch(r"history-xml-(\d{4})", role)
+            if match:
+                history_roles[int(match.group(1))] = role
+        years = sorted(history_roles)
+        if (
+            not years
+            or years[0] < 1967
+            or years != list(range(years[0], years[-1] + 1))
+            or set(entries)
+            != {
+                *history_roles.values(),
+                "current-release-pdf",
+                "archive-release-pdf",
+            }
+        ):
+            raise ValueError("DOL evidence roles or requested years are incomplete")
+
+        history_records: list[dict[str, Any]] = []
+        history_run_dates: set[str] = set()
+        skipped_future_rows = 0
+        for year in years:
+            role = history_roles[year]
+            entry = entries[role]
+            expected_form = {
+                "level": "us",
+                "strtdate": str(year),
+                "enddate": str(year),
+                "filetype": "xml",
+            }
+            if (
+                entry["url"] != HISTORY_URL
+                or "xml" not in entry["content_type"].lower()
+                or entry["request_witness"]
+                != {"method": "POST", "form": expected_form}
+                or set(entry["response_witness"]) != {"last_modified"}
+            ):
+                raise ValueError("DOL annual history evidence contract is invalid")
+            year_records, year_metadata = parse_weekly_claims_history_xml(
+                evidence.responses[role]
+            )
+            if any(
+                date.fromisoformat(item["date"]).year != year
+                for item in year_records
+            ):
+                raise ValueError(
+                    f"DOL single-year response leaked observations outside {year}"
+                )
+            history_records.extend(year_records)
+            history_run_dates.add(str(year_metadata["xml_run_date"]))
+            skipped_future_rows += int(year_metadata["future_rows_skipped"])
+        if len(history_run_dates) != 1:
+            raise ValueError("DOL yearly XML responses have inconsistent run dates")
+        if len(
+            {(item["series_id"], item["date"]) for item in history_records}
+        ) != len(history_records):
+            raise ValueError("DOL yearly XML responses contain duplicate observations")
+
+        current_entry = entries["current-release-pdf"]
+        archive_entry = entries["archive-release-pdf"]
+        if (
+            current_entry["url"] != CURRENT_RELEASE_URL
+            or "pdf" not in current_entry["content_type"].lower()
+            or current_entry["request_witness"] != {"method": "GET"}
+            or set(current_entry["response_witness"]) != {"last_modified"}
+            or "pdf" not in archive_entry["content_type"].lower()
+            or archive_entry["request_witness"]
+            != {
+                "method": "GET",
+                "discovered_from": "current-release-pdf",
+            }
+            or set(archive_entry["response_witness"]) != {"last_modified"}
+        ):
+            raise ValueError("DOL release PDF evidence contract is invalid")
+        current_pdf = evidence.responses["current-release-pdf"]
+        archive_pdf = evidence.responses["archive-release-pdf"]
+        if current_pdf != archive_pdf:
+            raise ValueError("current DOL release and immutable archive bytes differ")
+        release_records, release_metadata = parse_weekly_claims_release_pdf(current_pdf)
+        archive_url = str(release_metadata["archive_url"])
+        if archive_entry["url"] != archive_url:
+            raise ValueError("DOL archive URL does not replay from current release")
+
+        merged = {
+            (item["series_id"], item["date"]): item for item in history_records
+        }
+        merged.update(
+            {(item["series_id"], item["date"]): item for item in release_records}
+        )
+        records = sorted(
+            merged.values(), key=lambda item: (item["date"], item["series_id"])
+        )
+        return records, {
+            "xml_run_date": next(iter(history_run_dates)),
+            "history_latest_week": max(
+                date.fromisoformat(item["date"]) for item in history_records
+            ).isoformat(),
+            "future_rows_skipped": skipped_future_rows,
+            **release_metadata,
+            "requested_start_year": years[0],
+            "requested_end_year": years[-1],
+            "history_record_count": len(history_records),
+            "release_record_count": len(release_records),
+            "quality_status": "complete",
+        }
 
     def weekly_claims(self, *, start_year: int, end_year: int) -> ProviderResult:
         dataset = "national-weekly-claims"
@@ -399,6 +526,7 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
             )
         history_records: list[dict[str, Any]] = []
         history_artifacts: list[dict[str, Any]] = []
+        evidence_responses: list[EvidenceResponse] = []
         history_run_dates: set[str] = set()
         skipped_future_rows = 0
         # The legacy Informix query is substantially more reliable for a
@@ -412,11 +540,12 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
                 "filetype": "xml",
             }
             xml = None
+            xml_transport = None
             year_records = None
             year_metadata = None
             history_error = f"DOL history request failed for {year}"
             for _attempt in range(3):
-                xml, failure = self._bytes(
+                xml, xml_transport, failure = self._bytes(
                     dataset,
                     HISTORY_URL,
                     method="POST",
@@ -458,6 +587,19 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
                     "request": form,
                 }
             )
+            assert xml_transport is not None
+            evidence_responses.append(
+                EvidenceResponse(
+                    role=f"history-xml-{year}",
+                    url=HISTORY_URL,
+                    content_type=xml_transport["content_type"],
+                    raw_bytes=xml,
+                    request_witness={"method": "POST", "form": form},
+                    response_witness={
+                        "last_modified": xml_transport["last_modified"]
+                    },
+                )
+            )
         if len(history_run_dates) != 1:
             return ProviderResult.failure(
                 self.key,
@@ -470,15 +612,7 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
             return ProviderResult.failure(
                 self.key, dataset, "DOL yearly XML responses contain duplicate observations"
             )
-        history_metadata = {
-            "xml_run_date": next(iter(history_run_dates)),
-            "history_latest_week": max(
-                date.fromisoformat(item["date"]) for item in history_records
-            ).isoformat(),
-            "future_rows_skipped": skipped_future_rows,
-        }
-
-        current_pdf, failure = self._bytes(
+        current_pdf, current_transport, failure = self._bytes(
             dataset,
             CURRENT_RELEASE_URL,
             allowed_hosts=frozenset({"www.dol.gov", "dol.gov"}),
@@ -487,6 +621,7 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
         if failure:
             return failure
         assert current_pdf is not None
+        assert current_transport is not None
         try:
             release_records, release_metadata = parse_weekly_claims_release_pdf(
                 current_pdf
@@ -495,7 +630,7 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
             return ProviderResult.failure(self.key, dataset, str(exc))
 
         archive_url = str(release_metadata["archive_url"])
-        archive_pdf, failure = self._bytes(
+        archive_pdf, archive_transport, failure = self._bytes(
             dataset,
             archive_url,
             allowed_hosts=frozenset({"oui.doleta.gov"}),
@@ -504,38 +639,60 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
         if failure:
             return failure
         assert archive_pdf is not None
+        assert archive_transport is not None
         current_hash = hashlib.sha256(current_pdf).hexdigest()
         archive_hash = hashlib.sha256(archive_pdf).hexdigest()
-        if current_hash != archive_hash:
+        if current_pdf != archive_pdf or current_hash != archive_hash:
             return ProviderResult.failure(
                 self.key,
                 dataset,
                 "current DOL release and immutable archive hashes differ",
             )
-
-        merged = {
-            (item["series_id"], item["date"]): item for item in history_records
-        }
-        merged.update(
-            {(item["series_id"], item["date"]): item for item in release_records}
+        evidence_responses.extend(
+            (
+                EvidenceResponse(
+                    role="current-release-pdf",
+                    url=CURRENT_RELEASE_URL,
+                    content_type=current_transport["content_type"],
+                    raw_bytes=current_pdf,
+                    request_witness={"method": "GET"},
+                    response_witness={
+                        "last_modified": current_transport["last_modified"]
+                    },
+                ),
+                EvidenceResponse(
+                    role="archive-release-pdf",
+                    url=archive_url,
+                    content_type=archive_transport["content_type"],
+                    raw_bytes=archive_pdf,
+                    request_witness={
+                        "method": "GET",
+                        "discovered_from": "current-release-pdf",
+                    },
+                    response_witness={
+                        "last_modified": archive_transport["last_modified"]
+                    },
+                ),
+            )
         )
-        records = sorted(
-            merged.values(), key=lambda item: (item["date"], item["series_id"])
-        )
+        try:
+            raw_bundle, bundle_metadata = build_evidence_bundle(
+                provider=self.key,
+                dataset=dataset,
+                responses=evidence_responses,
+            )
+            records, replay_metadata = self.replay_evidence_bundle(raw_bundle)
+        except ValueError as exc:
+            return ProviderResult.failure(self.key, dataset, str(exc))
         metadata = {
-            **history_metadata,
-            **release_metadata,
-            "requested_start_year": start_year,
-            "requested_end_year": end_year,
-            "history_record_count": len(history_records),
-            "release_record_count": len(release_records),
-            "quality_status": "complete",
+            **bundle_metadata,
+            **replay_metadata,
             "artifacts": [
                 *history_artifacts,
                 {
                     "url": archive_url,
                     "sha256": archive_hash,
-                    "content_type": "application/pdf",
+                    "content_type": archive_transport["content_type"],
                     "size": len(archive_pdf),
                 },
             ],
@@ -545,5 +702,6 @@ class DOLWeeklyClaimsProvider(HTTPProvider):
             dataset=dataset,
             records=records,
             fetched_at=datetime.now(UTC),
+            raw_bytes=raw_bundle,
             metadata=metadata,
         )

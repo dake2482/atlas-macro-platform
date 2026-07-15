@@ -561,7 +561,7 @@ PAGE_CONFIGS = {
             "增长、就业、通胀与消费四个官方子页原子组合；每项分别保留"
             "有效日、抓取时间、输入批次、公式、许可与质量。"
         ),
-        "snapshot_contract_version": 1,
+        "snapshot_contract_version": 2,
         "period_options": [
             {"value": "1y", "label": "1 年", "months": 12},
             {"value": "3y", "label": "3 年", "months": 36},
@@ -604,18 +604,20 @@ PAGE_CONFIGS = {
         "title": "GDP",
         "eyebrow": "Growth Decomposition",
         "description": "实际 GDP、消费、投资、政府和净出口贡献。",
+        "snapshot_contract_version": 2,
         "metrics": [
-            metric("实际 GDP", "+2.1%", "环比年化", source="BEA / GDPC1"),
-            metric("消费贡献", "+1.4pp", "主引擎"),
-            metric("投资贡献", "+0.4pp", "改善"),
-            metric("净出口", "-0.2pp", "拖累"),
+            metric("实际 GDP 增速"),
+            metric("消费贡献"),
+            metric("投资贡献"),
+            metric("净出口贡献"),
         ],
-        "analysis": "消费仍支撑增长，但投资和库存的波动增加下一季度不确定性。",
+        "analysis": "只有当 BEA 原始证据、同批次观察、修订轮次与快照全部可重放时才发布。",
     },
     "employment": {
         "title": "就业",
         "eyebrow": "Labor Market",
         "description": "非农、失业率、时薪、职位空缺与初请共同判断供需平衡。",
+        "snapshot_contract_version": 2,
         "period_options": [
             {"value": "1y", "label": "1 年", "months": 12},
             {"value": "3y", "label": "3 年", "months": 36},
@@ -657,6 +659,7 @@ PAGE_CONFIGS = {
     "inflation": {
         "title": "通胀",
         "eyebrow": "Inflation Stack",
+        "snapshot_contract_version": 2,
         "description": (
             "使用 BLS 季调与未季调配对指数展示总体 CPI、核心 CPI 与最终需求"
             "PPI 的环比、同比及 3M/6M 年化动能，并加入 Shelter、核心商品与"
@@ -719,20 +722,28 @@ PAGE_CONFIGS = {
             metric("核心 CPI 6M 年化"),
             metric("住房成本 CPI（Shelter） 环比"),
             metric("住房成本 CPI（Shelter） 同比"),
+            metric("住房成本 CPI（Shelter） 3M 年化"),
+            metric("住房成本 CPI（Shelter） 6M 年化"),
             metric("核心商品 CPI 环比"),
             metric("核心商品 CPI 同比"),
+            metric("核心商品 CPI 3M 年化"),
+            metric("核心商品 CPI 6M 年化"),
             metric("服务 CPI（不含能源服务） 环比"),
             metric("服务 CPI（不含能源服务） 同比"),
+            metric("服务 CPI（不含能源服务） 3M 年化"),
+            metric("服务 CPI（不含能源服务） 6M 年化"),
             metric("最终需求 PPI 环比"),
             metric("最终需求 PPI 同比"),
             metric("最终需求 PPI 3M 年化"),
             metric("最终需求 PPI 6M 年化"),
             metric("PCE 价格指数 环比"),
             metric("PCE 价格指数 同比"),
+            metric("PCE 价格指数 3M 年化"),
+            metric("PCE 价格指数 6M 年化"),
             metric("核心 PCE 价格指数 环比"),
             metric("核心 PCE 价格指数 同比"),
-            metric("5Y 盈亏平衡通胀（Treasury 曲线代理）"),
-            metric("10Y 盈亏平衡通胀（Treasury 曲线代理）"),
+            metric("核心 PCE 价格指数 3M 年化"),
+            metric("核心 PCE 价格指数 6M 年化"),
         ],
         "analysis": (
             "当前只对通过同批完整性检查的 BLS、BEA PIO 与 Treasury/TIPS "
@@ -743,14 +754,69 @@ PAGE_CONFIGS = {
     "consumer": {
         "title": "消费",
         "eyebrow": "Household Demand",
-        "description": "零售、实际消费、储蓄率、信贷与消费者信心。",
-        "metrics": [
-            metric("零售销售", "+0.4%", "环比", source="Census"),
-            metric("实际 PCE", "+0.3%", "环比", source="BEA"),
-            metric("储蓄率", "3.9%", "-0.2pp"),
-            metric("消费者信心", "68.2", "+2.1"),
+        "snapshot_contract_version": 2,
+        "description": (
+            "Census MARTS 发布工作簿控制当前零售指标与可见尾部；"
+            "BEA PIO、Federal Reserve G.19 与 New York Fed HHDC 保留"
+            "独立批次和新鲜度。Census API 只在三序列重叠逐项一致时"
+            "扩展发布工作簿之前的历史。"
+        ),
+        "period_options": [
+            {"value": "1y", "label": "1 年", "months": 12},
+            {"value": "3y", "label": "3 年", "months": 36},
+            {"value": "5y", "label": "5 年", "months": 60},
         ],
-        "analysis": "消费仍有韧性但缓冲下降，低收入家庭的信用压力是领先风险。",
+        "default_period": "3y",
+        "tab_options": [
+            {"value": "overview", "label": "总览", "chart_keys": []},
+            {
+                "value": "retail",
+                "label": "零售",
+                "chart_keys": ["retail-sales"],
+            },
+            {
+                "value": "income",
+                "label": "消费与收入",
+                "chart_keys": [
+                    "real-consumption-income-momentum",
+                    "personal-saving-rate",
+                ],
+            },
+            {
+                "value": "credit",
+                "label": "消费信贷",
+                "chart_keys": ["consumer-credit-composition"],
+            },
+            {
+                "value": "debt",
+                "label": "家庭债务",
+                "chart_keys": [
+                    "household-debt-composition",
+                    "household-debt-delinquency",
+                ],
+            },
+        ],
+        "default_tab": "overview",
+        "metrics": [
+            metric("零售与餐饮服务"),
+            metric("零售环比"),
+            metric("零售同比"),
+            metric("实际 PCE 环比"),
+            metric("个人储蓄率"),
+            metric("实际可支配收入环比"),
+            metric("G.19 消费者信贷余额"),
+            metric("G.19 信贷增速"),
+            metric("循环信贷增速"),
+            metric("非循环信贷增速"),
+            metric("家庭债务余额"),
+            metric("信用卡余额"),
+            metric("全部债务 90+ 天逾期"),
+            metric("信用卡 90+ 天逾期"),
+        ],
+        "analysis": (
+            "页面仅展示通过原始证据、完整观测批次、许可与重放"
+            "校验的四源官方数据；不用总量指标推断收入群体压力。"
+        ),
     },
     "volatility": {
         "title": "波动率数据覆盖",

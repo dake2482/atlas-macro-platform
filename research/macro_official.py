@@ -17,16 +17,19 @@ Official references:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from .providers import HTTPProvider, ProviderResult
+from .raw_evidence import EvidenceResponse, build_evidence_bundle, parse_evidence_bundle
 
 BEA_ATTRIBUTION_NOTICE = (
     "This product uses the Bureau of Economic Analysis (BEA) Data API "
@@ -36,6 +39,30 @@ CENSUS_ATTRIBUTION_NOTICE = (
     "This product uses the Census Bureau Data API but is not endorsed or "
     "certified by the Census Bureau."
 )
+CENSUS_MARTS_ENDPOINT = "https://api.census.gov/data/timeseries/eits/marts"
+CENSUS_MARTS_FIELDS = (
+    "program_code",
+    "cell_value",
+    "time_slot_id",
+    "time_slot_date",
+    "time_slot_name",
+    "error_data",
+    "seasonally_adj",
+    "category_code",
+    "data_type_code",
+)
+CENSUS_MARTS_RESPONSE_HEADERS = (*CENSUS_MARTS_FIELDS, "time")
+
+
+def _census_api_series_id(
+    category_code: str,
+    adjustment_code: str,
+    suffix: str | None = None,
+) -> str:
+    """Return the source-qualified acquisition identity for Census API rows."""
+
+    base = f"CENSUS-API-MRTS-{category_code}-SM-{adjustment_code}"
+    return f"{base}-{suffix}" if suffix else base
 
 
 def _decimal_or_none(value: Any) -> Decimal | None:
@@ -344,85 +371,234 @@ class CensusMARTSProvider(HTTPProvider):
         if not re.fullmatch(r"[0-9A-Z]+", category_code):
             return ProviderResult.failure(self.key, dataset, "invalid MARTS category_code")
 
-        fields = (
-            "program_code,cell_value,time_slot_id,time_slot_date,time_slot_name,"
-            "error_data,seasonally_adj,category_code,data_type_code"
-        )
+        requested_time = str(time).strip()
+        fields = ",".join(CENSUS_MARTS_FIELDS)
         params = {
-                "get": fields,
-                "category_code": category_code,
-                "seasonally_adj": seasonal_value,
-                "data_type_code": "SM",
-                "time": str(time).strip(),
-                "key": self.api_key,
+            "get": fields,
+            "category_code": category_code,
+            "seasonally_adj": seasonal_value,
+            "data_type_code": "SM",
+            "time": requested_time,
+            "key": self.api_key,
         }
         try:
-            response = self.client.get("/data/timeseries/eits/marts", params=params)
+            response = self.client.get(CENSUS_MARTS_ENDPOINT, params=params)
             response.raise_for_status()
             raw_content = response.content
-            payload = response.json()
+            fetched_at = datetime.now(UTC)
+            parsed_url = urlparse(str(response.url))
+            returned_query = parse_qs(parsed_url.query, keep_blank_values=True)
+            if (
+                parsed_url.scheme != "https"
+                or parsed_url.netloc.lower() != "api.census.gov"
+                or parsed_url.path != "/data/timeseries/eits/marts"
+                or any(returned_query.get(key) != [str(value)] for key, value in params.items())
+                or set(returned_query) != set(params)
+            ):
+                raise ValueError("Census MARTS transport endpoint is invalid")
+            content_type = (
+                response.headers.get("content-type", "application/json")
+                .split(";", 1)[0]
+                .lower()
+            )
+            if "json" not in content_type or not raw_content:
+                raise ValueError("Census MARTS response is not non-empty JSON")
+            if self.api_key.encode() in raw_content:
+                raise ValueError("Census MARTS response echoed a credential")
+            raw_bundle, bundle_metadata = build_evidence_bundle(
+                provider=self.key,
+                dataset=dataset,
+                responses=(
+                    EvidenceResponse(
+                        role="marts-api-response",
+                        url=CENSUS_MARTS_ENDPOINT,
+                        content_type=content_type,
+                        raw_bytes=raw_content,
+                        request_witness={
+                            "method": "GET",
+                            "fields": list(CENSUS_MARTS_FIELDS),
+                            "category_code": category_code,
+                            "seasonally_adj": seasonal_value,
+                            "data_type_code": "SM",
+                            "time": requested_time,
+                            "require_complete_history": require_complete_history,
+                        },
+                        response_witness={"retrieved_at": fetched_at.isoformat()},
+                    ),
+                ),
+            )
+            records, replay_metadata = self.replay_evidence_bundle(
+                raw_bundle,
+                expected_dataset=dataset,
+            )
         except (httpx.HTTPError, ValueError) as exc:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
-            detail = f"HTTP {status_code}" if status_code is not None else type(exc).__name__
+            detail = (
+                f"HTTP {status_code}"
+                if status_code is not None
+                else str(exc)
+                if isinstance(exc, ValueError)
+                else type(exc).__name__
+            )
             return ProviderResult.failure(
                 self.key,
                 dataset,
                 f"Census MARTS request failed: {detail}",
             )
+        return ProviderResult(
+            provider=self.key,
+            dataset=dataset,
+            records=records,
+            fetched_at=fetched_at,
+            raw_bytes=raw_bundle,
+            metadata={
+                **bundle_metadata,
+                **replay_metadata,
+                "artifacts": [
+                    {
+                        "url": CENSUS_MARTS_ENDPOINT,
+                        "sha256": hashlib.sha256(raw_content).hexdigest(),
+                        "size": len(raw_content),
+                        "content_type": content_type,
+                    }
+                ],
+            },
+        )
+
+    @classmethod
+    def replay_evidence_bundle(
+        cls,
+        raw_bytes: bytes,
+        *,
+        expected_dataset: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        match = re.fullmatch(r"marts:([0-9A-Z]+):SM:(yes|no)", expected_dataset)
+        if match is None:
+            raise ValueError("Census MARTS expected dataset is invalid")
+        category_code, seasonal_value = match.groups()
+        evidence = parse_evidence_bundle(
+            raw_bytes,
+            expected_provider=cls.key,
+            expected_dataset=expected_dataset,
+        )
+        if set(evidence.responses) != {"marts-api-response"}:
+            raise ValueError("Census MARTS API evidence roles are incomplete")
+        entry = evidence.manifest["responses"][0]
+        request_witness = entry["request_witness"]
+        response_witness = entry["response_witness"]
+        expected_request_keys = {
+            "method",
+            "fields",
+            "category_code",
+            "seasonally_adj",
+            "data_type_code",
+            "time",
+            "require_complete_history",
+        }
+        if (
+            entry["role"] != "marts-api-response"
+            or entry["url"] != CENSUS_MARTS_ENDPOINT
+            or "json" not in entry["content_type"].lower()
+            or set(request_witness) != expected_request_keys
+            or request_witness["method"] != "GET"
+            or request_witness["fields"] != list(CENSUS_MARTS_FIELDS)
+            or request_witness["category_code"] != category_code
+            or request_witness["seasonally_adj"] != seasonal_value
+            or request_witness["data_type_code"] != "SM"
+            or not isinstance(request_witness["time"], str)
+            or not request_witness["time"]
+            or not isinstance(request_witness["require_complete_history"], bool)
+            or set(response_witness) != {"retrieved_at"}
+        ):
+            raise ValueError("Census MARTS API evidence contract is invalid")
+        try:
+            retrieved_at = datetime.fromisoformat(
+                str(response_witness["retrieved_at"]).replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError("Census MARTS retrieval time is invalid") from exc
+        if retrieved_at.tzinfo is None:
+            raise ValueError("Census MARTS retrieval time lacks a timezone")
+        retrieved_at = retrieved_at.astimezone(UTC)
+        if retrieved_at > datetime.now(UTC) + timedelta(minutes=5):
+            raise ValueError("Census MARTS retrieval time is in the future")
+        records, parser_metadata = cls.parse_response_bytes(
+            evidence.responses["marts-api-response"],
+            category_code=category_code,
+            seasonally_adjusted=seasonal_value == "yes",
+            require_complete_history=request_witness["require_complete_history"],
+            as_of_date=retrieved_at.date(),
+        )
+        return records, {
+            **parser_metadata,
+            "requested_time": request_witness["time"],
+            "require_complete_history": request_witness[
+                "require_complete_history"
+            ],
+            "retrieved_at": retrieved_at.isoformat(),
+        }
+
+    @classmethod
+    def parse_response_bytes(
+        cls,
+        raw_bytes: bytes,
+        *,
+        category_code: str,
+        seasonally_adjusted: bool,
+        require_complete_history: bool,
+        as_of_date: date,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        try:
+            payload = json.loads(raw_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("unexpected Census response JSON") from exc
         if isinstance(payload, Mapping):
             error = payload.get("error") or payload.get("errors")
-            return ProviderResult.failure(
-                self.key,
-                dataset,
-                str(error or "unexpected Census response shape"),
-            )
+            raise ValueError(str(error or "unexpected Census response shape"))
         if not isinstance(payload, list) or not payload or not isinstance(payload[0], list):
-            return ProviderResult.failure(self.key, dataset, "unexpected Census response shape")
+            raise ValueError("unexpected Census response shape")
 
+        seasonal_value = "yes" if seasonally_adjusted else "no"
         headers = [str(name) for name in payload[0]]
+        if headers != list(CENSUS_MARTS_RESPONSE_HEADERS):
+            raise ValueError("Census MARTS response headers do not match the requested schema")
         levels: dict[date, dict[str, Any]] = {}
         for row in payload[1:]:
             if not isinstance(row, list):
-                continue
-            item = dict(zip(headers, row, strict=False))
+                raise ValueError("Census MARTS response contains a non-row item")
+            if len(row) != len(headers):
+                raise ValueError("Census MARTS response row width does not match its headers")
+            item = dict(zip(headers, row, strict=True))
             value = _decimal_or_none(item.get("cell_value"))
             value_date = _month_from_census_row(item)
-            returned_category = str(item.get("category_code") or category_code).strip().upper()
-            returned_seasonal = str(item.get("seasonally_adj") or seasonal_value).strip().lower()
-            returned_type = str(item.get("data_type_code") or "SM").strip().upper()
-            if value is None or value_date is None:
-                continue
+            returned_program = str(item.get("program_code") or "").strip().upper()
+            returned_category = str(item.get("category_code") or "").strip().upper()
+            returned_seasonal = str(item.get("seasonally_adj") or "").strip().lower()
+            returned_type = str(item.get("data_type_code") or "").strip().upper()
             if (
-                returned_category != category_code
+                returned_program != "MARTS"
+                or returned_category != category_code
                 or returned_seasonal != seasonal_value
                 or returned_type != "SM"
             ):
-                return ProviderResult.failure(
-                    self.key, dataset, "Census MARTS response violated requested dimensions"
-                )
+                raise ValueError("Census MARTS response violated requested dimensions")
+            if value is None or value_date is None:
+                continue
             period = date.fromisoformat(value_date[:10]).replace(day=1)
-            if period > date.today().replace(day=1):
-                return ProviderResult.failure(
-                    self.key, dataset, "Census MARTS response contains a future month"
-                )
+            if period > as_of_date.replace(day=1):
+                raise ValueError("Census MARTS response contains a future month")
             if period in levels:
-                return ProviderResult.failure(
-                    self.key, dataset, "Census MARTS response duplicated a month"
-                )
+                raise ValueError("Census MARTS response duplicated a month")
             levels[period] = {
                 "value": value,
                 "source_fields": item,
-                "category_code": returned_category,
-                "seasonally_adjusted": returned_seasonal == "yes",
             }
         ordered_periods = sorted(levels)
         if not ordered_periods:
-            return ProviderResult.failure(self.key, dataset, "Census MARTS returned no values")
+            raise ValueError("Census MARTS returned no values")
         if require_complete_history:
             if ordered_periods[0] != date(1992, 1, 1):
-                return ProviderResult.failure(
-                    self.key, dataset, "Census MARTS history does not begin in 1992-01"
-                )
+                raise ValueError("Census MARTS history does not begin in 1992-01")
             expected = []
             cursor = ordered_periods[0]
             while cursor <= ordered_periods[-1]:
@@ -433,9 +609,7 @@ class CensusMARTSProvider(HTTPProvider):
                     else date(cursor.year, cursor.month + 1, 1)
                 )
             if ordered_periods != expected:
-                return ProviderResult.failure(
-                    self.key, dataset, "Census MARTS history contains a missing month"
-                )
+                raise ValueError("Census MARTS history contains a missing month")
 
         records: list[dict[str, Any]] = []
         latest_period = ordered_periods[-1]
@@ -452,11 +626,14 @@ class CensusMARTSProvider(HTTPProvider):
             source_fields = level["source_fields"]
             records.append(
                 {
-                    "series_id": f"CENSUS-MRTS-{category_code}-SM-{adjustment_code}",
+                    "series_id": _census_api_series_id(
+                        category_code,
+                        adjustment_code,
+                    ),
                     "date": period.isoformat(),
                     "value": level["value"],
                     "metadata": {
-                        "program_code": source_fields.get("program_code") or "MARTS",
+                        "program_code": source_fields["program_code"],
                         "category_code": category_code,
                         "data_type_code": "SM",
                         "seasonally_adjusted": seasonally_adjusted,
@@ -486,8 +663,10 @@ class CensusMARTSProvider(HTTPProvider):
                 ).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
                 records.append(
                     {
-                        "series_id": (
-                            f"CENSUS-MRTS-{category_code}-SM-{adjustment_code}-{suffix}"
+                        "series_id": _census_api_series_id(
+                            category_code,
+                            adjustment_code,
+                            suffix,
                         ),
                         "date": period.isoformat(),
                         "value": derived,
@@ -499,7 +678,10 @@ class CensusMARTSProvider(HTTPProvider):
                             "calculation_owner": "Atlas Macro",
                             "formula": f"(level_t / level_t-{months} - 1) * 100",
                             "input_series": [
-                                f"CENSUS-MRTS-{category_code}-SM-{adjustment_code}"
+                                _census_api_series_id(
+                                    category_code,
+                                    adjustment_code,
+                                )
                             ],
                             "input_value_dates": [
                                 prior_period.isoformat(),
@@ -509,52 +691,39 @@ class CensusMARTSProvider(HTTPProvider):
                                 str(levels[prior_period]["value"]),
                                 str(level["value"]),
                             ],
-                            "precision_policy": "round half up to 0.1 percentage point",
+                            "precision_policy": (
+                                "round half up to 0.1 percentage point"
+                            ),
                             "source_revision_date": None,
                             "vintage_policy": "current-latest-vintage",
                         },
                     }
                 )
-        return ProviderResult(
-            provider=self.key,
-            dataset=dataset,
-            records=records,
-            metadata={
-                "program": "Advance Monthly Sales for Retail and Food Services",
-                "category_code": category_code,
-                "data_type_code": "SM",
-                "seasonally_adjusted": seasonally_adjusted,
-                "unit": "USD millions",
-                "precision_policy": "retain cell_value precision without rounding",
-                "derived_precision_policy": "round half up to 0.1 percentage point",
-                "latest_value_date": latest_period.isoformat(),
-                "history_start": ordered_periods[0].isoformat(),
-                "level_count": len(ordered_periods),
-                "source_revision_date": None,
-                "vintage_policy": "current-latest-vintage",
-                "revision_note": (
-                    "The EITS/MARTS response does not expose a release or revision timestamp; "
-                    "fetched_at is retrieval time, not a source vintage."
-                ),
-                "attribution": "U.S. Census Bureau, Advance Monthly Retail Trade Survey",
-                "attribution_notice": CENSUS_ATTRIBUTION_NOTICE,
-                "license": "CC0-1.0 dataset catalogue; API terms and attribution apply",
-                "license_url": self.license_url,
-                "dataset_metadata_url": self.dataset_metadata_url,
-                "documentation_url": self.documentation_url,
-                "terms_url": self.terms_url,
-                "artifacts": [
-                    {
-                        "url": "https://api.census.gov/data/timeseries/eits/marts",
-                        "sha256": hashlib.sha256(raw_content).hexdigest(),
-                        "size": len(raw_content),
-                        "content_type": response.headers.get(
-                            "content-type", "application/json"
-                        ).split(";", 1)[0],
-                    }
-                ],
-            },
-        )
+        return records, {
+            "program": "Advance Monthly Sales for Retail and Food Services",
+            "category_code": category_code,
+            "data_type_code": "SM",
+            "seasonally_adjusted": seasonally_adjusted,
+            "unit": "USD millions",
+            "precision_policy": "retain cell_value precision without rounding",
+            "derived_precision_policy": "round half up to 0.1 percentage point",
+            "latest_value_date": latest_period.isoformat(),
+            "history_start": ordered_periods[0].isoformat(),
+            "level_count": len(ordered_periods),
+            "source_revision_date": None,
+            "vintage_policy": "current-latest-vintage",
+            "revision_note": (
+                "The EITS/MARTS response does not expose a release or revision timestamp; "
+                "fetched_at is retrieval time, not a source vintage."
+            ),
+            "attribution": "U.S. Census Bureau, Advance Monthly Retail Trade Survey",
+            "attribution_notice": CENSUS_ATTRIBUTION_NOTICE,
+            "license": "CC0-1.0 dataset catalogue; API terms and attribution apply",
+            "license_url": cls.license_url,
+            "dataset_metadata_url": cls.dataset_metadata_url,
+            "documentation_url": cls.documentation_url,
+            "terms_url": cls.terms_url,
+        }
 
 
 # Backward-compatible import for callers that used the old, inaccurate class name.

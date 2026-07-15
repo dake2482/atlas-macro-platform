@@ -27,6 +27,11 @@ from django.utils import timezone
 
 from .ai_glossary_catalog import AI_GLOSSARY_TERM_SLUGS
 from .calculations import percentile_rank
+from .consumer_contract import select_public_consumer_snapshot
+from .economy_contract import select_public_economy_snapshot
+from .employment_contract import select_public_employment_snapshot
+from .inflation_contract import select_public_inflation_snapshot
+from .macro_contract import select_public_gdp_snapshot
 from .models import (
     CFTCPosition,
     CodingAgentProfile,
@@ -80,7 +85,12 @@ from .services import (
     public_source_notices,
     publicly_displayable_source_keys,
 )
-from .thesis_publication import public_theses
+from .thesis_publication import (
+    DAILY_EVIDENCE_CONTRACT_VERSION,
+    DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION,
+    public_theses,
+    validate_daily_evidence_snapshot,
+)
 from .volatility_contract import select_public_fx_vol_snapshot
 
 
@@ -423,6 +433,18 @@ def _thesis_source_keys(thesis: Thesis | None) -> set[str]:
 def _thesis_snapshot_metadata(thesis: Thesis) -> dict[str, Any]:
     snapshot = thesis.source_snapshot
     data = snapshot.data if isinstance(snapshot.data, dict) else {}
+    candidate_contract_version = data.get("contract_version")
+    contract_version = (
+        candidate_contract_version
+        if type(candidate_contract_version) is int
+        and candidate_contract_version
+        in {
+            DAILY_EVIDENCE_LEGACY_CONTRACT_VERSION,
+            DAILY_EVIDENCE_CONTRACT_VERSION,
+        }
+        and not validate_daily_evidence_snapshot(snapshot, now=timezone.now())
+        else None
+    )
     deadlines: list[datetime] = []
     evidence_items = data.get("evidence_items")
     stack: list[tuple[Any, int]] = [
@@ -464,6 +486,12 @@ def _thesis_snapshot_metadata(thesis: Thesis) -> dict[str, Any]:
         "as_of": snapshot.as_of,
         "quality_status": snapshot.quality_status,
         "source_name": snapshot.source.name,
+        "contract_version": contract_version,
+        "contract_label": (
+            f"daily-evidence v{contract_version}"
+            if contract_version is not None
+            else ""
+        ),
         "license_scope": "；".join(licence_scopes),
         "stale": bool(deadlines and min(deadlines) < timezone.now()),
     }
@@ -1306,6 +1334,14 @@ def dashboard_page(request, page_key: str):
     blocked_refresh_failure = None
     stale_notice = None
     treasury_state = None
+    economy_state = None
+    gdp_state = None
+    employment_state = None
+    inflation_state = None
+    consumer_state = None
+    inflation_base_metric_keys: set[str] = set()
+    inflation_base_chart_keys: set[str] = set()
+    inflation_base_section_keys: set[str] = set()
     if config.get("prose_only_contract"):
         # A prose-only licence or coverage contract never trusts database
         # snapshots.  This makes a deliberately inserted legacy/rogue number
@@ -1468,6 +1504,153 @@ def dashboard_page(request, page_key: str):
             snapshot_source_keys = _snapshot_source_keys(snapshot.data)
             if snapshot.source_id:
                 snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "economy":
+        snapshot = select_public_economy_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            economy_state = getattr(
+                snapshot,
+                "economy_publication_state",
+                None,
+            )
+            if economy_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif economy_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "经济总览四个子页的最早根新鲜度已自然到期；页面"
+                        "保留最后一版可重验组合，且不把自然过期伪装成失败。"
+                    ),
+                }
+            elif economy_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "至少一个官方经济子页已进入新 revision；页面暂时"
+                        "保留上一版完整组合，等待父页原子发布。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "gdp":
+        snapshot = select_public_gdp_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            gdp_state = getattr(snapshot, "gdp_publication_state", None)
+            if gdp_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif gdp_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "BEA GDP 最新完整发布已自然超过声明的新鲜度窗口；"
+                        "页面保留最后一版可重验快照。"
+                    ),
+                }
+            elif gdp_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "最新 BEA GDP 采集批次仍在运行；页面暂时保留上一版"
+                        "可重验快照。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "employment":
+        snapshot = select_public_employment_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            employment_state = getattr(
+                snapshot, "employment_publication_state", None
+            )
+            if employment_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif employment_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "BLS/DOL 最新完整就业批次已自然超过声明的新鲜度窗口；"
+                        "页面保留最后一版可重验快照。"
+                    ),
+                }
+            elif employment_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "最新 BLS/DOL 就业刷新尚未形成同周期完整发布；"
+                        "页面暂时保留上一版可重验快照。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "inflation":
+        snapshot = select_public_inflation_snapshot()
+        if snapshot is not None:
+            inflation_state = getattr(
+                snapshot, "inflation_publication_state", None
+            )
+            if inflation_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif inflation_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "BLS/BEA 最新完整通胀基础批次已自然超过声明的新鲜度窗口；"
+                        "页面保留最后一版可重验快照。"
+                    ),
+                }
+            elif inflation_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "最新 BLS 或 BEA PIO 独立刷新尚未形成完整发布；"
+                        "页面暂时保留上一版可重验快照。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
+    elif snapshot_key == "consumer":
+        snapshot = select_public_consumer_snapshot(snapshot_candidates[:50])
+        if snapshot is not None:
+            consumer_state = getattr(
+                snapshot,
+                "consumer_publication_state",
+                None,
+            )
+            if consumer_state == "retained_failure":
+                selected_failure = (snapshot.data or {}).get("refresh_failure")
+                if isinstance(selected_failure, dict):
+                    blocked_refresh_failure = selected_failure
+            elif consumer_state == "natural_expiry":
+                stale_notice = {
+                    "reason_code": "natural-expiry",
+                    "reason": (
+                        "Consumer 四源最新完整批次已自然超过声明的新鲜度"
+                        "窗口；页面保留最后一版可重验快照。"
+                    ),
+                }
+            elif consumer_state == "transition_pending":
+                stale_notice = {
+                    "reason_code": "transition-pending",
+                    "reason": (
+                        "Consumer 最新必需输入尚未形成完整发布；"
+                        "页面暂时保留上一版可重验快照。"
+                    ),
+                }
+            snapshot_source_keys = _snapshot_source_keys(snapshot.data)
+            if snapshot.source_id:
+                snapshot_source_keys.add(snapshot.source.key)
     elif snapshot_key == "global-dollar":
         for candidate in snapshot_candidates[:50]:
             candidate_failure = (candidate.data or {}).get("refresh_failure")
@@ -1530,6 +1713,25 @@ def dashboard_page(request, page_key: str):
                 break
     if snapshot:
         snapshot_data = dict(snapshot.data or {})
+        economy_presentation_is_stale = (
+            snapshot_key == "economy"
+            and economy_state != "current_candidate"
+        )
+        gdp_presentation_is_stale = (
+            snapshot_key == "gdp" and gdp_state != "current_candidate"
+        )
+        employment_presentation_is_stale = (
+            snapshot_key == "employment"
+            and employment_state != "current_candidate"
+        )
+        inflation_presentation_is_stale = (
+            snapshot_key == "inflation"
+            and inflation_state != "current_candidate"
+        )
+        consumer_presentation_is_stale = (
+            snapshot_key == "consumer"
+            and consumer_state != "current_candidate"
+        )
         if snapshot_key == "inflation":
             snapshot_data["metrics"] = [
                 item
@@ -1547,6 +1749,15 @@ def dashboard_page(request, page_key: str):
                 if item.get("key") != "market-breakeven-methodology"
                 and item.get("title") != "市场通胀预期代理口径"
             ]
+            inflation_base_metric_keys = {
+                str(item.get("key") or "") for item in snapshot_data["metrics"]
+            }
+            inflation_base_chart_keys = {
+                str(item.get("key") or "") for item in snapshot_data["charts"]
+            }
+            inflation_base_section_keys = {
+                str(item.get("key") or "") for item in snapshot_data["sections"]
+            }
             expectation_metrics, expectation_charts, expectation_sections = (
                 _inflation_market_expectations_from_real_rates()
             )
@@ -1578,6 +1789,20 @@ def dashboard_page(request, page_key: str):
         ):
             for item in metrics:
                 item["quality_status"] = Observation.Quality.STALE
+        if (
+            economy_presentation_is_stale
+            or gdp_presentation_is_stale
+            or employment_presentation_is_stale
+            or consumer_presentation_is_stale
+        ):
+            for item in metrics:
+                item["quality_status"] = Observation.Quality.STALE
+            snapshot.quality_status = Observation.Quality.STALE
+        elif inflation_presentation_is_stale:
+            for item in metrics:
+                if str(item.get("key") or "") in inflation_base_metric_keys:
+                    item["quality_status"] = Observation.Quality.STALE
+            snapshot.quality_status = Observation.Quality.STALE
         if snapshot_key == "assets-fx":
             for item in metrics:
                 change = item.get("change")
@@ -1626,6 +1851,20 @@ def dashboard_page(request, page_key: str):
         snapshot_data["metrics"] = metrics
         sections = deepcopy(snapshot_data.get("sections", []))
         for section in sections:
+            if (
+                economy_presentation_is_stale
+                or gdp_presentation_is_stale
+                or employment_presentation_is_stale
+                or consumer_presentation_is_stale
+            ):
+                section["status"] = Observation.Quality.STALE
+                section["quality_status"] = Observation.Quality.STALE
+            elif (
+                inflation_presentation_is_stale
+                and str(section.get("key") or "") in inflation_base_section_keys
+            ):
+                section["status"] = Observation.Quality.STALE
+                section["quality_status"] = Observation.Quality.STALE
             fresh_until = section.get("fresh_until")
             if not fresh_until:
                 continue
@@ -1707,6 +1946,18 @@ def dashboard_page(request, page_key: str):
             ]
             chart.setdefault("as_of", snapshot.as_of.isoformat())
             chart.setdefault("quality_status", snapshot.quality_status)
+            if (
+                economy_presentation_is_stale
+                or gdp_presentation_is_stale
+                or employment_presentation_is_stale
+                or consumer_presentation_is_stale
+            ):
+                chart["quality_status"] = Observation.Quality.STALE
+            elif (
+                inflation_presentation_is_stale
+                and str(chart.get("key") or "") in inflation_base_chart_keys
+            ):
+                chart["quality_status"] = Observation.Quality.STALE
             fresh_until = chart.get("fresh_until")
             if fresh_until:
                 try:
@@ -1739,6 +1990,12 @@ def dashboard_page(request, page_key: str):
         snapshot_data["charts"] = raw_charts
         snapshot.data = snapshot_data
         config["snapshot"] = snapshot
+        if snapshot_key == "economy":
+            config["economy_state"] = economy_state
+        elif snapshot_key == "inflation":
+            config["inflation_state"] = inflation_state
+        elif snapshot_key == "consumer":
+            config["consumer_state"] = consumer_state
         config["refresh_failure"] = (
             blocked_refresh_failure
             if snapshot_key in {"assets-fx", "fx-vol"}

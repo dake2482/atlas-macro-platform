@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -23,6 +24,7 @@ from research.official_data import (
     _has_publishable_run,
     _metric,
     _publish_dashboard,
+    _publish_dashboard_core,
     publish_official_dashboards,
 )
 from research.providers import (
@@ -31,12 +33,25 @@ from research.providers import (
     NYFedMarketsProvider,
     ProviderResult,
     TreasuryRatesProvider,
+    strict_json_metadata_matches,
 )
 from research.services import ensure_source, record_provider_result, store_series_observations
 
 
 def _client(handler):
     return httpx.Client(base_url="https://example.test", transport=httpx.MockTransport(handler))
+
+
+@pytest.mark.parametrize("publisher", [_publish_dashboard, _publish_dashboard_core])
+def test_generic_dashboard_publishers_directly_reject_consumer(publisher):
+    with pytest.raises(ValueError, match="dedicated macro v2 publisher"):
+        publisher(
+            key="consumer",
+            title="Consumer",
+            summary="Must not publish generically",
+            metrics=[],
+            batch_id=uuid.uuid4(),
+        )
 
 
 def test_ny_fed_provider_normalizes_reference_rate_metadata():
@@ -353,7 +368,7 @@ def test_treasury_provider_normalizes_nominal_curve_xml():
       xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"
       xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices">
       <title>DailyTreasuryYieldCurveRateData</title>
-      <id>https://home.treasury.gov/xml-item?data=daily_treasury_yield_curve</id>
+      <id>https://home.treasury.gov/resource-center/data-chart-center/interest-rates/pages/xml-item?data=daily_treasury_yield_curve</id>
       <updated>2026-07-10T19:00:00Z</updated>
       <entry><content type="application/xml"><m:properties>
         <d:NEW_DATE m:type="Edm.DateTime">2026-07-10T00:00:00</d:NEW_DATE>
@@ -420,6 +435,176 @@ def test_bls_provider_normalizes_monthly_series():
     assert result.records[0]["quality_status"] == "estimated"
     assert result.records[0]["metadata"]["preliminary"] is True
     assert result.metadata["messages"] == []
+
+
+def test_strict_json_metadata_match_distinguishes_types_and_missing_null():
+    assert strict_json_metadata_matches(
+        {"value": None},
+        {"value": None},
+        fields={"value"},
+    )
+    assert not strict_json_metadata_matches(
+        {"value": True},
+        {"value": 1},
+        fields={"value"},
+    )
+    assert not strict_json_metadata_matches(
+        {"value": 2026.0},
+        {"value": 2026},
+        fields={"value"},
+    )
+    assert not strict_json_metadata_matches(
+        {},
+        {"value": None},
+        fields={"value"},
+    )
+
+
+def test_bls_provider_preserves_exact_official_missing_observation():
+    payload = {
+        "status": "REQUEST_SUCCEEDED",
+        "message": [],
+        "Results": {
+            "series": [
+                {
+                    "seriesID": "LNS14000000",
+                    "data": [
+                        {
+                            "year": "2026",
+                            "period": "M06",
+                            "periodName": "June",
+                            "value": "4.2",
+                            "latest": "true",
+                            "footnotes": [],
+                        },
+                        {
+                            "year": "2025",
+                            "period": "M10",
+                            "periodName": "October",
+                            "value": "-",
+                            "latest": "false",
+                            "footnotes": [{"code": "", "text": "No data available"}],
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    raw_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+    provider = BLSProvider(
+        client=_client(
+            lambda _request: httpx.Response(
+                200,
+                content=raw_bytes,
+                headers={"content-type": "application/json"},
+            )
+        )
+    )
+    result = provider.series(["LNS14000000"], start_year=2025, end_year=2026)
+
+    assert result.ok
+    assert result.raw_bytes == raw_bytes
+    assert [(record["date"], record["value"]) for record in result.records] == [
+        ("2026-06-01", Decimal("4.2"))
+    ]
+    assert result.metadata["quality_status"] == "complete"
+    assert result.metadata["missing_series"] == []
+    assert result.metadata["missing_observations"] == [
+        {"series_id": "LNS14000000", "date": "2025-10-01"}
+    ]
+    assert result.metadata["official_missing_observation_count"] == 1
+    assert result.metadata["latest_value_dates"] == {"LNS14000000": "2026-06-01"}
+    assert result.metadata["latest_observation_dates"] == {
+        "LNS14000000": "2026-06-01"
+    }
+    assert result.metadata["latest_missing_series"] == []
+
+
+def test_bls_provider_marks_a_latest_official_missing_observation_partial():
+    payload = {
+        "status": "REQUEST_SUCCEEDED",
+        "message": [],
+        "Results": {
+            "series": [
+                {
+                    "seriesID": "LNS14000000",
+                    "data": [
+                        {
+                            "year": "2026",
+                            "period": "M06",
+                            "periodName": "June",
+                            "value": "-",
+                            "latest": "true",
+                            "footnotes": [],
+                        },
+                        {
+                            "year": "2026",
+                            "period": "M05",
+                            "periodName": "May",
+                            "value": "4.2",
+                            "latest": "false",
+                            "footnotes": [],
+                        },
+                    ],
+                }
+            ]
+        },
+    }
+    provider = BLSProvider(
+        client=_client(lambda _request: httpx.Response(200, json=payload))
+    )
+
+    result = provider.series(["LNS14000000"], start_year=2026, end_year=2026)
+
+    assert result.ok
+    assert result.metadata["quality_status"] == "partial"
+    assert result.metadata["missing_series"] == []
+    assert result.metadata["latest_value_dates"] == {"LNS14000000": "2026-05-01"}
+    assert result.metadata["latest_observation_dates"] == {
+        "LNS14000000": "2026-06-01"
+    }
+    assert result.metadata["latest_missing_series"] == ["LNS14000000"]
+    assert result.metadata["missing_observations"] == [
+        {"series_id": "LNS14000000", "date": "2026-06-01"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["", "N/A", ".", None, "NaN", "Infinity", "-Infinity", 4.2],
+)
+def test_bls_provider_rejects_every_non_official_missing_marker(marker):
+    payload = {
+        "status": "REQUEST_SUCCEEDED",
+        "message": [],
+        "Results": {
+            "series": [
+                {
+                    "seriesID": "LNS14000000",
+                    "data": [
+                        {
+                            "year": "2025",
+                            "period": "M10",
+                            "periodName": "October",
+                            "value": marker,
+                            "latest": "false",
+                            "footnotes": [],
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+
+    provider = BLSProvider(
+        client=_client(lambda _request: httpx.Response(200, json=payload))
+    )
+    result = provider.series(["LNS14000000"], start_year=2025, end_year=2026)
+
+    assert not result.ok
+    assert result.records == []
+    assert "value is invalid" in str(result.error)
 
 
 def test_bls_provider_marks_an_absent_requested_series_partial():
@@ -808,8 +993,12 @@ def test_monthly_and_quarterly_freshness_start_from_period_end():
         source=source,
     )
 
-    assert _fresh_until(monthly) == datetime(2026, 8, 14, tzinfo=UTC)
-    assert _fresh_until(quarterly) == datetime(2026, 10, 28, tzinfo=UTC)
+    assert _fresh_until(monthly) == datetime(
+        2026, 8, 14, 23, 59, 59, 999999, tzinfo=UTC
+    )
+    assert _fresh_until(quarterly) == datetime(
+        2026, 10, 28, 23, 59, 59, 999999, tzinfo=UTC
+    )
 
 
 @pytest.mark.django_db
@@ -1126,12 +1315,42 @@ def test_transmission_route_never_selects_unversioned_mixed_frequency_legacy(cli
 
 
 @pytest.mark.django_db
-def test_legacy_chart_data_footer_uses_chart_lineage_not_all_page_sources(client):
+def test_legacy_consumer_snapshot_is_hidden_by_strict_selector(client):
+    shell = _licensed_source("legacy-consumer-shell")
+    DashboardSnapshot.objects.create(
+        key="consumer",
+        title="LEGACY-CONSUMER-SNAPSHOT",
+        as_of=timezone.now(),
+        source=shell,
+        is_published=True,
+        data={
+            "demo": False,
+            "contract_version": 1,
+            "source_keys": [shell.key],
+            "metrics": [
+                {
+                    "label": "Legacy consumer metric",
+                    "display_value": "LEGACY-CONSUMER-METRIC",
+                    "source_key": shell.key,
+                }
+            ],
+            "chart_data": [],
+        },
+    )
+
+    body = client.get("/economy/consumer/").content.decode()
+
+    assert "LEGACY-CONSUMER-SNAPSHOT" not in body
+    assert "LEGACY-CONSUMER-METRIC" not in body
+
+
+@pytest.mark.django_db
+def test_generic_chart_data_footer_uses_chart_lineage_not_all_page_sources(client):
     shell = _licensed_source("legacy-chart-shell")
     chart_source = _licensed_source("legacy-chart-only")
     metric_source = _licensed_source("legacy-metric-only")
     DashboardSnapshot.objects.create(
-        key="consumer",
+        key="trade-map",
         title="Legacy chart snapshot",
         as_of=timezone.now(),
         source=shell,
@@ -1157,7 +1376,7 @@ def test_legacy_chart_data_footer_uses_chart_lineage_not_all_page_sources(client
         },
     )
 
-    body = client.get("/economy/consumer/").content.decode()
+    body = client.get("/trade-map/").content.decode()
     chart_footer = body.split('<footer class="source-line', 1)[1].split(
         "</footer>", 1
     )[0]

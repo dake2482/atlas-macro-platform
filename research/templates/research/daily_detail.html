@@ -23,7 +23,7 @@
       <section class="panel"><header class="panel-header"><h2 class="section-title">报告元数据</h2></header><dl class="panel-body grid gap-3 text-[11px]">
         <div class="flex justify-between gap-3"><dt class="muted">日期</dt><dd class="mono">{{ item.date|date:"Y-m-d" }}</dd></div>
         <div class="flex justify-between gap-3"><dt class="muted">置信度</dt><dd>{{ item.confidence|default:"—" }}</dd></div>
-        <div class="flex justify-between gap-3"><dt class="muted">证据合同</dt><dd class="mono">daily-evidence v1</dd></div>
+        <div class="flex justify-between gap-3"><dt class="muted">证据合同</dt><dd class="mono">{{ snapshot_metadata.contract_label|default:"—" }}</dd></div>
         <div class="flex justify-between gap-3"><dt class="muted">快照 ID</dt><dd class="mono">{{ snapshot_metadata.id }}</dd></div>
         <div class="flex justify-between gap-3"><dt class="muted">发布批次</dt><dd class="mono break-all text-right">{{ snapshot_metadata.batch_id }}</dd></div>
         <div class="flex justify-between gap-3"><dt class="muted">来源</dt><dd class="text-right">{{ snapshot_metadata.source_name }}</dd></div>

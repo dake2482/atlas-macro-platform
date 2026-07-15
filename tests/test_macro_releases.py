@@ -2,21 +2,35 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
+from django.db import connection
+from django.db.models.query import QuerySet
+from django.test.utils import CaptureQueriesContext
 from openpyxl import Workbook
 
-from research.consumer_credit import (
-    G19_SERIES,
-    HHDC_BALANCE_SERIES,
-    HHDC_DELINQUENCY_SERIES,
-)
 from research.data_catalog import DATA_REQUIREMENTS
+from research.economy_contract import (
+    _component_payload as _strict_economy_component_payload,
+)
+from research.macro_contract import (
+    GDP_CONTRACT_VERSION,
+    GDP_REQUIRED_CHART_KEYS,
+    GDP_REQUIRED_METRIC_KEYS,
+    GDP_REQUIRED_SECTION_KEYS,
+    _validate_gdp_semantic_alignment,
+    coordinate_gdp_dashboard,
+    gdp_snapshot_is_publicly_displayable,
+    publish_gdp_revision,
+    select_public_gdp_snapshot,
+)
 from research.macro_releases import (
     BEA_GDP_PAGE,
     BEA_PIO_PAGE,
@@ -32,100 +46,42 @@ from research.macro_releases import (
 from research.models import (
     DashboardSnapshot,
     IngestionRun,
+    MetricSnapshot,
     Observation,
     RawArtifact,
     ReleaseVintageObservation,
+    SeriesDefinition,
 )
 from research.official_data import (
     MACRO_PUBLICATION_GROUPS,
     _keys_with_current_required_batches,
-    _mark_latest_dashboards_stale,
+    _publish_dashboard,
     _publishable_keys_for_source_groups,
-    _record_census_revision_witness,
+    _record_and_coordinate_gdp_result,
+    _store_bea_release_observations_v2,
+    _store_census_marts_observations_v2,
     _store_release_workbook_observations,
     publish_official_dashboards,
 )
 from research.providers import ProviderResult
-from research.services import record_provider_result, store_series_observations
+from research.raw_evidence import (
+    EvidenceResponse,
+    build_evidence_bundle,
+    parse_evidence_bundle,
+)
+from research.services import (
+    begin_ingestion,
+    ensure_source,
+    finish_ingestion,
+    record_provider_result,
+    store_series_observations,
+)
 
 
 def _workbook_bytes(workbook: Workbook) -> bytes:
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
-
-
-def _consumer_credit_results() -> tuple[ProviderResult, ProviderResult]:
-    g19_records = []
-    for period, offset in (("2026-04-01", Decimal("0")), ("2026-05-01", Decimal("1"))):
-        for index, (_, (series_id, _)) in enumerate(G19_SERIES.items(), start=1):
-            g19_records.append(
-                {
-                    "series_id": series_id,
-                    "date": period,
-                    "value": Decimal(index) + offset,
-                }
-            )
-    household_records = []
-    household_series = [
-        *HHDC_BALANCE_SERIES.values(),
-        *HHDC_DELINQUENCY_SERIES.values(),
-    ]
-    for period, offset in (("2025-12-31", Decimal("0")), ("2026-03-31", Decimal("1"))):
-        for index, series_id in enumerate(household_series, start=1):
-            household_records.append(
-                {
-                    "series_id": series_id,
-                    "date": period,
-                    "value": Decimal(index) + offset,
-                }
-            )
-    return (
-        ProviderResult(
-            provider="federal-reserve-g19",
-            dataset="g19-fixture",
-            records=g19_records,
-        ),
-        ProviderResult(
-            provider="ny-fed-household-credit",
-            dataset="hhdc-fixture",
-            records=household_records,
-        ),
-    )
-
-
-def _census_api_result() -> ProviderResult:
-    records = []
-    values = {
-        "2026-03-01": ("754013", "1.7", "4.2"),
-        "2026-04-01": ("757036", "0.4", "4.8"),
-        "2026-05-01": ("763705", "0.9", "6.9"),
-    }
-    for period, (level, mom, yoy) in values.items():
-        records.extend(
-            [
-                {
-                    "series_id": "CENSUS-MRTS-44X72-SM-SA",
-                    "date": period,
-                    "value": level,
-                },
-                {
-                    "series_id": "CENSUS-MRTS-44X72-SM-SA-MOM",
-                    "date": period,
-                    "value": mom,
-                },
-                {
-                    "series_id": "CENSUS-MRTS-44X72-SM-SA-YOY",
-                    "date": period,
-                    "value": yoy,
-                },
-            ]
-        )
-    return ProviderResult(
-        provider="census",
-        dataset="marts:44X72:SM:yes",
-        records=records,
-    )
 
 
 def _bea_vintage_workbook() -> bytes:
@@ -153,13 +109,18 @@ def _bea_vintage_workbook() -> bytes:
     return _workbook_bytes(workbook)
 
 
-def _bea_comparison_workbook() -> bytes:
+def _bea_comparison_workbook(
+    *,
+    quarter: str = "2026Q1",
+    release_date: str = "June 25, 2026",
+    estimate_round: str = "Third",
+) -> bytes:
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "GDPhistQ"
-    sheet["A1"] = "June 25, 2026"
+    sheet["A1"] = release_date
     sheet["A2"] = (
-        "2026Q1 (Third Estimate) Comparisons -- Percent Change from Preceding Period "
+        f"{quarter} ({estimate_round} Estimate) Comparisons -- Percent Change from Preceding Period "
         "in Real Gross Domestic Product and Related Measures"
     )
     rows = [
@@ -181,7 +142,7 @@ def _bea_comparison_workbook() -> bytes:
     sheet.cell(
         20,
         1,
-        "2026Q1 (Third Estimate) Comparisons -- Contributions to Percent Change "
+        f"{quarter} ({estimate_round} Estimate) Comparisons -- Contributions to Percent Change "
         "in Real Gross Domestic Product",
     )
     contribution_rows = [
@@ -200,10 +161,23 @@ def _bea_comparison_workbook() -> bytes:
     return _workbook_bytes(workbook)
 
 
-def _census_workbook() -> bytes:
+def _census_workbook(
+    *,
+    sales_declaration: str = (
+        "(Total sales estimates are shown in millions of dollars and are based on official survey data.)"
+    ),
+    change_declaration: str = (
+        "(Estimates are shown as percents and are based on official survey data.)"
+    ),
+) -> bytes:
     workbook = Workbook()
     sales = workbook.active
     sales.title = "Table 1."
+    sales.cell(
+        4,
+        1,
+        sales_declaration,
+    )
     sales.cell(6, 10, "Adjusted2")
     sales.cell(7, 10, 2026)
     sales.cell(7, 13, 2025)
@@ -217,6 +191,11 @@ def _census_workbook() -> bytes:
         sales.cell(12, column, value)
 
     changes = workbook.create_sheet("Table 2.")
+    changes.cell(
+        3,
+        1,
+        change_declaration,
+    )
     changes.cell(8, 3, "Apr. 2026 Advance")
     changes.cell(8, 5, "Mar. 2026 Preliminary")
     changes.cell(11, 3, "Mar. 2026")
@@ -232,10 +211,23 @@ def _census_workbook() -> bytes:
     return _workbook_bytes(workbook)
 
 
-def _census_current_workbook() -> bytes:
+def _census_current_workbook(
+    *,
+    sales_declaration: str = (
+        "(Total sales estimates are shown in millions of dollars and are based on official survey data.)"
+    ),
+    change_declaration: str = (
+        "(Estimates are shown as percents and are based on official survey data.)"
+    ),
+) -> bytes:
     workbook = Workbook()
     sales = workbook.active
     sales.title = "Table 1."
+    sales.cell(
+        4,
+        1,
+        sales_declaration,
+    )
     sales.cell(6, 10, "Adjusted2")
     sales.cell(7, 10, 2026)
     sales.cell(7, 13, 2025)
@@ -249,6 +241,11 @@ def _census_current_workbook() -> bytes:
         sales.cell(12, column, value)
 
     changes = workbook.create_sheet("Table 2.")
+    changes.cell(
+        3,
+        1,
+        change_declaration,
+    )
     changes.cell(8, 3, "May. 2026 Advance")
     changes.cell(8, 5, "Apr. 2026 Revised")
     changes.cell(11, 3, "Apr. 2026")
@@ -452,8 +449,10 @@ def _bea_client(vintage: bytes, comparisons: bytes) -> httpx.Client:
 
 def _census_client(workbook: bytes, *, current_status: int = 403) -> httpx.Client:
     latest = f"{CENSUS_MARTS_INDEX}rs2604.xlsx"
+    index_seen = False
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal index_seen
         url = str(request.url)
         if url == CENSUS_MARTS_CURRENT_WORKBOOK:
             if current_status == 200:
@@ -467,6 +466,7 @@ def _census_client(workbook: bytes, *, current_status: int = 403) -> httpx.Clien
                 )
             return httpx.Response(current_status, text="current workbook unavailable")
         if url == CENSUS_MARTS_INDEX:
+            index_seen = True
             return httpx.Response(
                 200,
                 text=(
@@ -477,14 +477,49 @@ def _census_client(workbook: bytes, *, current_status: int = 403) -> httpx.Clien
                 headers={"content-type": "text/html"},
             )
         if url == latest:
+            if not index_seen:
+                return httpx.Response(404, text="probe candidate unavailable")
             return httpx.Response(
                 200,
                 content=workbook,
                 headers={"content-type": XLSX_CONTENT_TYPE, "last-modified": "May 15, 2026"},
             )
+        if url.startswith(CENSUS_MARTS_INDEX) and url.endswith(".xlsx"):
+            return httpx.Response(404, text="probe candidate unavailable")
         raise AssertionError(f"unexpected URL: {url}")
 
     return httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+
+def _rebuild_census_evidence(
+    raw_bytes: bytes,
+    mutate,
+) -> bytes:
+    evidence = parse_evidence_bundle(
+        raw_bytes,
+        expected_provider="census-release",
+        expected_dataset="marts:retail-food-services",
+    )
+    responses = []
+    for original in evidence.manifest["responses"]:
+        entry = deepcopy(original)
+        if mutate(entry) is False:
+            continue
+        responses.append(
+            EvidenceResponse(
+                role=entry["role"],
+                url=entry["url"],
+                content_type=entry["content_type"],
+                raw_bytes=evidence.responses[original["role"]],
+                request_witness=entry["request_witness"],
+                response_witness=entry["response_witness"],
+            )
+        )
+    return build_evidence_bundle(
+        provider="census-release",
+        dataset="marts:retail-food-services",
+        responses=responses,
+    )[0]
 
 
 def _bea_pio_client(summary: bytes, section2: bytes) -> httpx.Client:
@@ -532,6 +567,24 @@ def test_bea_release_provider_preserves_vintages_components_and_artifact_hashes(
     assert result.metadata["vintage_observation_count"] == 12
     assert len(result.metadata["artifacts"]) == 3
     assert result.metadata["artifacts"][1]["sha256"] == hashlib.sha256(vintage).hexdigest()
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="bea-release",
+        expected_dataset="gdp-release-workbooks",
+    )
+    assert set(evidence.responses) == {
+        "release-page",
+        "vintage-workbook",
+        "comparison-workbook",
+    }
+    assert evidence.responses["vintage-workbook"] == vintage
+    assert evidence.responses["comparison-workbook"] == comparisons
+    replay_records, replay_supplemental, replay_metadata = (
+        BEAGDPReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+    )
+    assert replay_records == result.records
+    assert replay_supplemental == result.supplemental_records
+    assert replay_metadata["comparison_quarter"] == "2026Q1"
 
     by_series_and_date = {
         (item["series_id"], item["date"]): item for item in result.records
@@ -563,6 +616,17 @@ def test_bea_release_provider_preserves_vintages_components_and_artifact_hashes(
     ]["unit"] == "percentage points contribution to real GDP growth"
 
 
+def test_bea_gdp_replay_rechecks_xlsx_expanded_size(monkeypatch):
+    result = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    assert result.ok
+    monkeypatch.setattr(BEAGDPReleaseProvider, "max_expanded_bytes", 1)
+
+    with pytest.raises(ValueError, match="expanded-size limit"):
+        BEAGDPReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
 def test_bea_pio_provider_parses_full_history_codes_and_cross_checks_summary():
     summary = _bea_pio_summary_workbook()
     section2 = _bea_pio_section2_workbook()
@@ -584,6 +648,23 @@ def test_bea_pio_provider_parses_full_history_codes_and_cross_checks_summary():
     assert artifacts[BEA_PIO_SECTION2_WORKBOOK]["sha256"] == hashlib.sha256(
         section2
     ).hexdigest()
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="bea-pio-release",
+        expected_dataset="personal-income-outlays-release",
+    )
+    assert set(evidence.responses) == {
+        "release-page",
+        "summary-workbook",
+        "section2-workbook",
+    }
+    assert evidence.responses["summary-workbook"] == summary
+    assert evidence.responses["section2-workbook"] == section2
+    replay_records, replay_metadata = BEAPIOReleaseProvider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["latest_value_date"] == "2026-05-01"
 
     by_series_and_date = {
         (item["series_id"], item["date"]): item for item in result.records
@@ -627,6 +708,20 @@ def test_bea_pio_provider_parses_full_history_codes_and_cross_checks_summary():
     ] == 2017
 
 
+def test_bea_pio_replay_rechecks_xlsx_expanded_size(monkeypatch):
+    result = BEAPIOReleaseProvider(
+        client=_bea_pio_client(
+            _bea_pio_summary_workbook(),
+            _bea_pio_section2_workbook(),
+        )
+    ).personal_income_outlays()
+    assert result.ok
+    monkeypatch.setattr(BEAPIOReleaseProvider, "max_expanded_bytes", 1)
+
+    with pytest.raises(ValueError, match="expanded-size limit"):
+        BEAPIOReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
 @pytest.mark.parametrize(
     ("summary", "section2", "message"),
     [
@@ -659,6 +754,790 @@ def test_bea_pio_provider_fails_closed_on_inconsistent_workbooks(
     assert message in result.error
 
 
+@pytest.mark.django_db
+def test_bea_gdp_v2_keeps_private_bundle_and_append_only_release_vintages(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    first_result = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    first_raw = bytes(first_result.raw_bytes)
+    first = record_provider_result(
+        first_result,
+        persist=_store_bea_release_observations_v2,
+    )
+
+    assert first.status == IngestionRun.Status.SUCCESS
+    assert first.row_count == first_result.row_count + len(
+        first_result.supplemental_records["release_vintages"]
+    )
+    assert Observation.objects.filter(batch_id=first.batch_id).count() == len(
+        first_result.records
+    )
+    assert ReleaseVintageObservation.objects.filter(
+        batch_id=first.batch_id
+    ).count() == len(first_result.supplemental_records["release_vintages"])
+    first_artifact = RawArtifact.objects.get(run=first)
+    assert first_artifact.uri.startswith("private://bea-release/")
+    first_path = (
+        Path(settings.RAW_ARTIFACT_ROOT)
+        / first_artifact.sha256[:2]
+        / f"{first_artifact.sha256}.bin"
+    )
+    assert first_path.read_bytes() == first_raw
+    first_observations = list(
+        Observation.objects.filter(batch_id=first.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    )
+    first_vintages = list(
+        ReleaseVintageObservation.objects.filter(batch_id=first.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    )
+
+    second_result = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    second = record_provider_result(
+        second_result,
+        persist=_store_bea_release_observations_v2,
+    )
+
+    assert second.status == IngestionRun.Status.SUCCESS
+    assert second.batch_id != first.batch_id
+    assert RawArtifact.objects.filter(run__in=(first, second)).count() == 2
+    second_artifact = RawArtifact.objects.get(run=second)
+    second_path = (
+        Path(settings.RAW_ARTIFACT_ROOT)
+        / second_artifact.sha256[:2]
+        / f"{second_artifact.sha256}.bin"
+    )
+    assert second_path.read_bytes() == second_result.raw_bytes
+    assert Observation.objects.filter(batch_id=second.batch_id).count() == len(
+        second_result.records
+    )
+    assert ReleaseVintageObservation.objects.filter(
+        batch_id=second.batch_id
+    ).count() == len(second_result.supplemental_records["release_vintages"])
+    assert list(
+        Observation.objects.filter(batch_id=first.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    ) == first_observations
+    assert list(
+        ReleaseVintageObservation.objects.filter(batch_id=first.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    ) == first_vintages
+
+
+def _strict_gdp_run(*, vintage: bytes, comparisons: bytes) -> IngestionRun:
+    result = BEAGDPReleaseProvider(
+        client=_bea_client(vintage, comparisons)
+    ).gdp_pce()
+    assert result.ok, result.error
+    run = record_provider_result(
+        result,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert run.status == IngestionRun.Status.SUCCESS, run.error
+    return run
+
+
+@pytest.mark.django_db
+def test_gdp_v2_dedicated_publisher_selector_and_route(
+    client,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+
+    snapshot = publish_gdp_revision(run=run)
+
+    assert snapshot is not None
+    assert snapshot.data["contract_version"] == GDP_CONTRACT_VERSION
+    assert {item["key"] for item in snapshot.data["metrics"]} == (
+        GDP_REQUIRED_METRIC_KEYS
+    )
+    assert {item["key"] for item in snapshot.data["charts"]} == (
+        GDP_REQUIRED_CHART_KEYS
+    )
+    assert {item["key"] for item in snapshot.data["sections"]} == (
+        GDP_REQUIRED_SECTION_KEYS
+    )
+    assert snapshot.data["component_batches"] == [str(run.batch_id)]
+    assert snapshot.data["input_run"]["ingestion_run_id"] == run.pk
+    assert MetricSnapshot.objects.filter(
+        batch_id=snapshot.batch_id,
+        key__startswith="gdp-",
+    ).count() == len(GDP_REQUIRED_METRIC_KEYS)
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.pk == snapshot.pk
+    assert selected.gdp_publication_state == "current_candidate"
+    assert gdp_snapshot_is_publicly_displayable(snapshot)
+    metric, chart, reference, metric_row = _strict_economy_component_payload(
+        "gdp",
+        snapshot,
+    )
+    assert metric["key"] == "bea-a191rl"
+    assert chart["key"] == "gdp-growth-history"
+    assert reference["snapshot_id"] == snapshot.pk
+    assert reference["selected_metric_snapshot_id"] == metric_row.pk
+    assert reference["root_source_keys"] == sorted(snapshot.data["source_keys"])
+    assert reference["root_component_batches"] == sorted(
+        snapshot.data["component_batches"]
+    )
+    assert reference["root_fresh_until"] == snapshot.data["fresh_until"]
+
+    response = client.get("/economy/gdp/")
+    body = response.content.decode()
+    assert response.status_code == 200
+    assert body.count(" data-chart ") == 2
+    assert "GDP 发布轮次与修订路径" in body
+    assert "1.60% → 2.10%" in body
+
+    assert publish_gdp_revision(run=run) is None
+    assert DashboardSnapshot.objects.filter(
+        key="gdp",
+        data__contract_version=GDP_CONTRACT_VERSION,
+    ).count() == 1
+    assert publish_official_dashboards(keys={"gdp"}) == []
+    with pytest.raises(ValueError, match="dedicated macro v2"):
+        _publish_dashboard(
+            key="gdp",
+            title=snapshot.title,
+            summary=snapshot.summary,
+            metrics=snapshot.data["metrics"],
+            charts=snapshot.data["charts"],
+            sections=snapshot.data["sections"],
+            batch_id=uuid.uuid4(),
+        )
+
+
+@pytest.mark.django_db
+def test_gdp_publisher_locks_sources_before_runs_and_nullable_rows(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    original = QuerySet.select_for_update
+    lock_models = []
+    joined_lock_calls = []
+    nullable_lock_shapes = []
+
+    def recording_select_for_update(queryset, *args, **kwargs):
+        lock_models.append(queryset.model)
+        if queryset.model in {IngestionRun, DashboardSnapshot}:
+            joined_lock_calls.append((queryset.model, kwargs.get("of")))
+        if queryset.model in {Observation, ReleaseVintageObservation}:
+            nullable_lock_shapes.append(
+                (queryset.model, queryset.query.select_related)
+            )
+        return original(queryset, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", recording_select_for_update)
+    published = publish_gdp_revision(run=run)
+    assert published is not None
+    failure_at = datetime.now(UTC)
+    IngestionRun.objects.create(
+        source=run.source,
+        dataset=run.dataset,
+        started_at=failure_at,
+        completed_at=failure_at,
+        status=IngestionRun.Status.FAILED,
+        error="lock-path fixture",
+    )
+    coordinate_gdp_dashboard()
+
+    assert lock_models.index(run.source.__class__) < lock_models.index(IngestionRun)
+    assert joined_lock_calls
+    assert all(of == ("self",) for _model, of in joined_lock_calls)
+    assert nullable_lock_shapes == [
+        (Observation, False),
+        (ReleaseVintageObservation, False),
+    ]
+
+
+@pytest.mark.django_db
+def test_gdp_v2_same_values_new_run_is_new_revision_and_rogue_is_ignored(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    vintage = _bea_vintage_workbook()
+    comparisons = _bea_comparison_workbook()
+    first_run = _strict_gdp_run(vintage=vintage, comparisons=comparisons)
+    first = publish_gdp_revision(run=first_run)
+    assert first is not None
+
+    second_run = _strict_gdp_run(vintage=vintage, comparisons=comparisons)
+    second = publish_gdp_revision(run=second_run)
+
+    assert second is not None
+    assert second.pk != first.pk
+    assert second.batch_id != first.batch_id
+    assert second.data["fingerprint"] != first.data["fingerprint"]
+    assert DashboardSnapshot.objects.filter(
+        key="gdp",
+        data__contract_version=GDP_CONTRACT_VERSION,
+    ).count() == 2
+    selected = select_public_gdp_snapshot()
+    assert selected is not None and selected.pk == second.pk
+
+    rogue_batch = uuid.uuid4()
+    rogue_data = deepcopy(second.data)
+    rogue_data["publication_batch_id"] = str(rogue_batch)
+    DashboardSnapshot.objects.create(
+        key="gdp",
+        title=second.title,
+        summary=second.summary,
+        as_of=second.as_of,
+        batch_id=rogue_batch,
+        quality_status=second.quality_status,
+        data=rogue_data,
+        source=second.source,
+        is_published=True,
+    )
+    selected = select_public_gdp_snapshot()
+    assert selected is not None and selected.pk == second.pk
+
+
+@pytest.mark.parametrize("malformed_container", ["metrics", "charts", "sections"])
+@pytest.mark.django_db
+def test_gdp_selector_skips_malformed_strict_looking_containers(
+    client,
+    malformed_container,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    published = publish_gdp_revision(run=run)
+    assert published is not None
+    rogue_batch = uuid.uuid4()
+    rogue_data = deepcopy(published.data)
+    rogue_data["publication_batch_id"] = str(rogue_batch)
+    rogue_data[malformed_container] = [
+        None for _item in published.data[malformed_container]
+    ]
+    DashboardSnapshot.objects.create(
+        key="gdp",
+        title=published.title,
+        summary=published.summary,
+        as_of=published.as_of,
+        batch_id=rogue_batch,
+        quality_status=published.quality_status,
+        data=rogue_data,
+        source=published.source,
+        is_published=True,
+    )
+
+    selected = select_public_gdp_snapshot()
+    assert selected is not None and selected.pk == published.pk
+    assert client.get("/economy/gdp/").status_code == 200
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    "tamper_kind",
+    [
+        "raw",
+        "observation",
+        "observation-source",
+        "vintage",
+        "vintage-source",
+        "frequency",
+        "metric",
+        "payload",
+        "license",
+        "derived-license",
+        "rogue",
+    ],
+)
+def test_gdp_v2_tamper_fails_closed(
+    settings,
+    tmp_path,
+    tamper_kind,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    snapshot = publish_gdp_revision(run=run)
+    assert snapshot is not None
+
+    if tamper_kind == "raw":
+        artifact = RawArtifact.objects.get(run=run)
+        path = (
+            Path(settings.RAW_ARTIFACT_ROOT)
+            / artifact.sha256[:2]
+            / f"{artifact.sha256}.bin"
+        )
+        path.write_bytes(path.read_bytes() + b"tamper")
+    elif tamper_kind in {"observation", "observation-source"}:
+        observation = Observation.objects.filter(batch_id=run.batch_id).first()
+        assert observation is not None
+        if tamper_kind == "observation-source":
+            observation.source = ensure_source("bls")
+            observation.save(update_fields=["source", "updated_at"])
+        else:
+            observation.value += Decimal("1")
+            observation.save(update_fields=["value", "updated_at"])
+    elif tamper_kind in {"vintage", "vintage-source"}:
+        vintage = ReleaseVintageObservation.objects.filter(
+            batch_id=run.batch_id
+        ).first()
+        assert vintage is not None
+        if tamper_kind == "vintage-source":
+            vintage.source = ensure_source("bls")
+            vintage.save(update_fields=["source", "updated_at"])
+        else:
+            vintage.value += Decimal("1")
+            vintage.save(update_fields=["value", "updated_at"])
+    elif tamper_kind == "frequency":
+        series = Observation.objects.filter(batch_id=run.batch_id).first().series
+        series.frequency = "annual"
+        series.save(update_fields=["frequency", "updated_at"])
+    elif tamper_kind == "metric":
+        metric = MetricSnapshot.objects.filter(batch_id=snapshot.batch_id).first()
+        assert metric is not None and metric.value is not None
+        metric.value += Decimal("1")
+        metric.save(update_fields=["value", "updated_at"])
+    elif tamper_kind == "payload":
+        data = deepcopy(snapshot.data)
+        data["metrics"][0]["value"] += 1
+        snapshot.data = data
+        snapshot.save(update_fields=["data", "updated_at"])
+    elif tamper_kind in {"license", "derived-license"}:
+        licence = run.source.licenses.get(is_current=True)
+        field = (
+            "derived_display_allowed"
+            if tamper_kind == "derived-license"
+            else "public_display_allowed"
+        )
+        setattr(licence, field, False)
+        licence.save(update_fields=[field, "updated_at"])
+    else:
+        original = Observation.objects.filter(batch_id=run.batch_id).first()
+        assert original is not None
+        Observation.objects.create(
+            series=original.series,
+            instrument=None,
+            value=original.value,
+            value_date=original.value_date,
+            as_of=original.as_of,
+            fetched_at=original.fetched_at,
+            batch_id=run.batch_id,
+            source=original.source,
+            fallback_source=None,
+            quality_status=original.quality_status,
+            metadata=original.metadata,
+        )
+
+    assert select_public_gdp_snapshot() is None
+
+
+@pytest.mark.django_db
+def test_gdp_v2_transition_failure_and_natural_expiry_states(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    snapshot = publish_gdp_revision(run=run)
+    assert snapshot is not None
+
+    running = begin_ingestion("bea-release", "gdp-release-workbooks")
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.gdp_publication_state == "transition_pending"
+
+    failed = finish_ingestion(
+        running,
+        status=IngestionRun.Status.FAILED,
+        error="fixture upstream failure",
+    )
+    published, stale = coordinate_gdp_dashboard([failed])
+    assert published == []
+    assert stale == {"gdp"}
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.gdp_publication_state == "retained_failure"
+    assert selected.data["refresh_failure"]["attempt"]["ingestion_run_id"] == failed.pk
+
+    recovery = begin_ingestion("bea-release", "gdp-release-workbooks")
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.gdp_publication_state == "transition_pending"
+    assert "refresh_failure" not in selected.data
+    recovery.delete()
+
+    failed.delete()
+    stored = DashboardSnapshot.objects.get(pk=snapshot.pk)
+    data = deepcopy(stored.data)
+    data.pop("refresh_failure", None)
+    stored.data = data
+    stored.quality_status = Observation.Quality.FRESH
+    stored.save(update_fields=["data", "quality_status", "updated_at"])
+    expired_at = datetime.fromisoformat(stored.data["fresh_until"]) + timedelta(seconds=1)
+    monkeypatch.setattr("research.macro_contract.timezone.now", lambda: expired_at)
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.gdp_publication_state == "natural_expiry"
+
+
+@pytest.mark.django_db
+def test_gdp_expired_success_rolls_back_and_retains_then_recovers(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    baseline_run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    baseline = publish_gdp_revision(run=baseline_run)
+    assert baseline is not None
+    second_run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    snapshot_count = DashboardSnapshot.objects.filter(key="gdp").count()
+    metric_count = MetricSnapshot.objects.filter(key__startswith="gdp-").count()
+    expired_at = datetime.fromisoformat(baseline.data["fresh_until"]) + timedelta(seconds=1)
+    monkeypatch.setattr("research.macro_contract.timezone.now", lambda: expired_at)
+
+    dashboards, stale = coordinate_gdp_dashboard([second_run])
+
+    assert dashboards == [] and stale == {"gdp"}
+    assert DashboardSnapshot.objects.filter(key="gdp").count() == snapshot_count
+    assert MetricSnapshot.objects.filter(key__startswith="gdp-").count() == metric_count
+    retained = select_public_gdp_snapshot()
+    assert retained is not None and retained.pk == baseline.pk
+    assert retained.gdp_publication_state == "retained_failure"
+    marker = retained.data["refresh_failure"]
+    assert marker["reason_code"] == "publication-postcondition"
+    assert marker["attempt"]["ingestion_run_id"] == second_run.pk
+
+    current_now = datetime.now(UTC)
+    monkeypatch.setattr("research.macro_contract.timezone.now", lambda: current_now)
+    recovery_run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    transitioning = select_public_gdp_snapshot()
+    assert transitioning is not None
+    assert transitioning.gdp_publication_state == "transition_pending"
+    assert "refresh_failure" not in transitioning.data
+    recovered, stale = coordinate_gdp_dashboard([recovery_run])
+    assert len(recovered) == 1 and stale == set()
+    assert select_public_gdp_snapshot().pk == recovered[0].pk
+
+
+@pytest.mark.django_db
+def test_gdp_same_run_natural_expiry_is_idempotent_and_write_free(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    baseline = publish_gdp_revision(run=run)
+    assert baseline is not None
+    stored_data = deepcopy(baseline.data)
+    stored_updated_at = baseline.updated_at
+    snapshot_count = DashboardSnapshot.objects.filter(key="gdp").count()
+    metric_count = MetricSnapshot.objects.filter(key__startswith="gdp-").count()
+    expired_at = datetime.fromisoformat(baseline.data["fresh_until"]) + timedelta(seconds=1)
+    monkeypatch.setattr("research.macro_contract.timezone.now", lambda: expired_at)
+
+    with CaptureQueriesContext(connection) as captured:
+        dashboards, stale = coordinate_gdp_dashboard([run])
+
+    assert dashboards == [] and stale == {"gdp"}
+    write_queries = [
+        query["sql"]
+        for query in captured.captured_queries
+        if query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))
+    ]
+    assert write_queries == []
+    assert DashboardSnapshot.objects.filter(key="gdp").count() == snapshot_count
+    assert MetricSnapshot.objects.filter(key__startswith="gdp-").count() == metric_count
+    baseline.refresh_from_db()
+    assert baseline.data == stored_data
+    assert baseline.updated_at == stored_updated_at
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.gdp_publication_state == "natural_expiry"
+    assert "refresh_failure" not in selected.data
+
+
+@pytest.mark.django_db
+def test_gdp_v2_publication_exception_becomes_durable_retained_failure(
+    monkeypatch,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    baseline_run = _strict_gdp_run(
+        vintage=_bea_vintage_workbook(),
+        comparisons=_bea_comparison_workbook(),
+    )
+    baseline = publish_gdp_revision(run=baseline_run)
+    assert baseline is not None
+
+    replacement = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    from research import macro_contract
+
+    original_builder = macro_contract._build_gdp_payload
+
+    def fail_publication(evidence, **kwargs):
+        if evidence.run.pk != baseline_run.pk:
+            raise RuntimeError("fixture publication crash")
+        return original_builder(evidence, **kwargs)
+
+    monkeypatch.setattr(
+        "research.macro_contract._build_gdp_payload",
+        fail_publication,
+    )
+    with pytest.raises(RuntimeError, match="fixture publication crash"):
+        _record_and_coordinate_gdp_result(
+            replacement,
+            _store_bea_release_observations_v2,
+        )
+
+    failed = IngestionRun.objects.order_by("-started_at", "-id").first()
+    assert failed is not None
+    assert failed.status == IngestionRun.Status.FAILED
+    assert failed.metadata["publication_failure"] is True
+    assert "fixture publication crash" in failed.error
+    assert not RawArtifact.objects.filter(run=failed).exists()
+    assert IngestionRun.objects.filter(
+        source__key="bea-release",
+        dataset="gdp-release-workbooks",
+        status=IngestionRun.Status.SUCCESS,
+    ).count() == 1
+    selected = select_public_gdp_snapshot()
+    assert selected is not None
+    assert selected.pk == baseline.pk
+    assert selected.gdp_publication_state == "retained_failure"
+    assert selected.data["refresh_failure"]["attempt"]["ingestion_run_id"] == failed.pk
+
+
+@pytest.mark.django_db
+def test_gdp_v2_rejects_comparison_workbook_from_another_release(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    result = BEAGDPReleaseProvider(
+        client=_bea_client(
+            _bea_vintage_workbook(),
+            _bea_comparison_workbook(quarter="2025Q4"),
+        )
+    ).gdp_pce()
+    assert result.ok, result.error
+
+    with pytest.raises(
+        ValueError,
+        match="comparison workbook does not match the latest vintage release",
+    ):
+        _validate_gdp_semantic_alignment(
+            result.records,
+            result.supplemental_records["release_vintages"],
+            result.metadata,
+        )
+
+    run = record_provider_result(
+        result,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert run.status == IngestionRun.Status.FAILED
+    assert "comparison workbook does not match" in run.error
+
+
+@pytest.mark.django_db
+def test_bea_v2_acquisition_rejects_catalog_frequency_drift(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    gdp_source = ensure_source("bea-release")
+    SeriesDefinition.objects.create(
+        key="bea-a191rl",
+        name="tampered GDP fixture",
+        unit="%",
+        frequency="annual",
+        source=gdp_source,
+    )
+    gdp_result = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    gdp_run = record_provider_result(
+        gdp_result,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert gdp_run.status == IngestionRun.Status.FAILED
+    assert "persistence postcondition failed" in gdp_run.error
+    assert not Observation.objects.filter(batch_id=gdp_run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=gdp_run).exists()
+
+    pio_source = ensure_source("bea-pio-release")
+    SeriesDefinition.objects.create(
+        key="bea-real-pce-mom",
+        name="tampered PIO fixture",
+        unit="%",
+        frequency="annual",
+        source=pio_source,
+    )
+    pio_result = BEAPIOReleaseProvider(
+        client=_bea_pio_client(
+            _bea_pio_summary_workbook(),
+            _bea_pio_section2_workbook(),
+        )
+    ).personal_income_outlays()
+    pio_run = record_provider_result(
+        pio_result,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert pio_run.status == IngestionRun.Status.FAILED
+    assert "persistence postcondition failed" in pio_run.error
+    assert not Observation.objects.filter(batch_id=pio_run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=pio_run).exists()
+
+
+@pytest.mark.django_db
+def test_bea_pio_v2_keeps_private_bundle_and_append_only_history(settings, tmp_path):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    first_result = BEAPIOReleaseProvider(
+        client=_bea_pio_client(
+            _bea_pio_summary_workbook(),
+            _bea_pio_section2_workbook(),
+        )
+    ).personal_income_outlays()
+    first = record_provider_result(
+        first_result,
+        persist=_store_bea_release_observations_v2,
+    )
+
+    assert first.status == IngestionRun.Status.SUCCESS
+    assert first.row_count == len(first_result.records)
+    assert Observation.objects.filter(batch_id=first.batch_id).count() == len(
+        first_result.records
+    )
+    first_artifact = RawArtifact.objects.get(run=first)
+    first_path = (
+        Path(settings.RAW_ARTIFACT_ROOT)
+        / first_artifact.sha256[:2]
+        / f"{first_artifact.sha256}.bin"
+    )
+    assert first_path.read_bytes() == first_result.raw_bytes
+    first_latest = Observation.objects.get(
+        batch_id=first.batch_id,
+        series__key="bea-real-pce-mom",
+        value_date=datetime(2026, 5, 1, tzinfo=UTC),
+    )
+    first_signature = (first_latest.pk, first_latest.value, first_latest.updated_at)
+
+    second_result = BEAPIOReleaseProvider(
+        client=_bea_pio_client(
+            _bea_pio_summary_workbook(),
+            _bea_pio_section2_workbook(),
+        )
+    ).personal_income_outlays()
+    second = record_provider_result(
+        second_result,
+        persist=_store_bea_release_observations_v2,
+    )
+
+    assert second.status == IngestionRun.Status.SUCCESS
+    assert second.batch_id != first.batch_id
+    assert RawArtifact.objects.filter(run__in=(first, second)).count() == 2
+    assert Observation.objects.filter(batch_id=second.batch_id).count() == len(
+        second_result.records
+    )
+    first_latest.refresh_from_db()
+    assert (first_latest.pk, first_latest.value, first_latest.updated_at) == first_signature
+
+
+@pytest.mark.django_db
+def test_bea_gdp_v2_rejects_normalized_supplemental_and_metadata_tamper(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    normalized = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    normalized.records[0]["value"] = Decimal("999")
+    normalized_run = record_provider_result(
+        normalized,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert normalized_run.status == IngestionRun.Status.FAILED
+    assert "normalized observations" in normalized_run.error
+
+    supplemental = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    next(
+        item
+        for item in supplemental.supplemental_records["release_vintages"]
+        if item["estimate_round"] == "Second"
+    )["value"] = Decimal("999")
+    supplemental_run = record_provider_result(
+        supplemental,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert supplemental_run.status == IngestionRun.Status.FAILED
+    assert "supplemental observations" in supplemental_run.error
+
+    metadata = BEAGDPReleaseProvider(
+        client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
+    ).gdp_pce()
+    metadata.metadata["source_url"] = "https://mirror.invalid/gdp"
+    metadata_run = record_provider_result(
+        metadata,
+        persist=_store_bea_release_observations_v2,
+    )
+    assert metadata_run.status == IngestionRun.Status.FAILED
+    assert "replay metadata" in metadata_run.error
+
+    failed_runs = (normalized_run, supplemental_run, metadata_run)
+    assert not Observation.objects.filter(batch_id__in=[run.batch_id for run in failed_runs])
+    assert not ReleaseVintageObservation.objects.filter(
+        batch_id__in=[run.batch_id for run in failed_runs]
+    )
+    assert not RawArtifact.objects.filter(run__in=failed_runs)
+
+
 def test_census_release_provider_prefers_current_workbook_and_preserves_status():
     workbook = _census_current_workbook()
     result = CensusMARTSReleaseProvider(
@@ -672,6 +1551,18 @@ def test_census_release_provider_prefers_current_workbook_and_preserves_status()
     assert result.metadata["artifacts"][0]["sha256"] == hashlib.sha256(
         workbook
     ).hexdigest()
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="census-release",
+        expected_dataset="marts:retail-food-services",
+    )
+    assert set(evidence.responses) == {"current-workbook"}
+    assert evidence.responses["current-workbook"] == workbook
+    replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["workbook_scope"] == "current"
     by_series_and_date = {
         (item["series_id"], item["date"]): item for item in result.records
     }
@@ -692,7 +1583,49 @@ def test_census_release_provider_prefers_current_workbook_and_preserves_status()
     ] == Decimal("0.4")
 
 
-def test_census_release_provider_falls_back_to_latest_archive_file():
+def test_census_release_replay_rechecks_xlsx_expanded_size(monkeypatch):
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    assert result.ok
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_expanded_bytes", 1)
+
+    with pytest.raises(ValueError, match="expanded-size limit"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
+def test_census_release_replay_rechecks_compressed_workbook_size(monkeypatch):
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    assert result.ok
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_workbook_bytes", 1)
+
+    with pytest.raises(ValueError, match="evidence contract"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
+@pytest.mark.parametrize(
+    "workbook",
+    [
+        _census_current_workbook(
+            sales_declaration="(Total sales estimates are shown in thousands of dollars.)"
+        ),
+        _census_current_workbook(
+            change_declaration="(Estimates are shown as basis points.)"
+        ),
+    ],
+)
+def test_census_release_provider_rejects_wrong_declared_units(workbook):
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(workbook, current_status=200)
+    ).monthly_retail_sales()
+
+    assert not result.ok
+    assert "declared unit is invalid" in result.error
+
+
+def test_census_release_provider_falls_back_to_latest_archive_file(monkeypatch):
     workbook = _census_workbook()
     result = CensusMARTSReleaseProvider(client=_census_client(workbook)).monthly_retail_sales()
 
@@ -700,7 +1633,36 @@ def test_census_release_provider_falls_back_to_latest_archive_file():
     assert result.metadata["workbook_url"].endswith("rs2604.xlsx")
     assert result.metadata["workbook_scope"] == "historical_archive"
     assert result.metadata["latest_value_date"] == "2026-04-01"
-    assert result.metadata["artifacts"][1]["sha256"] == hashlib.sha256(workbook).hexdigest()
+    assert result.metadata["artifacts"][-1]["sha256"] == hashlib.sha256(workbook).hexdigest()
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="census-release",
+        expected_dataset="marts:retail-food-services",
+    )
+    assert set(evidence.responses) == {
+        "current-workbook-failure",
+        "recent-probe-01",
+        "recent-probe-02",
+        "recent-probe-03",
+        "recent-probe-04",
+        "archive-index",
+        "archive-workbook",
+    }
+    assert evidence.responses["archive-workbook"] == workbook
+    assert b"rs2604.xlsx" in evidence.responses["archive-index"]
+    replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["workbook_scope"] == "historical_archive"
+
+    def regress_archive_time(entry):
+        if entry["role"] == "archive-workbook":
+            entry["response_witness"]["retrieved_at"] = "2000-01-01T00:00:00+00:00"
+
+    regressed = _rebuild_census_evidence(result.raw_bytes, regress_archive_time)
+    with pytest.raises(ValueError, match="chronology regressed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(regressed)
     by_series_and_date = {
         (item["series_id"], item["date"]): item for item in result.records
     }
@@ -716,6 +1678,362 @@ def test_census_release_provider_falls_back_to_latest_archive_file():
     assert by_series_and_date[("CENSUS-MRTS-44X72-SM-SA-MOM", "2026-04-01")][
         "metadata"
     ]["estimate_status"] == "(a)"
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_workbook_bytes", 1)
+    with pytest.raises(ValueError, match="archive evidence contract"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
+def test_census_release_recent_probe_beats_stale_archive_index(monkeypatch):
+    workbook = _census_current_workbook()
+    anchor = datetime(2026, 7, 16, tzinfo=UTC)
+    monkeypatch.setattr(
+        CensusMARTSReleaseProvider,
+        "_utc_now",
+        staticmethod(lambda: anchor),
+    )
+    candidates = CensusMARTSReleaseProvider._recent_archive_candidates(anchor)
+    may_url = next(url for month, url in candidates if month == "2026-05")
+    attempted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        attempted.append(url)
+        if url == CENSUS_MARTS_CURRENT_WORKBOOK:
+            return httpx.Response(403, text="current workbook unavailable")
+        if url == may_url:
+            return httpx.Response(
+                200,
+                content=workbook,
+                headers={
+                    "content-type": XLSX_CONTENT_TYPE,
+                    "last-modified": "July 15, 2026",
+                },
+            )
+        if url.startswith(CENSUS_MARTS_INDEX) and url.endswith(".xlsx"):
+            return httpx.Response(404, text="not yet published")
+        if url == CENSUS_MARTS_INDEX:
+            return httpx.Response(
+                200,
+                text='<html><a href="rs2604.xlsx">stale latest</a></html>',
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    result = CensusMARTSReleaseProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        )
+    ).monthly_retail_sales()
+
+    assert result.ok
+    assert result.metadata["workbook_url"] == may_url
+    assert result.metadata["workbook_scope"] == "recent_archive_probe"
+    assert result.metadata["latest_value_date"] == "2026-05-01"
+    assert CENSUS_MARTS_INDEX not in attempted
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="census-release",
+        expected_dataset="marts:retail-food-services",
+    )
+    assert set(evidence.responses) == {
+        "current-workbook-failure",
+        "recent-probe-01",
+        "recent-probe-02",
+    }
+    responses = {
+        item["role"]: item for item in evidence.manifest["responses"]
+    }
+    assert responses["current-workbook-failure"]["response_witness"][
+        "status_code"
+    ] == 403
+    assert responses["recent-probe-01"]["response_witness"]["status_code"] == 404
+    response = responses["recent-probe-02"]
+    assert response["request_witness"]["candidate_month"] == "2026-05"
+    assert response["request_witness"]["candidate_rank"] == 2
+    assert response["url"] == may_url
+    replay_records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
+        result.raw_bytes
+    )
+    assert replay_records == result.records
+    assert replay_metadata["workbook_scope"] == "recent_archive_probe"
+
+    missing_failure = _rebuild_census_evidence(
+        result.raw_bytes,
+        lambda entry: entry["role"] != "recent-probe-01",
+    )
+    with pytest.raises(ValueError, match="not consecutive"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(missing_failure)
+
+    def fake_rank(entry):
+        if entry["role"] == "recent-probe-02":
+            entry["request_witness"]["candidate_rank"] = 1
+
+    forged_rank = _rebuild_census_evidence(result.raw_bytes, fake_rank)
+    with pytest.raises(ValueError, match="request chain"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(forged_rank)
+
+    def future_anchor(entry):
+        if entry["role"].startswith("recent-probe-"):
+            rank = entry["request_witness"]["candidate_rank"]
+            future_candidates = CensusMARTSReleaseProvider._recent_archive_candidates(
+                datetime(2079, 1, 1, tzinfo=UTC)
+            )
+            entry["request_witness"]["probe_anchor_month"] = "2079-01"
+            entry["request_witness"]["candidate_month"] = future_candidates[rank - 1][0]
+            entry["url"] = future_candidates[rank - 1][1]
+            entry["response_witness"]["retrieved_at"] = "2079-01-15T12:00:00+00:00"
+
+    forged_future = _rebuild_census_evidence(result.raw_bytes, future_anchor)
+    with pytest.raises(ValueError, match="future"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(forged_future)
+
+    missing_current = _rebuild_census_evidence(
+        result.raw_bytes,
+        lambda entry: entry["role"] != "current-workbook-failure",
+    )
+    with pytest.raises(ValueError, match="roles"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(missing_current)
+
+    def current_after_probe(entry):
+        if entry["role"] == "current-workbook-failure":
+            entry["response_witness"]["retrieved_at"] = (
+                anchor + timedelta(minutes=1)
+            ).isoformat()
+
+    regressed_from_current = _rebuild_census_evidence(
+        result.raw_bytes,
+        current_after_probe,
+    )
+    with pytest.raises(ValueError, match="chronology regressed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(regressed_from_current)
+
+    def first_probe_after_second(entry):
+        if entry["role"] == "recent-probe-01":
+            entry["response_witness"]["retrieved_at"] = (
+                anchor + timedelta(minutes=1)
+            ).isoformat()
+
+    regressed_between_probes = _rebuild_census_evidence(
+        result.raw_bytes,
+        first_probe_after_second,
+    )
+    with pytest.raises(ValueError, match="chronology regressed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(regressed_between_probes)
+
+    def mismatched_anchor(entry):
+        if entry["role"].startswith("recent-probe-"):
+            rank = entry["request_witness"]["candidate_rank"]
+            candidates = CensusMARTSReleaseProvider._recent_archive_candidates(
+                datetime(2026, 6, 1, tzinfo=UTC)
+            )
+            entry["request_witness"]["probe_anchor_month"] = "2026-06"
+            entry["request_witness"]["candidate_month"] = candidates[rank - 1][0]
+            entry["url"] = candidates[rank - 1][1]
+
+    anchor_mismatch = _rebuild_census_evidence(
+        result.raw_bytes,
+        mismatched_anchor,
+    )
+    with pytest.raises(ValueError, match="anchor is not bound"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(anchor_mismatch)
+
+    monkeypatch.setattr(CensusMARTSReleaseProvider, "max_workbook_bytes", 1)
+    with pytest.raises(ValueError, match="success content type"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [
+        ("forbidden", "non-terminal HTTP 403"),
+        ("network", "lacks an exact response"),
+        ("redirect", "left its exact official URL"),
+        ("malformed", "failed strict workbook validation"),
+    ],
+)
+def test_census_recent_probe_fails_closed_without_directory_fallback(
+    monkeypatch,
+    mode,
+    message,
+):
+    anchor = datetime(2026, 7, 16, tzinfo=UTC)
+    monkeypatch.setattr(
+        CensusMARTSReleaseProvider,
+        "_utc_now",
+        staticmethod(lambda: anchor),
+    )
+    first_url = CensusMARTSReleaseProvider._recent_archive_candidates(anchor)[0][1]
+    redirected_url = f"{first_url}?redirected=1"
+    attempted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        attempted.append(url)
+        if url == CENSUS_MARTS_CURRENT_WORKBOOK:
+            return httpx.Response(403, text="current workbook unavailable")
+        if url == first_url:
+            if mode == "forbidden":
+                return httpx.Response(403, text="forbidden")
+            if mode == "network":
+                raise httpx.ConnectError("probe transport failed", request=request)
+            if mode == "redirect":
+                return httpx.Response(302, headers={"location": redirected_url})
+            return httpx.Response(
+                200,
+                content=b"<html>not an XLSX workbook</html>",
+                headers={"content-type": XLSX_CONTENT_TYPE},
+            )
+        if url == redirected_url:
+            return httpx.Response(404, text="redirect target")
+        if url == CENSUS_MARTS_INDEX:
+            raise AssertionError("directory fallback must not run")
+        raise AssertionError(f"unexpected URL: {url}")
+
+    result = CensusMARTSReleaseProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        )
+    ).monthly_retail_sales()
+
+    assert not result.ok
+    assert message in result.error
+    assert CENSUS_MARTS_INDEX not in attempted
+
+
+def test_census_release_recent_probe_rejects_filename_content_month_mismatch(monkeypatch):
+    april_workbook = _census_workbook()
+    anchor = datetime(2026, 7, 16, tzinfo=UTC)
+    monkeypatch.setattr(
+        CensusMARTSReleaseProvider,
+        "_utc_now",
+        staticmethod(lambda: anchor),
+    )
+    candidates = CensusMARTSReleaseProvider._recent_archive_candidates(anchor)
+    may_url = next(url for month, url in candidates if month == "2026-05")
+    attempted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        attempted.append(url)
+        if url == CENSUS_MARTS_CURRENT_WORKBOOK:
+            return httpx.Response(403, text="current workbook unavailable")
+        if url == may_url:
+            return httpx.Response(
+                200,
+                content=april_workbook,
+                headers={"content-type": XLSX_CONTENT_TYPE},
+            )
+        if url.startswith(CENSUS_MARTS_INDEX) and url.endswith(".xlsx"):
+            return httpx.Response(404, text="not published")
+        if url == CENSUS_MARTS_INDEX:
+            return httpx.Response(
+                200,
+                text='<html><a href="rs2605.xlsx">mismatched</a></html>',
+                headers={"content-type": "text/html"},
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    result = CensusMARTSReleaseProvider(
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=True,
+        )
+    ).monthly_retail_sales()
+
+    assert not result.ok
+    assert "filename month does not match workbook latest month" in result.error
+    assert CENSUS_MARTS_INDEX not in attempted
+
+
+def test_census_release_replay_rejects_legacy_workbook_role():
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    assert result.ok
+
+    def legacy_role(entry):
+        if entry["role"] == "current-workbook":
+            entry["role"] = "workbook"
+
+    legacy = _rebuild_census_evidence(result.raw_bytes, legacy_role)
+    with pytest.raises(ValueError, match="roles are incomplete or mixed"):
+        CensusMARTSReleaseProvider.replay_evidence_bundle(legacy)
+
+
+@pytest.mark.django_db
+def test_census_standalone_archive_diagnostic_is_rejected_by_official_persistence(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_workbook())
+    ).historical_monthly_retail_sales()
+    assert result.ok
+    _, metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(result.raw_bytes)
+    assert metadata["workbook_scope"] == "historical_archive"
+
+    run = record_provider_result(
+        result,
+        persist=_store_census_marts_observations_v2,
+    )
+
+    assert run.status == IngestionRun.Status.FAILED
+    assert "release evidence roles are invalid" in run.error
+    assert not Observation.objects.filter(batch_id=run.batch_id).exists()
+    assert not RawArtifact.objects.filter(run=run).exists()
+
+
+@pytest.mark.django_db
+def test_census_release_v2_keeps_private_append_only_workbook_evidence(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    first_result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    first = record_provider_result(
+        first_result,
+        persist=_store_census_marts_observations_v2,
+    )
+    assert first.status == IngestionRun.Status.SUCCESS
+    assert Observation.objects.filter(batch_id=first.batch_id).count() == len(
+        first_result.records
+    )
+    artifact = RawArtifact.objects.get(run=first)
+    artifact_path = (
+        Path(settings.RAW_ARTIFACT_ROOT)
+        / artifact.sha256[:2]
+        / f"{artifact.sha256}.bin"
+    )
+    assert artifact_path.read_bytes() == first_result.raw_bytes
+    first_rows = list(
+        Observation.objects.filter(batch_id=first.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    )
+
+    second_result = CensusMARTSReleaseProvider(
+        client=_census_client(_census_current_workbook(), current_status=200)
+    ).monthly_retail_sales()
+    second = record_provider_result(
+        second_result,
+        persist=_store_census_marts_observations_v2,
+    )
+    assert second.status == IngestionRun.Status.SUCCESS
+    assert second.batch_id != first.batch_id
+    assert RawArtifact.objects.filter(run__in=(first, second)).count() == 2
+    assert Observation.objects.filter(batch_id=second.batch_id).count() == len(
+        second_result.records
+    )
+    assert list(
+        Observation.objects.filter(batch_id=first.batch_id)
+        .order_by("pk")
+        .values_list("pk", "value", "updated_at")
+    ) == first_rows
 
 
 @pytest.mark.django_db
@@ -729,54 +2047,25 @@ def test_consumer_dashboard_refuses_partial_metric_set():
 
 
 @pytest.mark.django_db
-def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(client):
+def test_release_workbooks_persist_lineage_and_publish_gdp_page(
+    client,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
     bea = BEAGDPReleaseProvider(
         client=_bea_client(_bea_vintage_workbook(), _bea_comparison_workbook())
     ).gdp_pce()
-    census_api = _census_api_result()
-    census = CensusMARTSReleaseProvider(
-        client=_census_client(_census_current_workbook(), current_status=200)
-    ).monthly_retail_sales()
-    pio = BEAPIOReleaseProvider(
-        client=_bea_pio_client(
-            _bea_pio_summary_workbook(),
-            _bea_pio_section2_workbook(),
-        )
-    ).personal_income_outlays()
-    bea_run = record_provider_result(bea, persist=_store_release_workbook_observations)
-    census_api_run = record_provider_result(
-        census_api, persist=_store_release_workbook_observations
+    bea_run = record_provider_result(
+        bea,
+        persist=_store_bea_release_observations_v2,
     )
-    census_run = record_provider_result(census, persist=_store_release_workbook_observations)
-    pio_run = record_provider_result(pio, persist=_store_release_workbook_observations)
-    g19, household = _consumer_credit_results()
-    g19_run = record_provider_result(g19, persist=_store_release_workbook_observations)
-    household_run = record_provider_result(
-        household, persist=_store_release_workbook_observations
-    )
-    _record_census_revision_witness(
-        [census_api_run, census_run, pio_run, g19_run, household_run]
-    )
-    census_api_run.refresh_from_db()
-
-    dashboards = {
-        item.key: item
-        for item in publish_official_dashboards(keys={"gdp", "consumer"})
-    }
+    gdp_snapshot = publish_gdp_revision(run=bea_run)
+    assert gdp_snapshot is not None
+    dashboards = {"gdp": gdp_snapshot}
 
     assert bea_run.status == "success"
-    assert census_api_run.status == "success"
-    assert census_run.status == "success"
-    assert pio_run.status == "success"
-    assert g19_run.status == "success"
-    assert household_run.status == "success"
-    witness = census_api_run.metadata["legacy_revision_witness"]
-    assert witness["latest_value_date"] == "2026-05-01"
-    assert witness["overlap_count"] == 7
-    assert witness["differences"] == []
-    assert RawArtifact.objects.filter(run=bea_run).count() == 3
-    assert RawArtifact.objects.filter(run=census_run).count() == 1
-    assert RawArtifact.objects.filter(run=pio_run).count() == 3
+    assert RawArtifact.objects.filter(run=bea_run).count() == 1
     assert ReleaseVintageObservation.objects.filter(batch_id=bea_run.batch_id).count() == 12
     second_estimate = ReleaseVintageObservation.objects.get(
         batch_id=bea_run.batch_id,
@@ -792,11 +2081,8 @@ def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(cl
     assert second_estimate.license_scope == second_estimate.source.license_scope
     assert second_estimate.fallback_source is None
     assert second_estimate.quality_status == Observation.Quality.FRESH
-    assert set(dashboards) == {"gdp", "consumer"}
+    assert set(dashboards) == {"gdp"}
     gdp = {item["key"]: item for item in dashboards["gdp"].data["metrics"]}
-    consumer = {
-        item["key"]: item for item in dashboards["consumer"].data["metrics"]
-    }
     assert gdp["bea-a191rl"]["display_value"] == "2.10%"
     assert gdp["bea-dpcerl"]["display_value"] == "0.50%"
     assert gdp["bea-pce-contribution"]["display_value"] == "0.37pp"
@@ -818,52 +2104,6 @@ def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(cl
     assert revision_section["title"] == "GDP 发布轮次与修订路径"
     assert revision_section["rows"][0]["display_value"] == "1.60% → 2.10%"
     assert "累计修订 +0.50pp" in revision_section["rows"][0]["status"]
-    assert consumer["census-mrts-44x72-sm-sa"]["display_value"] == "763,705 USD mn"
-    assert consumer["census-mrts-44x72-sm-sa-mom"]["display_value"] == "0.90%"
-    assert consumer["census-mrts-44x72-sm-sa-mom"]["change_unit"] == "pp"
-    assert consumer["bea-real-pce-mom"]["display_value"] == "0.30%"
-    assert consumer["bea-real-dpi-mom"]["display_value"] == "0.30%"
-    assert consumer["bea-personal-saving-rate"]["display_value"] == "3.00%"
-    assert consumer["census-mrts-44x72-sm-sa"]["source_key"] == "census-release"
-    assert consumer["bea-real-pce-mom"]["source_key"] == "bea-pio-release"
-    assert consumer["g19-consumer-credit-outstanding-sa"]["source_key"] == (
-        "federal-reserve-g19"
-    )
-    assert consumer["hhdc-total-debt-balance"]["source_key"] == (
-        "ny-fed-household-credit"
-    )
-    charts = dashboards["consumer"].data["charts"]
-    assert [chart["key"] for chart in charts] == [
-        "retail-sales",
-        "real-consumption-income-momentum",
-        "personal-saving-rate",
-        "consumer-credit-composition",
-        "household-debt-composition",
-        "household-debt-delinquency",
-    ]
-    assert dashboards["consumer"].data["chart_data"] == charts[0]["data"]
-    assert dashboards["consumer"].data["contract_version"] == 1
-    assert dashboards["consumer"].data["retail_batch_id"] == str(
-        census_run.batch_id
-    )
-    assert charts[0]["source_keys"] == ["census-release"]
-    assert charts[1]["source_keys"] == ["bea-pio-release"]
-    assert charts[0]["data"][0]["_lineage"]["零售与餐饮服务"][
-        "source_key"
-    ] == "census-release"
-    response = client.get("/economy/consumer/")
-    body = response.content.decode()
-    assert response.status_code == 200
-    assert body.count(" data-chart ") == 6
-    assert "dashboard-chart-0" in body
-    assert "dashboard-chart-1" in body
-    assert "dashboard-chart-2" in body
-    assert "dashboard-chart-5" in body
-    assert "实际 PCE 环比" in body
-    assert "3.00%" in body
-    assert "U.S. Bureau of Economic Analysis Personal Income and Outlays Releases" in body
-    assert "New York Fed Household Debt and Credit" in body
-    assert "来源：Atlas Macro Derived Data" not in body
     gdp_response = client.get("/economy/gdp/")
     gdp_body = gdp_response.content.decode()
     assert gdp_response.status_code == 200
@@ -871,76 +2111,8 @@ def test_release_workbooks_persist_lineage_and_publish_gdp_and_consumer_pages(cl
     assert "GDP 发布轮次与修订路径" in gdp_body
     assert "1.60% → 2.10%" in gdp_body
 
-    runs = [
-        bea_run,
-        census_api_run,
-        census_run,
-        pio_run,
-        g19_run,
-        household_run,
-    ]
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp",
-        "consumer",
-    }
-    census_api_run.dataset = "mrts:44X72:SM:yes"
-    census_api_run.save(update_fields=["dataset", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp",
-        "consumer",
-    }
-    census_api_run.dataset = "marts:44X72:SM:yes"
-    census_api_run.save(update_fields=["dataset", "updated_at"])
-    census_run.dataset = "marts:44X72:SM:yes"
-    census_run.save(update_fields=["dataset", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {"gdp"}
-    census_run.dataset = "marts:retail-food-services"
-    census_run.save(update_fields=["dataset", "updated_at"])
-    latest_pio = Observation.objects.filter(
-        series__key="bea-real-pce-mom",
-        source__key="bea-pio-release",
-    ).latest("value_date")
-    latest_pio.batch_id = uuid.uuid4()
-    latest_pio.save(update_fields=["batch_id", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp"
-    }
-    _mark_latest_dashboards_stale({"consumer"}, runs)
-    stale = DashboardSnapshot.objects.filter(key="consumer").latest("created_at")
-    assert stale.quality_status == "stale"
-    assert "上一版完整快照" in stale.data["refresh_failure"]["reason"]
-
-    latest_pio.batch_id = pio_run.batch_id
-    latest_pio.save(update_fields=["batch_id", "updated_at"])
-    latest_g19 = Observation.objects.filter(
-        series__key="g19-consumer-credit-outstanding-sa",
-        source__key="federal-reserve-g19",
-    ).latest("value_date")
-    latest_g19.batch_id = uuid.uuid4()
-    latest_g19.save(update_fields=["batch_id", "updated_at"])
-    assert _keys_with_current_required_batches({"gdp", "consumer"}, runs) == {
-        "gdp"
-    }
-    latest_g19.batch_id = g19_run.batch_id
-    latest_g19.save(update_fields=["batch_id", "updated_at"])
-    assert publish_official_dashboards(keys={"consumer"}) == []
-    recovered = DashboardSnapshot.objects.get(pk=stale.pk)
-    assert "refresh_failure" not in recovered.data
-
-    census_api_run.status = IngestionRun.Status.PARTIAL
-    census_api_run.row_count = 0
-    census_api_run.metadata = {"reason": "CENSUS_API_KEY is not configured"}
-    census_api_run.save(
-        update_fields=["status", "row_count", "metadata", "updated_at"]
-    )
-    assert _publishable_keys_for_source_groups(runs, MACRO_PUBLICATION_GROUPS) == {
-        "gdp",
-        "consumer",
-    }
-
-
 @pytest.mark.django_db
-def test_dashboard_deduplicates_same_date_across_provider_sources():
+def test_gdp_generic_publisher_rejects_legacy_cross_source_rows():
     older_fetch = datetime(2026, 6, 25, tzinfo=UTC)
     newer_fetch = older_fetch + timedelta(days=1)
     record_provider_result(
@@ -968,13 +2140,8 @@ def test_dashboard_deduplicates_same_date_across_provider_sources():
         persist=store_series_observations,
     )
 
-    dashboard = publish_official_dashboards(keys={"gdp"})[0]
-    metric = next(item for item in dashboard.data["metrics"] if item["key"] == "bea-a191rl")
-    chart = dashboard.data["chart_data"]
-
-    assert metric["display_value"] == "2.10%"
-    assert metric["change"] == 1.6
-    assert [row["date"] for row in chart] == ["2025-10-01", "2026-01-01"]
+    assert publish_official_dashboards(keys={"gdp"}) == []
+    assert not DashboardSnapshot.objects.filter(key="gdp").exists()
 
 
 @pytest.mark.django_db
@@ -1076,15 +2243,15 @@ def test_economy_catalog_separates_live_release_data_from_remaining_gaps():
     [
         (
             ("success", "success", "success", "success", "success", "success"),
-            {"gdp", "consumer"},
+            {"gdp"},
         ),
         (
             ("success", "failed", "success", "success", "success", "success"),
-            {"gdp", "consumer"},
+            {"gdp"},
         ),
         (("success", "success", "failed", "success", "success", "success"), {"gdp"}),
         (("success", "success", "success", "failed", "success", "success"), {"gdp"}),
-        (("failed", "success", "success", "success", "success", "success"), {"consumer"}),
+        (("failed", "success", "success", "success", "success", "success"), set()),
         (("success", "success", "success", "success", "partial", "success"), {"gdp"}),
         (("success", "success", "success", "success", "success", "failed"), {"gdp"}),
     ],

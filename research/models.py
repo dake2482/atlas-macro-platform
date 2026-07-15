@@ -126,7 +126,7 @@ class IngestionRun(TimestampedModel):
         PARTIAL = "partial", "部分成功"
 
     source = models.ForeignKey(Source, on_delete=models.PROTECT, related_name="runs")
-    dataset = models.CharField(max_length=120)
+    dataset = models.CharField(max_length=512)
     batch_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     started_at = models.DateTimeField()
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -271,8 +271,9 @@ class ReleaseVintageObservation(TimestampedModel):
                     "release_date",
                     "estimate_round",
                     "source",
+                    "batch_id",
                 ],
-                name="release_vintage_series_period_round_source",
+                name="release_vintage_series_period_round_source_batch",
             )
         ]
         indexes = [

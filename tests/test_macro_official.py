@@ -1,18 +1,32 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, date, datetime
 from decimal import Decimal
+from io import BytesIO
+from pathlib import Path
 
 import httpx
 import pytest
+from openpyxl import Workbook
 
 from research.macro_official import BEANIPAProvider, CensusMARTSProvider
-from research.models import Observation, RawArtifact
+from research.macro_releases import (
+    CENSUS_MARTS_CURRENT_WORKBOOK,
+    XLSX_CONTENT_TYPE,
+    CensusMARTSReleaseProvider,
+)
+from research.models import Observation, RawArtifact, SeriesDefinition
 from research.official_data import (
-    _store_release_workbook_observations,
+    _store_census_marts_observations_v2,
     publish_official_dashboards,
 )
 from research.providers import ProviderResult
+from research.raw_evidence import (
+    EvidenceResponse,
+    build_evidence_bundle,
+    parse_evidence_bundle,
+)
 from research.services import record_provider_result, store_series_observations
 
 
@@ -205,6 +219,88 @@ def _census_history_payload() -> list[list[str]]:
     return rows
 
 
+def _census_release_workbook() -> bytes:
+    workbook = Workbook()
+    sales = workbook.active
+    sales.title = "Table 1."
+    sales.cell(
+        4,
+        1,
+        "(Total sales estimates are shown in millions of dollars and are based on official survey data.)",
+    )
+    sales.cell(6, 10, "Adjusted2")
+    sales.cell(7, 10, 2026)
+    sales.cell(7, 13, 2025)
+    for column, label in enumerate(
+        ("May.3", "Apr.", "Mar.", "May.", "Apr."), start=10
+    ):
+        sales.cell(8, column, label)
+    for column, status in enumerate(
+        ("(a)", "(r)", "(r)", "(r)", "(r)"), start=10
+    ):
+        sales.cell(9, column, status)
+    sales.cell(11, 2, "Retail & food services, ")
+    sales.cell(12, 2, "  total")
+    for column, value in enumerate(
+        (763705, 757036, 754013, 714568, 721903), start=10
+    ):
+        sales.cell(12, column, value)
+
+    changes = workbook.create_sheet("Table 2.")
+    changes.cell(
+        3,
+        1,
+        "(Estimates are shown as percents and are based on official survey data.)",
+    )
+    changes.cell(8, 3, "May. 2026 Advance")
+    changes.cell(8, 5, "Apr. 2026 Revised")
+    changes.cell(11, 3, "Apr. 2026")
+    changes.cell(11, 4, "May. 2025")
+    changes.cell(11, 5, "Mar. 2026")
+    changes.cell(11, 6, "Apr. 2025")
+    changes.cell(14, 2, "Retail & food services, ")
+    changes.cell(15, 2, "  total")
+    for column, value in enumerate((0.9, 6.9, 0.4, 4.8), start=3):
+        changes.cell(15, column, value)
+
+    output = BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
+def _census_release_result() -> ProviderResult:
+    fetched_at = datetime(2026, 6, 17, 12, tzinfo=UTC)
+    raw_bytes, bundle_metadata = build_evidence_bundle(
+        provider="census-release",
+        dataset="marts:retail-food-services",
+        responses=(
+            EvidenceResponse(
+                role="current-workbook",
+                url=CENSUS_MARTS_CURRENT_WORKBOOK,
+                content_type=XLSX_CONTENT_TYPE,
+                raw_bytes=_census_release_workbook(),
+                request_witness={"method": "GET", "scope": "current"},
+                response_witness={
+                    "status_code": 200,
+                    "last_modified": "June 17, 2026",
+                    "retrieved_at": fetched_at.isoformat(),
+                },
+            ),
+        ),
+    )
+    records, replay_metadata = CensusMARTSReleaseProvider.replay_evidence_bundle(
+        raw_bytes
+    )
+    return ProviderResult(
+        provider="census-release",
+        dataset="marts:retail-food-services",
+        records=records,
+        fetched_at=fetched_at,
+        raw_bytes=raw_bytes,
+        metadata={**bundle_metadata, **replay_metadata},
+    )
+
+
 def test_census_marts_uses_correct_endpoint_full_history_and_sanitized_artifact():
     def handler(request):
         assert request.url.path == "/data/timeseries/eits/marts"
@@ -229,16 +325,16 @@ def test_census_marts_uses_correct_endpoint_full_history_and_sanitized_artifact(
     by_series_date = {
         (item["series_id"], item["date"]): item for item in result.records
     }
-    latest = by_series_date[("CENSUS-MRTS-44X72-SM-SA", "2026-05-01")]
+    latest = by_series_date[("CENSUS-API-MRTS-44X72-SM-SA", "2026-05-01")]
     assert latest["value"] == Decimal("763705")
     assert latest["metadata"]["estimate_status"] == "advance"
-    assert by_series_date[("CENSUS-MRTS-44X72-SM-SA-MOM", "2026-05-01")][
+    assert by_series_date[("CENSUS-API-MRTS-44X72-SM-SA-MOM", "2026-05-01")][
         "value"
     ] == Decimal("0.9")
-    assert by_series_date[("CENSUS-MRTS-44X72-SM-SA-MOM", "2026-04-01")][
+    assert by_series_date[("CENSUS-API-MRTS-44X72-SM-SA-MOM", "2026-04-01")][
         "value"
     ] == Decimal("0.4")
-    assert by_series_date[("CENSUS-MRTS-44X72-SM-SA-YOY", "2026-05-01")][
+    assert by_series_date[("CENSUS-API-MRTS-44X72-SM-SA-YOY", "2026-05-01")][
         "value"
     ] == Decimal("6.9")
     assert result.metadata["vintage_policy"] == "current-latest-vintage"
@@ -249,10 +345,31 @@ def test_census_marts_uses_correct_endpoint_full_history_and_sanitized_artifact(
     artifact = result.metadata["artifacts"][0]
     assert artifact["url"] == "https://api.census.gov/data/timeseries/eits/marts"
     assert "census-test-key" not in str(result.metadata)
+    evidence = parse_evidence_bundle(
+        result.raw_bytes,
+        expected_provider="census",
+        expected_dataset="marts:44X72:SM:yes",
+    )
+    assert set(evidence.responses) == {"marts-api-response"}
+    assert json.loads(evidence.responses["marts-api-response"]) == (
+        _census_history_payload()
+    )
+    assert b"census-test-key" not in result.raw_bytes
+    replay_records, replay_metadata = CensusMARTSProvider.replay_evidence_bundle(
+        result.raw_bytes,
+        expected_dataset=result.dataset,
+    )
+    assert replay_records == result.records
+    assert replay_metadata["requested_time"] == "from 1992"
 
 
 @pytest.mark.django_db
-def test_census_marts_persists_sanitized_raw_artifact_and_all_derived_rows():
+def test_census_marts_v2_persists_private_append_only_artifact_and_derived_rows(
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+
     def handler(_request):
         return httpx.Response(200, json=_census_history_payload())
 
@@ -260,19 +377,23 @@ def test_census_marts_persists_sanitized_raw_artifact_and_all_derived_rows():
         api_key="census-test-key", client=_client(handler)
     ).monthly_retail_sales(time="from 1992", require_complete_history=True)
     run = record_provider_result(
-        result, persist=_store_release_workbook_observations
+        result, persist=_store_census_marts_observations_v2
     )
 
     assert run.status == "success"
     assert run.row_count == 1226
     artifact = RawArtifact.objects.get(run=run)
-    assert artifact.uri.startswith(
-        "https://api.census.gov/data/timeseries/eits/marts#sha256="
-    )
+    assert artifact.uri.startswith("private://census/")
     assert "census-test-key" not in artifact.uri
+    path = (
+        Path(settings.RAW_ARTIFACT_ROOT)
+        / artifact.sha256[:2]
+        / f"{artifact.sha256}.bin"
+    )
+    assert path.read_bytes() == result.raw_bytes
     derived = Observation.objects.get(
         source__key="census",
-        series__key="census-mrts-44x72-sm-sa-mom",
+        series__key="census-api-mrts-44x72-sm-sa-mom",
         value_date=datetime(2026, 5, 1, tzinfo=UTC),
     )
     assert derived.metadata["input_batch_ids"] == [str(run.batch_id)]
@@ -280,6 +401,78 @@ def test_census_marts_persists_sanitized_raw_artifact_and_all_derived_rows():
         "2026-04-01",
         "2026-05-01",
     ]
+
+    first_signature = (derived.pk, derived.value, derived.updated_at)
+    repeated_result = CensusMARTSProvider(
+        api_key="census-test-key", client=_client(handler)
+    ).monthly_retail_sales(time="from 1992", require_complete_history=True)
+    repeated = record_provider_result(
+        repeated_result,
+        persist=_store_census_marts_observations_v2,
+    )
+    assert repeated.status == "success"
+    assert repeated.batch_id != run.batch_id
+    derived.refresh_from_db()
+    assert (derived.pk, derived.value, derived.updated_at) == first_signature
+    assert Observation.objects.filter(batch_id=repeated.batch_id).count() == 1226
+
+
+@pytest.mark.parametrize(
+    "persistence_order",
+    [("release", "api"), ("api", "release")],
+)
+@pytest.mark.django_db
+def test_census_release_and_api_persist_with_distinct_series_identities(
+    persistence_order,
+    settings,
+    tmp_path,
+):
+    settings.RAW_ARTIFACT_ROOT = tmp_path / "raw-artifacts"
+    api_result = CensusMARTSProvider(
+        api_key="census-test-key",
+        client=_client(
+            lambda _request: httpx.Response(200, json=_census_history_payload())
+        ),
+    ).monthly_retail_sales(time="from 1992", require_complete_history=True)
+    release_result = _census_release_result()
+    assert api_result.ok, api_result.error
+    assert release_result.ok, release_result.error
+    results = {"api": api_result, "release": release_result}
+
+    runs = {
+        identity: record_provider_result(
+            results[identity],
+            persist=_store_census_marts_observations_v2,
+        )
+        for identity in persistence_order
+    }
+
+    assert {identity: run.status for identity, run in runs.items()} == {
+        "api": "success",
+        "release": "success",
+    }, {identity: run.error for identity, run in runs.items()}
+    api_keys = set(
+        Observation.objects.filter(source__key="census").values_list(
+            "series__key", flat=True
+        )
+    )
+    release_keys = set(
+        Observation.objects.filter(source__key="census-release").values_list(
+            "series__key", flat=True
+        )
+    )
+    assert api_keys == {
+        "census-api-mrts-44x72-sm-sa",
+        "census-api-mrts-44x72-sm-sa-mom",
+        "census-api-mrts-44x72-sm-sa-yoy",
+    }
+    assert release_keys == {
+        "census-mrts-44x72-sm-sa",
+        "census-mrts-44x72-sm-sa-mom",
+        "census-mrts-44x72-sm-sa-yoy",
+    }
+    assert api_keys.isdisjoint(release_keys)
+    assert SeriesDefinition.objects.filter(key__in=api_keys | release_keys).count() == 6
 
 
 def test_census_marts_fails_closed_on_missing_history_month_and_redacts_http_error():
@@ -304,20 +497,66 @@ def test_census_marts_fails_closed_on_missing_history_month_and_redacts_http_err
     assert "census-test-key" not in failed.error
 
 
+@pytest.mark.parametrize(
+    ("violation", "message"),
+    [
+        ("header", "headers do not match"),
+        ("row-width", "row width"),
+        ("dimension", "violated requested dimensions"),
+    ],
+)
+def test_census_marts_parser_rejects_schema_and_dimension_fallbacks(
+    violation,
+    message,
+):
+    payload = _census_history_payload()
+    if violation == "header":
+        payload[0][0] = "unexpected_program_code"
+    elif violation == "row-width":
+        payload[1].pop()
+    else:
+        category_index = payload[0].index("category_code")
+        payload[1][category_index] = ""
+
+    with pytest.raises(ValueError, match=message):
+        CensusMARTSProvider.parse_response_bytes(
+            json.dumps(payload).encode(),
+            category_code="44X72",
+            seasonally_adjusted=True,
+            require_complete_history=True,
+            as_of_date=date(2026, 5, 31),
+        )
+
+
 def test_census_marts_derives_month_from_slot_when_response_uses_year_predicate():
     def handler(_request):
         return httpx.Response(
             200,
             json=[
-                [
-                    "cell_value",
-                    "time_slot_id",
-                    "seasonally_adj",
-                    "category_code",
-                    "data_type_code",
-                    "time",
-                ],
-                ["100", "M02", "no", "44X72", "SM", "2025"],
+                    [
+                        "program_code",
+                        "cell_value",
+                        "time_slot_id",
+                        "time_slot_date",
+                        "time_slot_name",
+                        "error_data",
+                        "seasonally_adj",
+                        "category_code",
+                        "data_type_code",
+                        "time",
+                    ],
+                    [
+                        "MARTS",
+                        "100",
+                        "M02",
+                        "",
+                        "February",
+                        "no",
+                        "no",
+                        "44X72",
+                        "SM",
+                        "2025",
+                    ],
             ],
         )
 
@@ -331,7 +570,7 @@ def test_census_marts_derives_month_from_slot_when_response_uses_year_predicate(
 
 
 @pytest.mark.django_db
-def test_bea_and_census_observations_publish_gdp_and_consumer_pages():
+def test_legacy_generic_rows_cannot_publish_gdp_or_consumer():
     fetched_at = datetime(2026, 7, 12, tzinfo=UTC)
     bea = ProviderResult(
         provider="bea",
@@ -376,12 +615,5 @@ def test_bea_and_census_observations_publish_gdp_and_consumer_pages():
 
     dashboards = {item.key: item for item in publish_official_dashboards()}
 
-    assert {"gdp", "consumer"} <= dashboards.keys()
-    gdp_metrics = {item["key"]: item for item in dashboards["gdp"].data["metrics"]}
-    assert gdp_metrics["bea-a191rl"]["display_value"] == "2.10%"
-    consumer_metrics = {
-        item["key"]: item for item in dashboards["consumer"].data["metrics"]
-    }
-    assert consumer_metrics["census-mrts-44x72-sm-sa"]["display_value"] == (
-        "763,700 USD mn"
-    )
+    assert "gdp" not in dashboards
+    assert "consumer" not in dashboards

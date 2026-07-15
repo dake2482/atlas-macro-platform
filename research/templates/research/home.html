@@ -17,7 +17,7 @@
       {% if active_thesis %}
         <div class="panel-body !p-5">
           <p class="max-w-3xl text-[15px] leading-8 text-[var(--ink)]">{{ active_thesis.summary }}</p>
-          <div class="mt-3 flex flex-wrap gap-2 text-[10px] text-[var(--muted)]"><span>daily-evidence v1 · 快照 <span class="mono">#{{ snapshot_metadata.id }}</span></span><span>批次 <span class="mono">{{ snapshot_metadata.batch_id }}</span></span><span>质量 {{ snapshot_metadata.quality_status }}</span>{% if snapshot_metadata.stale %}<span class="badge badge-warning">历史冻结</span>{% endif %}</div>
+          <div class="mt-3 flex flex-wrap gap-2 text-[10px] text-[var(--muted)]"><span>{% if snapshot_metadata.contract_label %}{{ snapshot_metadata.contract_label }} · {% endif %}快照 <span class="mono">#{{ snapshot_metadata.id }}</span></span><span>批次 <span class="mono">{{ snapshot_metadata.batch_id }}</span></span><span>质量 {{ snapshot_metadata.quality_status }}</span>{% if snapshot_metadata.stale %}<span class="badge badge-warning">历史冻结</span>{% endif %}</div>
           <div class="mt-6 grid gap-5 md:grid-cols-2">
             <div>
               <p class="eyebrow !text-[var(--muted)]">Evidence / 核心证据</p>

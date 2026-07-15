@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import zipfile
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from io import BytesIO
@@ -21,6 +21,11 @@ from urllib.parse import urljoin, urlparse
 from openpyxl import load_workbook
 
 from .providers import HTTPProvider, ProviderResult
+from .raw_evidence import (
+    EvidenceResponse,
+    build_evidence_bundle,
+    parse_evidence_bundle,
+)
 
 BEA_GDP_PAGE = "https://www.bea.gov/data/gdp/gross-domestic-product"
 BEA_PIO_PAGE = "https://www.bea.gov/data/income-saving/personal-income"
@@ -233,7 +238,10 @@ class BEAGDPReleaseProvider(_ReleaseWorkbookProvider):
     def gdp_pce(self) -> ProviderResult:
         dataset = "gdp-release-workbooks"
         try:
-            page, page_type, _ = self._download(BEA_GDP_PAGE, expected="html")
+            page, page_type, page_modified = self._download(
+                BEA_GDP_PAGE,
+                expected="html",
+            )
             comparison_url = self._comparison_url(page)
             vintage, vintage_type, vintage_modified = self._download(
                 BEA_VINTAGE_WORKBOOK, expected="xlsx"
@@ -244,6 +252,34 @@ class BEAGDPReleaseProvider(_ReleaseWorkbookProvider):
             records, vintage_records, release_metadata = self._parse_vintage(vintage)
             component_records, component_metadata = self._parse_components(comparison)
             records.extend(component_records)
+            raw_bundle, raw_bundle_metadata = build_evidence_bundle(
+                provider=self.key,
+                dataset=dataset,
+                responses=(
+                    EvidenceResponse(
+                        role="release-page",
+                        url=BEA_GDP_PAGE,
+                        content_type=page_type,
+                        raw_bytes=page,
+                        response_witness={"last_modified": page_modified},
+                    ),
+                    EvidenceResponse(
+                        role="vintage-workbook",
+                        url=BEA_VINTAGE_WORKBOOK,
+                        content_type=vintage_type,
+                        raw_bytes=vintage,
+                        response_witness={"last_modified": vintage_modified},
+                    ),
+                    EvidenceResponse(
+                        role="comparison-workbook",
+                        url=comparison_url,
+                        content_type=comparison_type,
+                        raw_bytes=comparison,
+                        request_witness={"discovered_from": "release-page"},
+                        response_witness={"last_modified": comparison_modified},
+                    ),
+                ),
+            )
         except Exception as exc:
             return ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
 
@@ -257,7 +293,9 @@ class BEAGDPReleaseProvider(_ReleaseWorkbookProvider):
             dataset=dataset,
             records=records,
             supplemental_records={"release_vintages": vintage_records},
+            raw_bytes=raw_bundle,
             metadata={
+                **raw_bundle_metadata,
                 "source_url": BEA_GDP_PAGE,
                 "vintage_workbook_url": BEA_VINTAGE_WORKBOOK,
                 "comparison_workbook_url": comparison_url,
@@ -270,6 +308,65 @@ class BEAGDPReleaseProvider(_ReleaseWorkbookProvider):
                 ),
                 "unit_policy": "source workbook values retained",
                 "attribution": "U.S. Bureau of Economic Analysis",
+                **release_metadata,
+                **component_metadata,
+            },
+        )
+
+    @classmethod
+    def replay_evidence_bundle(
+        cls,
+        raw_bytes: bytes,
+    ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]], dict[str, Any]]:
+        evidence = parse_evidence_bundle(
+            raw_bytes,
+            expected_provider=cls.key,
+            expected_dataset="gdp-release-workbooks",
+        )
+        if set(evidence.responses) != {
+            "release-page",
+            "vintage-workbook",
+            "comparison-workbook",
+        }:
+            raise ValueError("BEA GDP evidence roles are incomplete")
+        urls = {
+            item["role"]: item["url"]
+            for item in evidence.manifest["responses"]
+        }
+        page = evidence.responses["release-page"]
+        comparison_url = cls._comparison_url(page)
+        if (
+            urls["release-page"] != BEA_GDP_PAGE
+            or urls["vintage-workbook"] != BEA_VINTAGE_WORKBOOK
+            or urls["comparison-workbook"] != comparison_url
+        ):
+            raise ValueError("BEA GDP evidence URLs do not match official discovery")
+        vintage_bytes = _xlsx_bytes(
+            evidence.responses["vintage-workbook"],
+            max_expanded_bytes=cls.max_expanded_bytes,
+        )
+        comparison_bytes = _xlsx_bytes(
+            evidence.responses["comparison-workbook"],
+            max_expanded_bytes=cls.max_expanded_bytes,
+        )
+        records, vintage_records, release_metadata = cls._parse_vintage(
+            vintage_bytes
+        )
+        validator = cls()
+        try:
+            component_records, component_metadata = validator._parse_components(
+                comparison_bytes
+            )
+        finally:
+            validator.close()
+        records.extend(component_records)
+        return (
+            records,
+            {"release_vintages": vintage_records},
+            {
+                "source_url": BEA_GDP_PAGE,
+                "vintage_workbook_url": BEA_VINTAGE_WORKBOOK,
+                "comparison_workbook_url": comparison_url,
                 **release_metadata,
                 **component_metadata,
             },
@@ -702,7 +799,10 @@ class BEAPIOReleaseProvider(_ReleaseWorkbookProvider):
     def personal_income_outlays(self) -> ProviderResult:
         dataset = "personal-income-outlays-release"
         try:
-            page, page_type, _ = self._download(BEA_PIO_PAGE, expected="html")
+            page, page_type, page_modified = self._download(
+                BEA_PIO_PAGE,
+                expected="html",
+            )
             summary_url = self._workbook_url(page)
             summary, summary_type, summary_modified = self._download(
                 summary_url, expected="xlsx"
@@ -713,13 +813,43 @@ class BEAPIOReleaseProvider(_ReleaseWorkbookProvider):
             summary_values, summary_metadata = self._parse_summary_workbook(summary)
             records, history_metadata = self._parse_section2_workbook(section2)
             self._cross_check(summary_values, summary_metadata, records, history_metadata)
+            raw_bundle, raw_bundle_metadata = build_evidence_bundle(
+                provider=self.key,
+                dataset=dataset,
+                responses=(
+                    EvidenceResponse(
+                        role="release-page",
+                        url=BEA_PIO_PAGE,
+                        content_type=page_type,
+                        raw_bytes=page,
+                        response_witness={"last_modified": page_modified},
+                    ),
+                    EvidenceResponse(
+                        role="summary-workbook",
+                        url=summary_url,
+                        content_type=summary_type,
+                        raw_bytes=summary,
+                        request_witness={"discovered_from": "release-page"},
+                        response_witness={"last_modified": summary_modified},
+                    ),
+                    EvidenceResponse(
+                        role="section2-workbook",
+                        url=BEA_PIO_SECTION2_WORKBOOK,
+                        content_type=section2_type,
+                        raw_bytes=section2,
+                        response_witness={"last_modified": section2_modified},
+                    ),
+                ),
+            )
         except Exception as exc:
             return ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
         return ProviderResult(
             provider=self.key,
             dataset=dataset,
             records=records,
+            raw_bytes=raw_bundle,
             metadata={
+                **raw_bundle_metadata,
                 "source_url": BEA_PIO_PAGE,
                 "summary_workbook_url": summary_url,
                 "section2_workbook_url": BEA_PIO_SECTION2_WORKBOOK,
@@ -744,6 +874,63 @@ class BEAPIOReleaseProvider(_ReleaseWorkbookProvider):
                 "summary_cross_check": "passed",
             },
         )
+
+    @classmethod
+    def replay_evidence_bundle(
+        cls,
+        raw_bytes: bytes,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        evidence = parse_evidence_bundle(
+            raw_bytes,
+            expected_provider=cls.key,
+            expected_dataset="personal-income-outlays-release",
+        )
+        if set(evidence.responses) != {
+            "release-page",
+            "summary-workbook",
+            "section2-workbook",
+        }:
+            raise ValueError("BEA PIO evidence roles are incomplete")
+        urls = {
+            item["role"]: item["url"]
+            for item in evidence.manifest["responses"]
+        }
+        page = evidence.responses["release-page"]
+        summary_url = cls._workbook_url(page)
+        if (
+            urls["release-page"] != BEA_PIO_PAGE
+            or urls["summary-workbook"] != summary_url
+            or urls["section2-workbook"] != BEA_PIO_SECTION2_WORKBOOK
+        ):
+            raise ValueError("BEA PIO evidence URLs do not match official discovery")
+        summary_bytes = _xlsx_bytes(
+            evidence.responses["summary-workbook"],
+            max_expanded_bytes=cls.max_expanded_bytes,
+        )
+        section2_bytes = _xlsx_bytes(
+            evidence.responses["section2-workbook"],
+            max_expanded_bytes=cls.max_expanded_bytes,
+        )
+        summary_values, summary_metadata = cls._parse_summary_workbook(
+            summary_bytes
+        )
+        records, history_metadata = cls._parse_section2_workbook(
+            section2_bytes
+        )
+        cls._cross_check(
+            summary_values,
+            summary_metadata,
+            records,
+            history_metadata,
+        )
+        return records, {
+            "source_url": BEA_PIO_PAGE,
+            "summary_workbook_url": summary_url,
+            "section2_workbook_url": BEA_PIO_SECTION2_WORKBOOK,
+            **history_metadata,
+            "summary_workbook_title": summary_metadata["workbook_title"],
+            "summary_cross_check": "passed",
+        }
 
     @staticmethod
     def _workbook_url(page: bytes) -> str:
@@ -1064,54 +1251,150 @@ class CensusMARTSReleaseProvider(_ReleaseWorkbookProvider):
     key = "census-release"
     base_url = "https://www2.census.gov"
     allowed_hosts = frozenset({"www2.census.gov", "www.census.gov"})
+    recent_archive_probe_count = 4
+    max_probe_failure_bytes = 64 * 1024
 
     def monthly_retail_sales(self) -> ProviderResult:
         dataset = "marts:retail-food-services"
-        current_error: Exception | None = None
         try:
-            workbook_url = CENSUS_MARTS_CURRENT_WORKBOOK
-            content, content_type, last_modified = self._download(
-                workbook_url, expected="xlsx"
+            (
+                current_status,
+                current_content,
+                current_type,
+                current_modified,
+                current_retrieved_at,
+            ) = self._bounded_census_response(
+                CENSUS_MARTS_CURRENT_WORKBOOK,
+                expected_host="www.census.gov",
             )
-            records, metadata = self._parse_workbook(content)
-            artifacts = [_artifact(workbook_url, content, content_type)]
-            source_url = CENSUS_MARTS_RELEASE_PAGE
-            workbook_scope = "current"
+            if not current_content:
+                raise ValueError("Census current workbook response body is empty")
+            current_response_witness: dict[str, Any] = {
+                "status_code": current_status,
+                "retrieved_at": current_retrieved_at.isoformat(),
+            }
+            current_role = "current-workbook-failure"
+            if current_status == 200:
+                _xlsx_bytes(
+                    current_content,
+                    max_expanded_bytes=self.max_expanded_bytes,
+                )
+                if current_type not in {
+                    XLSX_CONTENT_TYPE,
+                    "application/octet-stream",
+                    "application/zip",
+                }:
+                    raise ValueError(
+                        f"unexpected current XLSX content type: {current_type}"
+                    )
+                self._parse_workbook(current_content)
+                current_role = "current-workbook"
+                current_response_witness["last_modified"] = current_modified
+            elif current_status not in {403, 404, 410}:
+                raise ValueError(
+                    f"Census current workbook returned HTTP {current_status}"
+                )
+            current_response = EvidenceResponse(
+                role=current_role,
+                url=CENSUS_MARTS_CURRENT_WORKBOOK,
+                content_type=current_type,
+                raw_bytes=current_content,
+                request_witness={"method": "GET", "scope": "current"},
+                response_witness=current_response_witness,
+            )
+            artifacts = [
+                _artifact(
+                    CENSUS_MARTS_CURRENT_WORKBOOK,
+                    current_content,
+                    current_type,
+                )
+            ]
+            if current_status == 200:
+                responses = (current_response,)
+                result_fetched_at = current_retrieved_at
+            else:
+                probe_responses, probe_artifacts, probe_fetched_at = (
+                    self._probe_recent_archives()
+                )
+                responses = (current_response, *probe_responses)
+                artifacts.extend(probe_artifacts)
+                if probe_fetched_at is not None:
+                    result_fetched_at = probe_fetched_at
+                else:
+                    index, index_type, index_modified = self._download(
+                        CENSUS_MARTS_INDEX,
+                        expected="html",
+                    )
+                    workbook_url = self._latest_workbook_url(index)
+                    content, content_type, last_modified = self._download(
+                        workbook_url,
+                        expected="xlsx",
+                    )
+                    result_fetched_at = self._utc_now()
+                    self._validate_archive_month(
+                        workbook_url,
+                        self._parse_workbook(content)[1],
+                    )
+                    responses = (
+                        *responses,
+                        EvidenceResponse(
+                            role="archive-index",
+                            url=CENSUS_MARTS_INDEX,
+                            content_type=index_type,
+                            raw_bytes=index,
+                            request_witness={
+                                "method": "GET",
+                                "scope": "historical_archive",
+                            },
+                            response_witness={"last_modified": index_modified},
+                        ),
+                        EvidenceResponse(
+                            role="archive-workbook",
+                            url=workbook_url,
+                            content_type=content_type,
+                            raw_bytes=content,
+                            request_witness={
+                                "method": "GET",
+                                "scope": "historical_archive",
+                                "discovered_from": "archive-index",
+                            },
+                            response_witness={
+                                "last_modified": last_modified,
+                                "retrieved_at": result_fetched_at.isoformat(),
+                            },
+                        ),
+                    )
+                    artifacts.extend(
+                        [
+                            _artifact(CENSUS_MARTS_INDEX, index, index_type),
+                            _artifact(workbook_url, content, content_type),
+                        ]
+                    )
         except Exception as exc:
-            current_error = exc
-            try:
-                index, index_type, _ = self._download(CENSUS_MARTS_INDEX, expected="html")
-                workbook_url = self._latest_workbook_url(index)
-                content, content_type, last_modified = self._download(
-                    workbook_url, expected="xlsx"
-                )
-                records, metadata = self._parse_workbook(content)
-                artifacts = [
-                    _artifact(CENSUS_MARTS_INDEX, index, index_type),
-                    _artifact(workbook_url, content, content_type),
-                ]
-                source_url = CENSUS_MARTS_INDEX
-                workbook_scope = "historical_archive"
-            except Exception as fallback_exc:
-                reason = (
-                    f"current {type(current_error).__name__}: {current_error}; "
-                    f"archive {type(fallback_exc).__name__}: {fallback_exc}"
-                )
-                return ProviderResult.failure(self.key, dataset, reason)
+            return ProviderResult.failure(
+                self.key,
+                dataset,
+                f"{type(exc).__name__}: {exc}",
+            )
+        try:
+            raw_bundle, bundle_metadata = build_evidence_bundle(
+                provider=self.key,
+                dataset=dataset,
+                responses=responses,
+            )
+            records, metadata = self.replay_evidence_bundle(raw_bundle)
+        except Exception as exc:
+            return ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
         return ProviderResult(
             provider=self.key,
             dataset=dataset,
             records=records,
+            raw_bytes=raw_bundle,
+            fetched_at=result_fetched_at,
             metadata={
-                "source_url": source_url,
-                "workbook_url": workbook_url,
-                "workbook_last_modified": last_modified,
-                "workbook_scope": workbook_scope,
-                "artifacts": artifacts,
-                "unit": "USD millions",
-                "vintage_policy": "latest official advance/preliminary/revised release workbook",
-                "attribution": "U.S. Census Bureau",
+                **bundle_metadata,
                 **metadata,
+                "artifacts": artifacts,
             },
         )
 
@@ -1119,10 +1402,46 @@ class CensusMARTSReleaseProvider(_ReleaseWorkbookProvider):
         """Parse the latest archived MARTS workbook; used only for diagnostics/tests."""
         dataset = "marts:retail-food-services"
         try:
-            index, index_type, _ = self._download(CENSUS_MARTS_INDEX, expected="html")
+            index, index_type, index_modified = self._download(
+                CENSUS_MARTS_INDEX, expected="html"
+            )
             workbook_url = self._latest_workbook_url(index)
             content, content_type, last_modified = self._download(workbook_url, expected="xlsx")
-            records, metadata = self._parse_workbook(content)
+            result_fetched_at = self._utc_now()
+            responses = (
+                EvidenceResponse(
+                    role="archive-index",
+                    url=CENSUS_MARTS_INDEX,
+                    content_type=index_type,
+                    raw_bytes=index,
+                    request_witness={
+                        "method": "GET",
+                        "scope": "historical_archive",
+                    },
+                    response_witness={"last_modified": index_modified},
+                ),
+                EvidenceResponse(
+                    role="archive-workbook",
+                    url=workbook_url,
+                    content_type=content_type,
+                    raw_bytes=content,
+                    request_witness={
+                        "method": "GET",
+                        "scope": "historical_archive",
+                        "discovered_from": "archive-index",
+                    },
+                    response_witness={
+                        "last_modified": last_modified,
+                        "retrieved_at": result_fetched_at.isoformat(),
+                    },
+                ),
+            )
+            raw_bundle, bundle_metadata = build_evidence_bundle(
+                provider=self.key,
+                dataset=dataset,
+                responses=responses,
+            )
+            records, metadata = self.replay_evidence_bundle(raw_bundle)
         except Exception as exc:
             return ProviderResult.failure(self.key, dataset, f"{type(exc).__name__}: {exc}")
         artifacts = [
@@ -1133,18 +1452,496 @@ class CensusMARTSReleaseProvider(_ReleaseWorkbookProvider):
             provider=self.key,
             dataset=dataset,
             records=records,
+            raw_bytes=raw_bundle,
+            fetched_at=result_fetched_at,
             metadata={
-                "source_url": CENSUS_MARTS_INDEX,
-                "workbook_url": workbook_url,
-                "workbook_last_modified": last_modified,
-                "workbook_scope": "historical_archive",
-                "artifacts": artifacts,
-                "unit": "USD millions",
-                "vintage_policy": "latest official advance/preliminary/revised release workbook",
-                "attribution": "U.S. Census Bureau",
+                **bundle_metadata,
                 **metadata,
+                "artifacts": artifacts,
             },
         )
+
+    @classmethod
+    def replay_evidence_bundle(
+        cls,
+        raw_bytes: bytes,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        evidence = parse_evidence_bundle(
+            raw_bytes,
+            expected_provider=cls.key,
+            expected_dataset="marts:retail-food-services",
+        )
+        roles = set(evidence.responses)
+        entries = {
+            item["role"]: item for item in evidence.manifest["responses"]
+        }
+        allowed_workbook_types = {
+            XLSX_CONTENT_TYPE,
+            "application/octet-stream",
+            "application/zip",
+        }
+        if roles == {"current-workbook"}:
+            workbook_entry = entries["current-workbook"]
+            if (
+                workbook_entry["url"] != CENSUS_MARTS_CURRENT_WORKBOOK
+                or workbook_entry["content_type"] not in allowed_workbook_types
+                or not 0 < int(workbook_entry.get("size_bytes") or 0)
+                <= cls.max_workbook_bytes
+                or workbook_entry["request_witness"]
+                != {"method": "GET", "scope": "current"}
+                or set(workbook_entry["response_witness"])
+                != {"status_code", "last_modified", "retrieved_at"}
+                or workbook_entry["response_witness"]["status_code"] != 200
+            ):
+                raise ValueError("Census current-workbook evidence contract is invalid")
+            workbook_scope = "current"
+            source_url = CENSUS_MARTS_RELEASE_PAGE
+            workbook_url = CENSUS_MARTS_CURRENT_WORKBOOK
+            workbook_bytes = evidence.responses["current-workbook"]
+        elif "current-workbook-failure" in roles:
+            current_failure = entries["current-workbook-failure"]
+            current_retrieved_at = cls._validate_current_failure(current_failure)
+            probe_roles = {
+                role for role in roles if re.fullmatch(r"recent-probe-\d{2}", role)
+            }
+            remaining_roles = roles - probe_roles - {"current-workbook-failure"}
+            if not remaining_roles:
+                workbook_entry, _probe_retrieved_at = cls._validate_recent_probe_evidence(
+                    evidence,
+                    entries,
+                    require_success=True,
+                    not_before=current_retrieved_at,
+                )
+                if workbook_entry is None:
+                    raise ValueError("Census recent probe success evidence is missing")
+                workbook_scope = "recent_archive_probe"
+                source_url = workbook_entry["url"]
+                workbook_url = workbook_entry["url"]
+                workbook_bytes = evidence.responses[workbook_entry["role"]]
+            elif remaining_roles == {"archive-index", "archive-workbook"}:
+                if len(probe_roles) != cls.recent_archive_probe_count:
+                    raise ValueError(
+                        "Census directory fallback lacks every bounded probe failure"
+                    )
+                probe_success, probe_retrieved_at = cls._validate_recent_probe_evidence(
+                    evidence,
+                    entries,
+                    require_success=False,
+                    not_before=current_retrieved_at,
+                )
+                if probe_success is not None:
+                    raise ValueError("Census directory fallback contains a probe success")
+                index_entry = entries["archive-index"]
+                workbook_entry = entries["archive-workbook"]
+                cls._validate_archive_index_entries(
+                    evidence,
+                    index_entry,
+                    workbook_entry,
+                    allowed_workbook_types,
+                    not_before=probe_retrieved_at,
+                )
+                workbook_url = cls._latest_workbook_url(
+                    evidence.responses["archive-index"]
+                )
+                if workbook_entry["url"] != workbook_url:
+                    raise ValueError(
+                        "Census archive workbook URL does not replay from index"
+                    )
+                workbook_scope = "historical_archive"
+                source_url = CENSUS_MARTS_INDEX
+                workbook_bytes = evidence.responses["archive-workbook"]
+            else:
+                raise ValueError("Census MARTS fallback evidence roles are mixed")
+        elif roles == {"archive-index", "archive-workbook"}:
+            index_entry = entries["archive-index"]
+            workbook_entry = entries["archive-workbook"]
+            cls._validate_archive_index_entries(
+                evidence,
+                index_entry,
+                workbook_entry,
+                allowed_workbook_types,
+                not_before=None,
+            )
+            workbook_url = cls._latest_workbook_url(
+                evidence.responses["archive-index"]
+            )
+            if workbook_entry["url"] != workbook_url:
+                raise ValueError("Census archive workbook URL does not replay from index")
+            workbook_scope = "historical_archive"
+            source_url = CENSUS_MARTS_INDEX
+            workbook_bytes = evidence.responses["archive-workbook"]
+        else:
+            raise ValueError("Census MARTS evidence roles are incomplete or mixed")
+        workbook_bytes = _xlsx_bytes(
+            workbook_bytes,
+            max_expanded_bytes=cls.max_expanded_bytes,
+        )
+        records, parser_metadata = cls._parse_workbook(workbook_bytes)
+        if workbook_scope != "current":
+            cls._validate_archive_month(workbook_url, parser_metadata)
+        retrieved_at = cls._validated_retrieved_at(
+            workbook_entry["response_witness"].get("retrieved_at")
+        )
+        vintage_policy = "latest official current release workbook"
+        if workbook_scope == "recent_archive_probe":
+            vintage_policy = (
+                "first valid workbook after exact bounded newer-candidate 404/410 proofs"
+            )
+        elif workbook_scope == "historical_archive":
+            vintage_policy = (
+                "newest workbook listed by the captured directory index; "
+                "global recency is not asserted"
+            )
+        return records, {
+            "source_url": source_url,
+            "workbook_url": workbook_url,
+            "workbook_last_modified": workbook_entry["response_witness"][
+                "last_modified"
+            ],
+            "workbook_scope": workbook_scope,
+            "retrieved_at": retrieved_at.isoformat(),
+            "unit": "USD millions",
+            "vintage_policy": vintage_policy,
+            "attribution": "U.S. Census Bureau",
+            **parser_metadata,
+        }
+
+    @classmethod
+    def _validated_retrieved_at(cls, value: Any) -> datetime:
+        try:
+            retrieved_at = datetime.fromisoformat(
+                str(value).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Census retrieval timestamp is invalid") from exc
+        if retrieved_at.tzinfo is None:
+            raise ValueError("Census retrieval timestamp must be timezone-aware")
+        retrieved_at = retrieved_at.astimezone(UTC)
+        if retrieved_at > cls._utc_now().astimezone(UTC) + timedelta(minutes=5):
+            raise ValueError("Census retrieval timestamp is in the future")
+        return retrieved_at
+
+    @classmethod
+    def _validate_current_failure(cls, entry: dict[str, Any]) -> datetime:
+        witness = entry.get("response_witness")
+        if (
+            entry.get("url") != CENSUS_MARTS_CURRENT_WORKBOOK
+            or entry.get("request_witness") != {"method": "GET", "scope": "current"}
+            or not isinstance(witness, dict)
+            or set(witness) != {"status_code", "retrieved_at"}
+            or witness.get("status_code") not in {403, 404, 410}
+            or int(entry.get("size_bytes") or 0) <= 0
+            or int(entry.get("size_bytes") or 0) > cls.max_probe_failure_bytes
+        ):
+            raise ValueError("Census current-workbook failure evidence is invalid")
+        return cls._validated_retrieved_at(witness["retrieved_at"])
+
+    @classmethod
+    def _validate_recent_probe_evidence(
+        cls,
+        evidence: Any,
+        entries: dict[str, dict[str, Any]],
+        *,
+        require_success: bool,
+        not_before: datetime,
+    ) -> tuple[dict[str, Any] | None, datetime]:
+        probe_roles = sorted(
+            role for role in entries if re.fullmatch(r"recent-probe-\d{2}", role)
+        )
+        if not probe_roles or len(probe_roles) > cls.recent_archive_probe_count:
+            raise ValueError("Census recent archive probe role count is invalid")
+        expected_roles = [f"recent-probe-{rank:02d}" for rank in range(1, len(probe_roles) + 1)]
+        if probe_roles != expected_roles:
+            raise ValueError("Census recent archive probe roles are not consecutive")
+        first_request = entries[probe_roles[0]].get("request_witness")
+        if not isinstance(first_request, dict):
+            raise ValueError("Census recent archive probe request witness is invalid")
+        try:
+            anchor = datetime.strptime(
+                str(first_request["probe_anchor_month"]),
+                "%Y-%m",
+            ).replace(tzinfo=UTC)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Census recent archive probe anchor is invalid") from exc
+        candidates = cls._recent_archive_candidates(anchor)
+        previous_retrieved_at = not_before.astimezone(UTC)
+        success_entry: dict[str, Any] | None = None
+        for rank, role in enumerate(probe_roles, start=1):
+            entry = entries[role]
+            request = entry.get("request_witness")
+            response = entry.get("response_witness")
+            if (
+                not isinstance(request, dict)
+                or not isinstance(response, dict)
+                or set(request)
+                != {
+                    "method",
+                    "scope",
+                    "discovered_from",
+                    "probe_anchor_month",
+                    "candidate_month",
+                    "candidate_rank",
+                    "candidate_count",
+                }
+                or request.get("method") != "GET"
+                or request.get("scope") != "recent_archive_probe"
+                or request.get("discovered_from") != "bounded_utc_calendar_probe"
+                or request.get("probe_anchor_month") != anchor.strftime("%Y-%m")
+                or request.get("candidate_month") != candidates[rank - 1][0]
+                or request.get("candidate_rank") != rank
+                or request.get("candidate_count") != cls.recent_archive_probe_count
+                or entry.get("url") != candidates[rank - 1][1]
+            ):
+                raise ValueError("Census recent archive probe request chain is invalid")
+            retrieved_at = cls._validated_retrieved_at(response.get("retrieved_at"))
+            if retrieved_at < previous_retrieved_at:
+                raise ValueError("Census recent archive retrieval chronology regressed")
+            if rank == 1 and retrieved_at.strftime("%Y-%m") != anchor.strftime("%Y-%m"):
+                raise ValueError("Census probe anchor is not bound to first retrieval month")
+            previous_retrieved_at = retrieved_at
+            status_code = response.get("status_code")
+            if status_code in {404, 410}:
+                if (
+                    set(response) != {"status_code", "retrieved_at"}
+                    or int(entry.get("size_bytes") or 0) <= 0
+                    or int(entry.get("size_bytes") or 0) > cls.max_probe_failure_bytes
+                ):
+                    raise ValueError("Census recent archive terminal failure proof is invalid")
+                continue
+            if status_code != 200 or set(response) != {
+                "status_code",
+                "last_modified",
+                "retrieved_at",
+            }:
+                raise ValueError("Census recent archive probe status chain is invalid")
+            if rank != len(probe_roles) or success_entry is not None:
+                raise ValueError("Census recent archive success is not the final unique response")
+            if entry.get("content_type") not in {
+                XLSX_CONTENT_TYPE,
+                "application/octet-stream",
+                "application/zip",
+            } or not 0 < int(entry.get("size_bytes") or 0) <= cls.max_workbook_bytes:
+                raise ValueError("Census recent archive success content type is invalid")
+            workbook = _xlsx_bytes(
+                evidence.responses[role],
+                max_expanded_bytes=cls.max_expanded_bytes,
+            )
+            _, parser_metadata = cls._parse_workbook(workbook)
+            cls._validate_archive_month(str(entry["url"]), parser_metadata)
+            success_entry = entry
+        if require_success and success_entry is None:
+            raise ValueError("Census recent archive probe lacks its final success")
+        if not require_success and success_entry is not None:
+            raise ValueError("Census failed probe chain unexpectedly contains a success")
+        return success_entry, previous_retrieved_at
+
+    @classmethod
+    def _validate_archive_index_entries(
+        cls,
+        evidence: Any,
+        index_entry: dict[str, Any],
+        workbook_entry: dict[str, Any],
+        allowed_workbook_types: set[str],
+        *,
+        not_before: datetime | None,
+    ) -> None:
+        if (
+            index_entry.get("url") != CENSUS_MARTS_INDEX
+            or index_entry.get("content_type") != "text/html"
+            or index_entry.get("request_witness")
+            != {"method": "GET", "scope": "historical_archive"}
+            or set(index_entry.get("response_witness") or {}) != {"last_modified"}
+            or len(evidence.responses.get("archive-index", b"")) > cls.max_html_bytes
+            or workbook_entry.get("content_type") not in allowed_workbook_types
+            or not 0 < int(workbook_entry.get("size_bytes") or 0)
+            <= cls.max_workbook_bytes
+            or workbook_entry.get("request_witness")
+            != {
+                "method": "GET",
+                "scope": "historical_archive",
+                "discovered_from": "archive-index",
+            }
+            or set(workbook_entry.get("response_witness") or {})
+            != {"last_modified", "retrieved_at"}
+        ):
+            raise ValueError("Census archive evidence contract is invalid")
+        retrieved_at = cls._validated_retrieved_at(
+            workbook_entry["response_witness"]["retrieved_at"]
+        )
+        if not_before is not None and retrieved_at < not_before.astimezone(UTC):
+            raise ValueError("Census archive fallback retrieval chronology regressed")
+
+    @classmethod
+    def _recent_archive_candidates(
+        cls,
+        anchor: datetime | None = None,
+    ) -> list[tuple[str, str]]:
+        anchor = anchor or datetime.now(UTC)
+        year, month = anchor.year, anchor.month
+        candidates = []
+        for _ in range(cls.recent_archive_probe_count):
+            month -= 1
+            if month == 0:
+                year -= 1
+                month = 12
+            filename = f"rs{year % 100:02d}{month:02d}.xlsx"
+            candidates.append(
+                (f"{year:04d}-{month:02d}", urljoin(CENSUS_MARTS_INDEX, filename))
+            )
+        return candidates
+
+    @staticmethod
+    def _utc_now() -> datetime:
+        return datetime.now(UTC)
+
+    def _probe_recent_archives(
+        self,
+    ) -> tuple[
+        tuple[EvidenceResponse, ...],
+        list[dict[str, Any]],
+        datetime | None,
+    ]:
+        anchor = self._utc_now()
+        candidates = self._recent_archive_candidates(anchor)
+        responses: list[EvidenceResponse] = []
+        artifacts: list[dict[str, Any]] = []
+        for rank, (candidate_month, workbook_url) in enumerate(candidates, start=1):
+            try:
+                (
+                    status_code,
+                    content,
+                    content_type,
+                    last_modified,
+                    retrieved_at,
+                ) = self._bounded_census_response(
+                    workbook_url,
+                    expected_host="www2.census.gov",
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"Census recent archive probe lacks an exact response at rank {rank}: {exc}"
+                ) from exc
+            request_witness = {
+                "method": "GET",
+                "scope": "recent_archive_probe",
+                "discovered_from": "bounded_utc_calendar_probe",
+                "probe_anchor_month": anchor.strftime("%Y-%m"),
+                "candidate_month": candidate_month,
+                "candidate_rank": rank,
+                "candidate_count": self.recent_archive_probe_count,
+            }
+            response_witness: dict[str, Any] = {
+                "status_code": status_code,
+                "retrieved_at": retrieved_at.isoformat(),
+            }
+            if status_code == 200:
+                response_witness["last_modified"] = last_modified
+                try:
+                    _xlsx_bytes(
+                        content,
+                        max_expanded_bytes=self.max_expanded_bytes,
+                    )
+                    if content_type not in {
+                        XLSX_CONTENT_TYPE,
+                        "application/octet-stream",
+                        "application/zip",
+                    }:
+                        raise ValueError(
+                            f"unexpected XLSX content type: {content_type}"
+                        )
+                    _, parser_metadata = self._parse_workbook(content)
+                    self._validate_archive_month(workbook_url, parser_metadata)
+                except Exception as exc:
+                    raise ValueError(
+                        "Census recent archive returned HTTP 200 but failed strict "
+                        f"workbook validation at {candidate_month}: {exc}"
+                    ) from exc
+            elif status_code not in {404, 410}:
+                raise ValueError(
+                    f"candidate {candidate_month} returned non-terminal HTTP {status_code}"
+                )
+            if not content or (
+                status_code in {404, 410}
+                and len(content) > self.max_probe_failure_bytes
+            ):
+                raise ValueError("Census recent archive failure body is not exactly bounded")
+            role = f"recent-probe-{rank:02d}"
+            responses.append(
+                EvidenceResponse(
+                    role=role,
+                    url=workbook_url,
+                    content_type=content_type,
+                    raw_bytes=content,
+                    request_witness=request_witness,
+                    response_witness=response_witness,
+                )
+            )
+            artifacts.append(_artifact(workbook_url, content, content_type))
+            if status_code == 200:
+                return tuple(responses), artifacts, retrieved_at
+        return tuple(responses), artifacts, None
+
+    def _bounded_census_response(
+        self,
+        workbook_url: str,
+        *,
+        expected_host: str,
+    ) -> tuple[int, bytes, str, str, datetime]:
+        chunks: list[bytes] = []
+        size = 0
+        with self.client.stream("GET", workbook_url) as response:
+            final_url = urlparse(str(response.url))
+            if (
+                final_url.scheme != "https"
+                or not final_url.hostname
+                or final_url.hostname.lower() != expected_host
+                or str(response.url) != workbook_url
+            ):
+                raise ValueError("Census archive probe left its exact official URL")
+            status_code = int(response.status_code)
+            limit = (
+                self.max_workbook_bytes
+                if status_code == 200
+                else self.max_probe_failure_bytes
+            )
+            for chunk in response.iter_bytes():
+                size += len(chunk)
+                if size > limit:
+                    raise ValueError("Census archive probe response exceeded its size limit")
+                chunks.append(chunk)
+            content_type = (
+                response.headers.get("content-type", "").split(";", 1)[0].lower()
+                or "application/octet-stream"
+            )
+            last_modified = response.headers.get("last-modified", "")
+        return (
+            status_code,
+            b"".join(chunks),
+            content_type,
+            last_modified,
+            self._utc_now(),
+        )
+
+    @staticmethod
+    def _validate_archive_month(
+        workbook_url: str,
+        parser_metadata: dict[str, Any],
+    ) -> None:
+        expected_prefix = CENSUS_MARTS_INDEX
+        match = re.fullmatch(
+            re.escape(expected_prefix) + r"rs(\d{2})(\d{2})\.xlsx",
+            workbook_url,
+            re.IGNORECASE,
+        )
+        if match is None:
+            raise ValueError("Census archive workbook URL is not canonical")
+        short_year, month = (int(value) for value in match.groups())
+        year = 2000 + short_year if short_year < 80 else 1900 + short_year
+        latest_month = str(parser_metadata.get("latest_value_date") or "")[:7]
+        if not 1 <= month <= 12 or latest_month != f"{year:04d}-{month:02d}":
+            raise ValueError(
+                "Census archive workbook filename month does not match workbook latest month"
+            )
 
     @staticmethod
     def _latest_workbook_url(index: bytes) -> str:
@@ -1191,6 +1988,16 @@ class CensusMARTSReleaseProvider(_ReleaseWorkbookProvider):
             raise ValueError("Census MARTS workbook is missing required tables")
         sales_sheet = workbook["Table 1."]
         rows = [list(row) for row in sales_sheet.iter_rows(values_only=True)]
+        sales_declaration = " ".join(
+            str(value or "")
+            for row in rows[:5]
+            for value in row
+        )
+        sales_declaration = " ".join(sales_declaration.casefold().split())
+        if "total sales estimates are shown in millions of dollars" not in (
+            sales_declaration
+        ):
+            raise ValueError("Census MARTS sales table declared unit is invalid")
         adjusted_column = None
         for row in rows[:15]:
             for index, value in enumerate(row):
@@ -1262,6 +2069,14 @@ class CensusMARTSReleaseProvider(_ReleaseWorkbookProvider):
 
         change_sheet = workbook["Table 2."]
         change_rows = [list(row) for row in change_sheet.iter_rows(values_only=True)]
+        change_declaration = " ".join(
+            str(value or "")
+            for row in change_rows[:5]
+            for value in row
+        )
+        change_declaration = " ".join(change_declaration.casefold().split())
+        if "estimates are shown as percents" not in change_declaration:
+            raise ValueError("Census MARTS change table declared unit is invalid")
         change_total = None
         previous_label = ""
         for row in change_rows:

@@ -261,6 +261,49 @@ def test_private_raw_artifact_persists_exact_content_addressed_bytes_and_row(tmp
 
 
 @pytest.mark.django_db
+def test_private_raw_artifact_same_run_reuses_exact_row_and_rejects_new_bytes(
+    tmp_path,
+):
+    raw = b'{"attempt": "exact retry"}\n'
+    digest = hashlib.sha256(raw).hexdigest()
+    result = ProviderResult(
+        provider="ny-fed-markets",
+        dataset="reference-rate:sofr",
+        raw_bytes=raw,
+        metadata={
+            "content_type": "application/json",
+            "byte_length": len(raw),
+            "sha256": digest,
+        },
+    )
+    conflicting_raw = b'{"attempt": "different response"}\n'
+    conflicting_digest = hashlib.sha256(conflicting_raw).hexdigest()
+    conflicting = ProviderResult(
+        provider="ny-fed-markets",
+        dataset=result.dataset,
+        raw_bytes=conflicting_raw,
+        metadata={
+            "content_type": "application/json",
+            "byte_length": len(conflicting_raw),
+            "sha256": conflicting_digest,
+        },
+    )
+
+    with override_settings(RAW_ARTIFACT_ROOT=tmp_path):
+        run = _run("raw-artifact-same-run-retry")
+        first = persist_private_raw_artifact(run=run, result=result)
+        retried = persist_private_raw_artifact(run=run, result=result)
+        with pytest.raises(ValueError, match="conflicting private raw artifact"):
+            persist_private_raw_artifact(run=run, result=conflicting)
+
+    assert retried.pk == first.pk
+    assert RawArtifact.objects.filter(run=run).count() == 1
+    assert not (
+        tmp_path / conflicting_digest[:2] / f"{conflicting_digest}.bin"
+    ).exists()
+
+
+@pytest.mark.django_db
 def test_private_raw_artifact_rejects_existing_content_address_collision(tmp_path):
     raw = b"expected raw response"
     digest = hashlib.sha256(raw).hexdigest()

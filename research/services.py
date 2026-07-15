@@ -695,7 +695,7 @@ def begin_ingestion(
     source_obj = ensure_source(source) if isinstance(source, str) else source
     return IngestionRun.objects.create(
         source=source_obj,
-        dataset=dataset[:120],
+        dataset=dataset[:512],
         started_at=timezone.now(),
         metadata=dict(metadata or {}),
     )
@@ -1006,6 +1006,16 @@ SERIES_CATALOG = {
         "millions of chained dollars",
         "monthly",
     ),
+    "BEA-PCE-PRICE-INDEX": (
+        "Personal Consumption Expenditures Price Index",
+        "chain-type price index",
+        "monthly",
+    ),
+    "BEA-CORE-PCE-PRICE-INDEX": (
+        "PCE Price Index Excluding Food and Energy",
+        "chain-type price index",
+        "monthly",
+    ),
     "CENSUS-MRTS-44X72-SM-SA": (
         "Retail Trade and Food Services Sales, Seasonally Adjusted",
         "USD millions",
@@ -1017,6 +1027,21 @@ SERIES_CATALOG = {
         "monthly",
     ),
     "CENSUS-MRTS-44X72-SM-SA-YOY": (
+        "Retail Trade and Food Services Sales, Year-over-Year",
+        "%",
+        "monthly",
+    ),
+    "CENSUS-API-MRTS-44X72-SM-SA": (
+        "Retail Trade and Food Services Sales, Seasonally Adjusted",
+        "USD millions",
+        "monthly",
+    ),
+    "CENSUS-API-MRTS-44X72-SM-SA-MOM": (
+        "Retail Trade and Food Services Sales, Month-over-Month",
+        "%",
+        "monthly",
+    ),
+    "CENSUS-API-MRTS-44X72-SM-SA-YOY": (
         "Retail Trade and Food Services Sales, Year-over-Year",
         "%",
         "monthly",
@@ -1334,18 +1359,27 @@ def store_series_observations(
     return count
 
 
+@transaction.atomic
 def store_release_vintage_observations(
     result: ProviderResult,
     source: Source,
     run: IngestionRun,
     *,
     record_group: str = "release_vintages",
+    preserve_batches: bool = False,
 ) -> int:
-    """Upsert release-vintage rows without collapsing values by economic period."""
+    """Store release vintages, optionally retaining every acquisition batch.
+
+    The legacy path keeps its historical identity-based upsert while only one
+    row exists for that identity.  Once an exact-archive source has retained
+    multiple acquisition batches, a legacy write fails closed instead of
+    choosing and mutating an arbitrary historical row.
+    """
 
     records = result.supplemental_records.get(record_group, [])
     if not records:
         return 0
+    Source.objects.select_for_update().get(pk=source.pk)
     fetched_at = result.fetched_at
     if timezone.is_naive(fetched_at):
         fetched_at = timezone.make_aware(fetched_at, UTC)
@@ -1382,12 +1416,24 @@ def store_release_vintage_observations(
         )
         value_date = _aware_midnight(record["date"])
         as_of = _aware_midnight(release_date)
+        lookup = {
+            "series": series,
+            "value_date": value_date,
+            "release_date": release_date,
+            "estimate_round": estimate_round,
+            "source": source,
+        }
+        if preserve_batches:
+            lookup["batch_id"] = run.batch_id
+        elif (
+            ReleaseVintageObservation.objects.filter(**lookup).order_by().count()
+            > 1
+        ):
+            raise ValueError(
+                "legacy release-vintage upsert is ambiguous across retained batches"
+            )
         ReleaseVintageObservation.objects.update_or_create(
-            series=series,
-            value_date=value_date,
-            release_date=release_date,
-            estimate_round=estimate_round,
-            source=source,
+            **lookup,
             defaults={
                 "value": record["value"],
                 "as_of": as_of,
@@ -1876,37 +1922,66 @@ def persist_private_raw_artifact(
         getattr(settings, "RAW_ARTIFACT_ROOT", settings.BASE_DIR / "data" / "artifacts")
     )
     target = root / digest[:2] / f"{digest}.bin"
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    if target.exists():
-        if target.read_bytes() != payload:
-            raise ValueError("existing content-addressed artifact bytes do not match digest")
-    else:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{digest}.", dir=target.parent
-        )
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            try:
-                os.link(temporary_name, target)
-            except FileExistsError:
-                if target.read_bytes() != payload:
-                    raise ValueError(
-                        "existing content-addressed artifact bytes do not match digest"
-                    )
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
+    expected_uri = f"private://{artifact_namespace}/{digest[:2]}/{digest}.bin"
 
     with transaction.atomic():
+        # A process can die after the callback transaction commits but before
+        # record_provider_result marks its pre-created run complete.  Serialize
+        # that retry on the run and reuse only an exact, singular artifact.
+        # A different response belongs to a different acquisition run.
+        locked_run = IngestionRun.objects.select_for_update().get(pk=run.pk)
+        existing = list(
+            RawArtifact.objects.select_for_update()
+            .filter(run=locked_run)
+            .order_by("pk")
+        )
+        if existing:
+            if len(existing) != 1:
+                raise ValueError("ingestion run has multiple private raw artifacts")
+            artifact = existing[0]
+            if (
+                artifact.uri != expected_uri
+                or artifact.sha256 != digest
+                or artifact.content_type != content_type
+                or artifact.size_bytes != len(payload)
+            ):
+                raise ValueError(
+                    "ingestion run already has a conflicting private raw artifact"
+                )
+        else:
+            artifact = None
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if target.read_bytes() != payload:
+                raise ValueError(
+                    "existing content-addressed artifact bytes do not match digest"
+                )
+        else:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=f".{digest}.", dir=target.parent
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.link(temporary_name, target)
+                except FileExistsError:
+                    if target.read_bytes() != payload:
+                        raise ValueError(
+                            "existing content-addressed artifact bytes do not match digest"
+                        )
+            finally:
+                if os.path.exists(temporary_name):
+                    os.unlink(temporary_name)
+
+        if artifact is not None:
+            return artifact
         return RawArtifact.objects.create(
-            run=run,
-            uri=(
-                f"private://{artifact_namespace}/{digest[:2]}/{digest}.bin"
-            ),
+            run=locked_run,
+            uri=expected_uri,
             sha256=digest,
             content_type=content_type,
             size_bytes=len(payload),
